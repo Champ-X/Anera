@@ -1,0 +1,67 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "exact-prompt-html-slides-live-canary",
+  "sourceSchemaVersion": "anera-html-slides-live-canary/1.0",
+  "generatedAt": "2026-08-31T02:44:11.012Z",
+  "provenance": {
+    "source": "reports/real-smokes/html-slides-2026-08-31T02-44-11-012Z/report.json",
+    "sourceBytes": 8850,
+    "sourceSha256": "bf305cecd95a09062c153640718e81044130b5f5e3bbe120f537d845276636df",
+    "implementationFingerprintSchemaVersion": 1,
+    "implementationFingerprintSha256": "c365467091719ed50ebaa908fde8dc10e44aa2976a91a4540a4f164c063109f8"
+  },
+  "execution": {
+    "description": "The exact recording prompt executed through the production Anera bundle with live DeepSeek text and vision providers",
+    "passed": true,
+    "productionBundle": true,
+    "liveProviders": true,
+    "status": "completed",
+    "providerIdentity": {
+      "agentModel": "deepseek-chat",
+      "visionModel": "deepseek-v4-flash-vision-exp",
+      "temperature": 0
+    },
+    "activeDurationMs": 78112,
+    "modelRequests": 10,
+    "modelCalls": 10,
+    "toolCalls": 10,
+    "promptTokens": 107797,
+    "completionTokens": 9419,
+    "cachedPromptTokens": 12800,
+    "estimatedCostUsd": 0.03741436,
+    "estimatedCostStatus": "estimated"
+  },
+  "checks": {
+    "exactPromptPreserved": true,
+    "fullToolSequence": true,
+    "researchBeforeArtifact": true,
+    "htmlArtifactPresented": true,
+    "htmlDocumentComplete": true,
+    "substantialArtifact": true,
+    "accessibleNavigationPresent": true,
+    "visibleSourceLinks": true,
+    "selfContainedExecutableAssets": true,
+    "browserScreenshotSaved": true,
+    "visionInspectionPassed": true,
+    "noUnexpectedToolFailures": true,
+    "oneFinal": true,
+    "boundedEfficiency": true
+  },
+  "artifact": {
+    "path": "ai-weekly-2026.html",
+    "bytes": 19172,
+    "sha256": "792011d694d39b33913d91e9a3a3da008586be8481f6ba7f9ee543a0fc3ff26b",
+    "sourceUrlCount": 10
+  },
+  "screenshot": {
+    "path": "ai-weekly-2026.png",
+    "bytes": 286232,
+    "sha256": "3efd319bc00401cd6b632fc0b93d7891369c1b16d28ad2ad2b1e4ab0af6316ed"
+  },
+  "scope": {
+    "arenaParityEvidence": false,
+    "arenaProviderIdentityKnown": false,
+    "mobileExcluded": true,
+    "fullGitHubConnectorExcluded": true
+  }
+}

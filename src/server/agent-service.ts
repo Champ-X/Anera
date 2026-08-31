@@ -440,6 +440,36 @@ function hasKnownLeadingArenaCompaction(content: string | null): boolean {
     && content.startsWith(`${ARENA_SYSTEM_MESSAGE_OPEN}\n${ARENA_COMPACTION_PREAMBLE}`)
 }
 
+/**
+ * Recover task-classification context only from a server-provenanced checkpoint
+ * and only while the user is explicitly continuing that task. A checkpoint
+ * prepended to an ordinary new request remains context, never current intent.
+ */
+function trustedArenaCompactionTaskContext(messages: readonly ModelMessage[]): string {
+  const active = activeTaskMessageSlice(messages)
+  const latestUser = [...active].reverse().find((message) => message.role === 'user')
+  if (!latestUser) return ''
+  const latestText = arenaUserAuthoredText(latestUser)
+  if (
+    !latestText.startsWith('[Harness operator action: Continue]')
+    && !isExplicitTaskContinuation(latestText)
+  ) return ''
+
+  return active.flatMap((message) => {
+    if (
+      message.role !== 'user'
+      || typeof message.content !== 'string'
+      || !message.arena_system_messages?.some((part) => part.kind === 'compaction' && part.position === 'leading')
+    ) return []
+    const prefix = `${ARENA_SYSTEM_MESSAGE_OPEN}\n${ARENA_COMPACTION_PREAMBLE}`
+    if (!message.content.startsWith(prefix)) return []
+    const end = message.content.indexOf(`\n${ARENA_SYSTEM_MESSAGE_CLOSE}`, prefix.length)
+    if (end < 0) return []
+    const summary = message.content.slice(prefix.length, end).trim()
+    return summary ? [summary] : []
+  }).join('\n')
+}
+
 function prependArenaCompactionCheckpoint(summary: string, retainedMessages: ModelMessage[]): ModelMessage[] {
   const block = projectArenaCompactionCheckpoint(summary)
   const next = [...retainedMessages]
@@ -1625,6 +1655,9 @@ export class AgentService {
     let webCitationRecoveryCount = 0
     let visualWebArtifactRecoveryCount = 0
     let admittedToolCalls = 0
+    let singleArtifactWebMode = false
+    let visualWebArtifactMode = false
+    let visualWebResearchRequired = false
     try {
       let consecutiveToolCall: ConsecutiveToolCallState | undefined
       let activeToolDefinitions: ToolDefinition[] = ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS
@@ -1633,17 +1666,43 @@ export class AgentService {
         const stepId = createId('step')
         const state = await this.store.get(sessionId)
         this.assertSessionTokenLimit(state.summary)
-        const singleArtifactWebTask = isSingleArtifactWebTask(state.messages)
-        const visualWebArtifactTask = isVisualWebArtifactTask(state.messages)
-        const visualWebResearchMissing = visualWebArtifactTask
-          && visualWebTaskRequiresResearch(state.messages)
-          && (webResearchCitationEvidence([...state.messages])?.sourceUrls.length ?? 0) === 0
+        singleArtifactWebMode ||= isSingleArtifactWebTask(state.messages)
+        visualWebArtifactMode ||= isVisualWebArtifactTask(state.messages)
+        if (visualWebArtifactMode) visualWebResearchRequired ||= visualWebTaskRequiresResearch(state.messages)
+        const singleArtifactWebTask = singleArtifactWebMode
+        const visualWebArtifactTask = visualWebArtifactMode
         if (singleArtifactWebTask && !singleArtifactCanonicalPath) {
           singleArtifactCanonicalPath = successfulSingleArtifactCanonicalPath(state.messages)
         }
+        const visualWebWorkflowGap = visualWebArtifactTask
+          ? visualWebArtifactCompletionGap(state.messages, {
+            forceTask: true,
+            requiresResearch: visualWebResearchRequired,
+            canonicalPath: singleArtifactCanonicalPath,
+          })
+          : undefined
+        const visualWebWorkflowComplete = visualWebArtifactTask && visualWebWorkflowGap === undefined
+        const visualWebResearchMissing = visualWebArtifactTask
+          && visualWebResearchRequired
+          && (webResearchCitationEvidence([...state.messages])?.sourceUrls.length ?? 0) === 0
         const directSingleArtifactMode = singleArtifactWebTask && !isPlanExplicitlyRequested(state.messages)
-        const canonicalDiagnosticRead = Boolean(singleArtifactCanonicalPath)
-          && canonicalArtifactDiagnosticReadRequired(state.messages)
+        const sourceRepairPhase = singleArtifactCanonicalPath
+          ? researchArtifactSourceRepairPhase(state.messages, singleArtifactCanonicalPath)
+          : undefined
+        const visualRepairPhase = singleArtifactCanonicalPath
+          ? visualArtifactDefectRepairPhase(state.messages, singleArtifactCanonicalPath)
+          : undefined
+        const canonicalDiagnosticRead = Boolean(singleArtifactCanonicalPath) && (
+          canonicalArtifactDiagnosticReadRequired(state.messages)
+          || sourceRepairPhase === 'read'
+          || visualRepairPhase === 'read'
+        )
+        const canonicalTargetedEdit = Boolean(singleArtifactCanonicalPath)
+          && !canonicalDiagnosticRead
+          && (sourceRepairPhase === 'edit' || visualRepairPhase === 'edit')
+        const visualRequiredToolNames = visualWebWorkflowGap
+          ? visualWebArtifactRequiredToolNames(visualWebWorkflowGap)
+          : undefined
         activeToolDefinitions = selectAgentToolDefinitions(state, activeToolDefinitions, this.connectorTools)
         if (directSingleArtifactMode) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name !== 'propose_plan')
@@ -1657,6 +1716,14 @@ export class AgentService {
               && (tool.function.name !== 'read_file' || canonicalDiagnosticRead)
           ))
         }
+        if (canonicalDiagnosticRead) {
+          activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name === 'read_file')
+        } else if (canonicalTargetedEdit) {
+          activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name === 'edit_file')
+        } else if (visualRequiredToolNames) {
+          activeToolDefinitions = activeToolDefinitions.filter((tool) => visualRequiredToolNames.has(tool.function.name))
+        }
+        if (visualWebWorkflowComplete) activeToolDefinitions = []
         const enabledConnectorSlugs = state.activeTaskConnectorSlugs ?? []
         const baseSystemPrompt = systemPromptForTools(activeToolDefinitions, {
           timezone: state.timezone,
@@ -1677,11 +1744,20 @@ export class AgentService {
         const visualWebWorkflowPrompt = visualWebArtifactTask
           ? `\n\nHarness visual HTML presentation contract: treat this as one canonical self-contained HTML artifact unless the user explicitly requested a multi-file framework. For current, recent, weekly, news, trend, or hotspot content, issue at most three complementary web_search calls together in one parallel model step, then stop searching once those results cover the requested themes; fetch a page only for one concrete fact that the returned evidence does not support. Use only exact returned URLs as visible source links. Build a focused 6–10-slide artifact, normally within 8–28 KiB, with accessible next/previous and keyboard navigation plus a visible current/total state. After the durable write, start one managed Website preview and open the current artifact once in Browser. Perform exactly one forward click or keypress and use its fresh snapshot to prove navigation; do not traverse every slide. Then save exactly one post-navigation screenshot to a workspace-relative PNG. Inspect that exact screenshot with inspect_image using a defect-check prompt that returns exactly \`NO DEFECTS\` when layout, contrast, clipping, overlap, and readability pass, or at most three concrete defects otherwise. If defects are reported, edit only those defects and repeat the minimum current preview/one-action/screenshot/inspection cycle. If source verification rejects a URL, edit only the named unsupported anchor instead of replacing the whole sources section. Then call present_file for the verified canonical HTML, and only then give the Final. These are completion boundaries, not optional suggestions.`
           : ''
-        const activeSystemPrompt = singleArtifactCanonicalPath
-          ? `${baseSystemPrompt}\n\nHarness durable progress: the canonical self-contained Web deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)}. ${canonicalDiagnosticRead ? 'The last edit failed because its context did not match; read_file is temporarily available for one diagnostic read of the canonical file, then retry only the necessary targeted edit.' : 'Continue from it without rereading or listing the file you just created.'} Start the preview and verify it now; use edit_file only for a concrete correction observed in the browser. Historical mutation records under _historicalMutation are metadata, not file content; never use their hashes or fields as edit_file.old_text. Do not create or overwrite another full-file variant. start_process is only for the long-running preview server; never use it for finite cat, sed, grep, wc, or other inspection commands. For this bounded artifact, use browser open once at the requested viewport and test each specifically requested interaction state once; if an interaction changes durable page state, test dependent controls in that resulting state rather than only as isolated happy paths. Every action already returns a fresh snapshot. Exact browser text and control state override approximate screenshot OCR. If a genuine visual question remains, save and inspect one screenshot; if that inspection reports no concrete defect, do not capture or inspect another screenshot. Do not restore an earlier control state, query the console, or reread source after the requested action result passes unless the user explicitly requires it. Do not run generic markup checks unless an observed failure requires diagnosis. When the requested states pass, present the canonical HTML and finish.${visualWebWorkflowPrompt}`
+        const visualWebCurrentPhasePrompt = visualWebArtifactTask && !visualWebWorkflowComplete
+          ? `\n\nHarness current visual phase: ${canonicalDiagnosticRead
+            ? 'read the canonical HTML exactly once so the pending targeted correction can use current bytes'
+            : canonicalTargetedEdit
+              ? 'apply exactly one targeted edit for the pending source or visual defect using the current canonical bytes'
+              : visualWebArtifactPhaseInstruction(visualWebWorkflowGap)}. The tool surface is intentionally limited to this next durable phase; perform it once and do not substitute extra inspection or navigation.`
+          : ''
+        const activeSystemPrompt = visualWebWorkflowComplete
+          ? `${baseSystemPrompt}\n\nHarness durable completion: the canonical visual HTML presentation has already passed research grounding, live Website preview, Browser navigation, screenshot inspection containing NO DEFECTS, and present_file. All required durable boundaries are complete. Give the concise user-facing Final now. Do not request, repeat, or describe any further tool action.`
+          : singleArtifactCanonicalPath
+          ? `${baseSystemPrompt}\n\nHarness durable progress: the canonical self-contained Web deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)}. ${canonicalDiagnosticRead ? 'A targeted correction requires exact current bytes. read_file is the only tool available for this one diagnostic step; read the canonical file now, then retry only the necessary targeted edit on the next step.' : 'Continue from it without rereading or listing the file you just created.'} Start the preview and verify it now; use edit_file only for a concrete correction observed in the browser. Historical mutation records under _historicalMutation are metadata, not file content; never use their hashes or fields as edit_file.old_text. Do not create or overwrite another full-file variant. start_process is only for the long-running preview server; never use it for finite cat, sed, grep, wc, or other inspection commands. For this bounded artifact, use browser open once at the requested viewport and test each specifically requested interaction state once; if an interaction changes durable page state, test dependent controls in that resulting state rather than only as isolated happy paths. Every action already returns a fresh snapshot. Exact browser text and control state override approximate screenshot OCR. If a genuine visual question remains, save and inspect one screenshot; if that inspection reports no concrete defect, do not capture or inspect another screenshot. Do not restore an earlier control state, query the console, or reread source after the requested action result passes unless the user explicitly requires it. Do not run generic markup checks unless an observed failure requires diagnosis. When the requested states pass, present the canonical HTML and finish.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
           : directSingleArtifactMode
-            ? `${baseSystemPrompt}\n\nHarness bounded single-artifact mode: the user supplied explicit requirements and acceptance criteria for one self-contained Web artifact, with no unresolved product choice. Build the complete HTML directly. Do not create or propose a plan.${visualWebWorkflowPrompt}`
-            : `${baseSystemPrompt}${visualWebWorkflowPrompt}`
+            ? `${baseSystemPrompt}\n\nHarness bounded single-artifact mode: the user supplied explicit requirements and acceptance criteria for one self-contained Web artifact, with no unresolved product choice. Build the complete HTML directly. Do not create or propose a plan.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
+            : `${baseSystemPrompt}${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
         const forcedCompaction = state.forceCompactionRequested
         const prepared = await this.prepareContext(
           sessionId,
@@ -2034,7 +2110,11 @@ export class AgentService {
             }
           }
           const completionState = await this.store.get(sessionId)
-          const visualWorkflowGap = visualWebArtifactCompletionGap(completionState.messages)
+          const visualWorkflowGap = visualWebArtifactCompletionGap(completionState.messages, {
+            forceTask: visualWebArtifactMode,
+            requiresResearch: visualWebResearchRequired,
+            canonicalPath: singleArtifactCanonicalPath,
+          })
           if (visualWorkflowGap) {
             if (visualWebArtifactRecoveryCount >= MAX_VISUAL_WEB_ARTIFACT_RECOVERIES) {
               throw new Error(`Model stopped before completing the visual HTML presentation workflow: ${visualWorkflowGap.missingPhases.join(', ')}. Continue the run to retry from the persisted artifact and evidence.`)
@@ -4386,6 +4466,16 @@ function activeTaskMessageSlice(messages: readonly ModelMessage[]): readonly Mod
     ) break
     userPosition -= 1
   }
+  if (userPosition === 0 && userIndexes[0] > 0) {
+    const onlyBoundary = messages[userIndexes[0]]
+    const content = arenaUserAuthoredText(onlyBoundary)
+    // A compaction checkpoint can retain an internal Continue boundary while
+    // pruning the original user message. In that shape the preceding compacted
+    // tool history still belongs to this task and must remain visible to
+    // completion gates; treating Continue as a brand-new task discards the
+    // durable preview/inspection chain.
+    if (content.startsWith('[Harness operator action: Continue]')) return messages
+  }
   return messages.slice(userIndexes[userPosition])
 }
 
@@ -4395,21 +4485,9 @@ function activeTaskMessageSlice(messages: readonly ModelMessage[]): readonly Mod
  * React intent because those projects normally need a multi-file toolchain.
  */
 export function isSingleArtifactWebTask(messages: readonly ModelMessage[]): boolean {
-  const userMessages = messages.filter((message) => message.role === 'user')
+  const userMessages = activeTaskMessageSlice(messages).filter((message) => message.role === 'user')
   if (userMessages.length === 0) return false
-
-  let taskStart = userMessages.length - 1
-  while (taskStart > 0) {
-    const message = userMessages[taskStart]
-    const content = arenaUserAuthoredText(message)
-    if (
-      !isArenaCustomFeedbackMessage(message)
-      && !content.startsWith('[Harness operator action: Continue]')
-      && !isExplicitTaskContinuation(content)
-    ) break
-    taskStart -= 1
-  }
-  const taskText = userMessages.slice(taskStart).map(arenaUserAuthoredText).join('\n')
+  const taskText = userMessages.map(arenaUserAuthoredText).join('\n')
   const webIntent = /\b(?:web\s*(?:site|page|app)|dashboard|landing\s+page|frontend|html)\b|网站|网页|前端|仪表盘|HTML/i.test(taskText)
   const singleArtifactIntent = /\b(?:single[-\s](?:file|html\s+file)|one[-\s](?:file|html\s+file)|self[-\s]contained|standalone\s+html|all[-\s]in[-\s]one\s+html)\b|单(?:个)?文件|一个\s*HTML\s*文件|单一\s*HTML\s*文件|自包含|独立\s*HTML/iu.test(taskText)
   const explicitlyMultiFile = /\b(?:multi[-\s]file|multiple\s+files|react|next\.?js|nuxt|vite|webpack)\b|多文件/iu.test(taskText)
@@ -4422,21 +4500,12 @@ export function isSingleArtifactWebTask(messages: readonly ModelMessage[]): bool
  * ordinary PowerPoint/Office requests continue to use the OOXML path.
  */
 export function isVisualWebArtifactTask(messages: readonly ModelMessage[]): boolean {
-  const userMessages = messages.filter((message) => message.role === 'user')
+  const userMessages = activeTaskMessageSlice(messages).filter((message) => message.role === 'user')
   if (userMessages.length === 0) return false
-
-  let taskStart = userMessages.length - 1
-  while (taskStart > 0) {
-    const message = userMessages[taskStart]
-    const content = arenaUserAuthoredText(message)
-    if (
-      !isArenaCustomFeedbackMessage(message)
-      && !content.startsWith('[Harness operator action: Continue]')
-      && !isExplicitTaskContinuation(content)
-    ) break
-    taskStart -= 1
-  }
-  const taskText = userMessages.slice(taskStart).map(arenaUserAuthoredText).join('\n')
+  const taskText = [
+    userMessages.map(arenaUserAuthoredText).join('\n'),
+    trustedArenaCompactionTaskContext(messages),
+  ].filter(Boolean).join('\n')
   const explicitlyMultiFile = /\b(?:multi[-\s]file|multiple\s+files|react|next\.?js|nuxt|vite|webpack)\b|多文件/iu.test(taskText)
   if (explicitlyMultiFile) return false
 
@@ -4463,6 +4532,22 @@ function isCompleteHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { a
   return /\.html?$/i.test(path) && /<html\b/i.test(content) && /<\/html\s*>/i.test(content)
 }
 
+function isCompactedHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { arguments: { path: string } } {
+  if (call.name !== 'write_file') return false
+  const path = typeof call.arguments.path === 'string' ? call.arguments.path.trim() : ''
+  const mutation = call.arguments._historicalMutation
+  return /\.html?$/i.test(path)
+    && Boolean(mutation)
+    && typeof mutation === 'object'
+    && !Array.isArray(mutation)
+    && (mutation as Record<string, unknown>).operation === 'write_file'
+    && (mutation as Record<string, unknown>).payload === 'omitted_after_consumption'
+}
+
+function isCanonicalHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { arguments: { path: string } } {
+  return isCompleteHtmlWrite(call) || isCompactedHtmlWrite(call)
+}
+
 interface SuccessfulTaskToolOccurrence {
   call: ToolCallRecord
   callMessageIndex: number
@@ -4470,17 +4555,53 @@ interface SuccessfulTaskToolOccurrence {
   result: ModelMessage
 }
 
+function structuredToolResult(message: ModelMessage): Record<string, unknown> | undefined {
+  if (message.role !== 'tool' || typeof message.content !== 'string') return undefined
+  try {
+    const payload = JSON.parse(message.content) as unknown
+    return payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function retrievedResearchSourceUrls(
+  call: { name: string; arguments: Record<string, unknown> },
+  result: ModelMessage,
+): string[] {
+  if (!['web_search', 'fetch_page', 'web_fetch'].includes(call.name)) return []
+  const payload = structuredToolResult(result)
+  if (!payload || payload.status !== 'success') return []
+  if (call.name === 'web_search') {
+    if (!Array.isArray(payload.results)) return []
+    return payload.results.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+      const url = canonicalCitationUrl(String((entry as Record<string, unknown>).url ?? ''))
+      return url ? [url] : []
+    })
+  }
+  const url = canonicalCitationUrl(String(payload.url ?? ''))
+    ?? canonicalCitationUrl(String(call.arguments.url ?? ''))
+  return url ? [url] : []
+}
+
+function visualInspectionPassed(result: ModelMessage): boolean {
+  const content = typeof result.content === 'string' ? result.content : ''
+  const section = content.match(
+    /(?:^|\n\n)Visual inspection:\s*\r?\n([\s\S]*?)(?=\r?\n\r?\nEvidence note:|$)/iu,
+  )?.[1]
+  return section?.trim().toUpperCase() === 'NO DEFECTS'
+}
+
 function toolResultProvesExecutedSuccess(message: ModelMessage): boolean {
   if (message.role !== 'tool' || message.tool_result_status === 'failed') return false
-  if (typeof message.content === 'string') {
-    try {
-      const payload = JSON.parse(message.content) as Record<string, unknown>
-      const status = typeof payload.status === 'string' ? payload.status.toLowerCase() : ''
-      if (['error', 'failed', 'verification_required', 'cancelled', 'timed_out'].includes(status)) return false
-      if (payload.not_executed === true || payload.notExecuted === true) return false
-    } catch {
-      // Arena-compatible tools may return successful plain text.
-    }
+  const payload = structuredToolResult(message)
+  if (payload) {
+    const status = typeof payload.status === 'string' ? payload.status.toLowerCase() : ''
+    if (['error', 'failed', 'verification_required', 'cancelled', 'timed_out'].includes(status)) return false
+    if (payload.not_executed === true || payload.notExecuted === true) return false
   }
   return message.tool_result_status === 'succeeded' || isProvenSuccessfulToolResult(message)
 }
@@ -4492,12 +4613,16 @@ function successfulTaskToolOccurrences(messages: readonly ModelMessage[]): Succe
     const message = active[index]
     if (message.role !== 'assistant') continue
     for (const rawCall of message.tool_calls ?? []) {
+      const parsedCall: ToolCallRecord = {
+        id: rawCall.id,
+        name: rawCall.function.name,
+        arguments: parseArguments(rawCall.function.arguments),
+      }
       calls.set(rawCall.id, {
-        call: normalizeAneraRuntimeToolCall({
-          id: rawCall.id,
-          name: rawCall.function.name,
-          arguments: parseArguments(rawCall.function.arguments),
-        }),
+        // Runtime schema normalization intentionally strips unknown keys. The
+        // Harness-authored historical mutation marker is private provenance,
+        // so retain this exact compacted call for durable-path recovery.
+        call: isCompactedHtmlWrite(parsedCall) ? parsedCall : normalizeAneraRuntimeToolCall(parsedCall),
         index,
       })
     }
@@ -4519,8 +4644,8 @@ function successfulTaskToolOccurrences(messages: readonly ModelMessage[]): Succe
 }
 
 function successfulSingleArtifactCanonicalPath(messages: readonly ModelMessage[]): string | undefined {
-  const occurrence = successfulTaskToolOccurrences(messages).find(({ call }) => isCompleteHtmlWrite(call))
-  return occurrence && isCompleteHtmlWrite(occurrence.call)
+  const occurrence = successfulTaskToolOccurrences(messages).find(({ call }) => isCanonicalHtmlWrite(call))
+  return occurrence && isCanonicalHtmlWrite(occurrence.call)
     ? arenaWorkspacePathForVision(occurrence.call.arguments.path)
     : undefined
 }
@@ -4541,11 +4666,23 @@ export interface VisualWebArtifactCompletionGap {
   missingPhases: VisualWebArtifactWorkflowPhase[]
 }
 
+interface VisualWebArtifactCompletionOptions {
+  /** Preserve the task contract after context compaction removes classifier text. */
+  forceTask?: boolean
+  /** Preserve time-sensitive research intent across the same compaction. */
+  requiresResearch?: boolean
+  /** Durable path learned from a previously successful complete HTML write. */
+  canonicalPath?: string
+}
+
 function visualWebTaskRequiresResearch(messages: readonly ModelMessage[]): boolean {
-  const taskText = activeTaskMessageSlice(messages)
-    .filter((message) => message.role === 'user')
-    .map(arenaUserAuthoredText)
-    .join('\n')
+  const taskText = [
+    activeTaskMessageSlice(messages)
+      .filter((message) => message.role === 'user')
+      .map(arenaUserAuthoredText)
+      .join('\n'),
+    trustedArenaCompactionTaskContext(messages),
+  ].filter(Boolean).join('\n')
   return /\b(?:today|this\s+week|weekly|latest|current|recent|news|trends?|hot\s+topics?)\b|(?:今天|本日|本周|这周|每周|最新|当前|近期|新闻|趋势|热点)/iu.test(taskText)
 }
 
@@ -4557,16 +4694,26 @@ function visualWebTaskRequiresResearch(messages: readonly ModelMessage[]): boole
  */
 export function visualWebArtifactCompletionGap(
   messages: readonly ModelMessage[],
+  options: VisualWebArtifactCompletionOptions = {},
 ): VisualWebArtifactCompletionGap | undefined {
-  if (!isVisualWebArtifactTask(messages)) return undefined
+  if (!options.forceTask && !isVisualWebArtifactTask(messages)) return undefined
   const occurrences = successfulTaskToolOccurrences(messages)
-  const canonicalWrite = occurrences.find(({ call }) => isCompleteHtmlWrite(call))
-  const canonicalPath = canonicalWrite && isCompleteHtmlWrite(canonicalWrite.call)
-    ? arenaWorkspacePathForVision(canonicalWrite.call.arguments.path)
-    : undefined
+  const completeCanonicalWrite = occurrences.find(({ call }) => isCanonicalHtmlWrite(call))
+  const canonicalPath = options.canonicalPath ?? (
+    completeCanonicalWrite && isCanonicalHtmlWrite(completeCanonicalWrite.call)
+      ? arenaWorkspacePathForVision(completeCanonicalWrite.call.arguments.path)
+      : undefined
+  )
+  const canonicalWrite = completeCanonicalWrite ?? (canonicalPath
+    ? occurrences.find(({ call }) => (
+      call.name === 'write_file'
+      && typeof call.arguments.path === 'string'
+      && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+    ))
+    : undefined)
   const missing = new Set<VisualWebArtifactWorkflowPhase>()
 
-  if (!canonicalWrite || !canonicalPath) missing.add('html_artifact')
+  if (!canonicalPath || (!canonicalWrite && !options.canonicalPath)) missing.add('html_artifact')
   const mutationCandidates = canonicalPath
     ? occurrences.filter(({ call }) => (
       (call.name === 'write_file' || call.name === 'edit_file')
@@ -4575,20 +4722,25 @@ export function visualWebArtifactCompletionGap(
     ))
     : []
   const latestMutation = mutationCandidates.at(-1) ?? canonicalWrite
-  const currentArtifactBoundary = latestMutation?.resultMessageIndex ?? Number.POSITIVE_INFINITY
+  const currentArtifactBoundary = latestMutation?.resultMessageIndex
+    ?? (canonicalPath ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY)
 
-  if (visualWebTaskRequiresResearch(messages)) {
-    const research = occurrences.find(({ call, resultMessageIndex }) => (
-      ['web_search', 'fetch_page', 'web_fetch'].includes(call.name)
+  if (options.requiresResearch ?? visualWebTaskRequiresResearch(messages)) {
+    const research = occurrences.find(({ call, resultMessageIndex, result }) => (
+      retrievedResearchSourceUrls(call, result).length > 0
       && resultMessageIndex < currentArtifactBoundary
     ))
     if (!research) missing.add('web_research')
   }
 
-  const preview = occurrences.find(({ call, resultMessageIndex }) => (
-    ['start_process', 'build_and_start'].includes(call.name)
-    && resultMessageIndex > (canonicalWrite?.resultMessageIndex ?? Number.POSITIVE_INFINITY)
-  ))
+  const preview = occurrences.find(({ call, resultMessageIndex, result }) => {
+    if (
+      !['start_process', 'build_and_start'].includes(call.name)
+      || resultMessageIndex <= (canonicalWrite?.resultMessageIndex ?? (canonicalPath ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY))
+    ) return false
+    const status = structuredToolResult(result)?.status
+    return call.name !== 'start_process' || String(status || '').toLowerCase() !== 'exited'
+  })
   if (!preview) missing.add('website_preview')
 
   const lastOccurrence = (
@@ -4609,6 +4761,60 @@ export function visualWebArtifactCompletionGap(
   const isBrowserAction = (occurrence: SuccessfulTaskToolOccurrence, action: string): boolean => (
     occurrence.call.name === 'browser' && occurrence.call.arguments.action === action
   )
+  const browserResultWorkspacePath = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => {
+    const rawUrl = structuredToolResult(occurrence.result)?.url
+    if (typeof rawUrl !== 'string') return undefined
+    try {
+      const pathname = decodeURIComponent(new URL(rawUrl).pathname)
+      const previewMarker = '/preview/'
+      const markerIndex = pathname.lastIndexOf(previewMarker)
+      if (markerIndex < 0) return undefined
+      return arenaWorkspacePathForVision(pathname.slice(markerIndex + previewMarker.length))
+    } catch {
+      return undefined
+    }
+  }
+  const browserOpenTargetsCanonical = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
+    isBrowserAction(occurrence, 'open')
+    && typeof occurrence.call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(occurrence.call.arguments.path) === canonicalPath
+    && browserResultWorkspacePath(occurrence) === canonicalPath
+  )
+  const browserNavigationTargetsCanonical = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
+    browserResultWorkspacePath(occurrence) === canonicalPath
+  )
+  const browserResultChanged = (
+    before: SuccessfulTaskToolOccurrence,
+    after: SuccessfulTaskToolOccurrence,
+  ): boolean => {
+    const beforeResult = structuredToolResult(before.result)
+    const afterResult = structuredToolResult(after.result)
+    if (!beforeResult || !afterResult) return false
+    return ['url', 'text', 'snapshot', 'title'].some((field) => (
+      typeof afterResult[field] === 'string'
+      && afterResult[field] !== beforeResult[field]
+    ))
+  }
+  const isBrowserNavigation = (occurrence: SuccessfulTaskToolOccurrence): boolean => {
+    if (occurrence.call.name !== 'browser') return false
+    const action = String(occurrence.call.arguments.action || '')
+    if (action === 'press') {
+      const key = String(occurrence.call.arguments.key || '').trim().toLowerCase()
+      return ['arrowright', 'arrowdown', 'pagedown', 'space', 'spacebar'].includes(key)
+        || occurrence.call.arguments.key === ' '
+    }
+    if (action !== 'click') return false
+    return typeof occurrence.call.arguments.ref === 'string'
+      && occurrence.call.arguments.ref.trim().length > 0
+  }
+  const isBrowserNavigationAttempt = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
+    occurrence.call.name === 'browser'
+    && ['click', 'press'].includes(String(occurrence.call.arguments.action || ''))
+  )
+  const isNavigationAfter = (
+    open: SuccessfulTaskToolOccurrence,
+    occurrence: SuccessfulTaskToolOccurrence,
+  ): boolean => isBrowserNavigation(occurrence) && browserResultChanged(open, occurrence)
   const screenshotPathOf = (occurrence: SuccessfulTaskToolOccurrence): string => arenaWorkspacePathForVision(String(
     occurrence.call.arguments.screenshot_path
     || occurrence.call.arguments.path
@@ -4637,7 +4843,7 @@ export function visualWebArtifactCompletionGap(
       && occurrence.resultMessageIndex < candidatePresentation.resultMessageIndex
       && occurrence.call.name === 'inspect_image'
       && typeof occurrence.call.arguments.path === 'string'
-      && /\bNO DEFECTS\b/iu.test(String(occurrence.result.content || ''))
+      && visualInspectionPassed(occurrence.result)
     )).reverse()
     for (const candidateInspection of passingInspections) {
       const inspectedPath = arenaWorkspacePathForVision(String(candidateInspection.call.arguments.path))
@@ -4646,17 +4852,24 @@ export function visualWebArtifactCompletionGap(
         candidateInspection.resultMessageIndex,
       )
       if (!candidateScreenshot) continue
-      const candidateNavigation = lastOccurrence(
-        (occurrence) => occurrence.call.name === 'browser'
-          && ['click', 'press'].includes(String(occurrence.call.arguments.action || '')),
-        candidateScreenshot.resultMessageIndex,
-      )
-      if (!candidateNavigation) continue
+      // The last Browser open before this screenshot defines its page epoch.
+      // Reject the whole chain when that epoch targets a competing HTML file;
+      // searching directly for a canonical open would incorrectly jump across it.
       const candidateOpen = lastOccurrence(
         (occurrence) => isBrowserAction(occurrence, 'open'),
-        candidateNavigation.resultMessageIndex,
+        candidateScreenshot.resultMessageIndex,
       )
-      if (!candidateOpen) continue
+      if (!candidateOpen || !browserOpenTargetsCanonical(candidateOpen)) continue
+      const candidateNavigation = lastOccurrence(
+        isBrowserNavigationAttempt,
+        candidateScreenshot.resultMessageIndex,
+        candidateOpen.resultMessageIndex,
+      )
+      if (
+        !candidateNavigation
+        || !isNavigationAfter(candidateOpen, candidateNavigation)
+        || !browserNavigationTargetsCanonical(candidateNavigation)
+      ) continue
       browserOpen = candidateOpen
       navigation = candidateNavigation
       screenshot = candidateScreenshot
@@ -4671,14 +4884,20 @@ export function visualWebArtifactCompletionGap(
   // the newest in-progress cycle so the recovery prompt advances from current
   // durable evidence instead of repeating an older attempt.
   if (!presentation) {
-    browserOpen = lastOccurrence((occurrence) => isBrowserAction(occurrence, 'open'))
-    navigation = browserOpen
+    const latestOpen = lastOccurrence((occurrence) => isBrowserAction(occurrence, 'open'))
+    browserOpen = latestOpen && browserOpenTargetsCanonical(latestOpen) ? latestOpen : undefined
+    const latestNavigationAttempt = browserOpen
       ? lastOccurrence(
-        (occurrence) => occurrence.call.name === 'browser'
-          && ['click', 'press'].includes(String(occurrence.call.arguments.action || '')),
+        isBrowserNavigationAttempt,
         Number.POSITIVE_INFINITY,
         browserOpen.resultMessageIndex,
       )
+      : undefined
+    navigation = browserOpen
+      && latestNavigationAttempt
+      && isNavigationAfter(browserOpen, latestNavigationAttempt)
+      && browserNavigationTargetsCanonical(latestNavigationAttempt)
+      ? latestNavigationAttempt
       : undefined
     screenshot = navigation
       ? lastOccurrence(
@@ -4712,7 +4931,7 @@ export function visualWebArtifactCompletionGap(
   if (!navigation) missing.add('navigation_check')
   if (!screenshot) missing.add('browser_screenshot')
   if (!inspection) missing.add('visual_inspection')
-  if (inspection && !/\bNO DEFECTS\b/iu.test(String(inspection.result.content || ''))) {
+  if (inspection && !visualInspectionPassed(inspection.result)) {
     missing.add('visual_inspection_pass')
   }
   if (!presentation) missing.add('present_file')
@@ -4736,16 +4955,162 @@ function visualWebArtifactRecoveryPrompt(gap: VisualWebArtifactCompletionGap): s
   return `[Harness operator action: Continue] The visual HTML presentation is not complete. Required remaining work: ${actions}. ${gap.canonicalPath ? `Continue from ${JSON.stringify(gap.canonicalPath)}; do not create a competing full-file variant. ` : ''}Do the remaining tool actions now in dependency order. Do not give a Final until the verified HTML has been presented.`
 }
 
+function nextVisualWebArtifactPhase(
+  gap: VisualWebArtifactCompletionGap | undefined,
+): VisualWebArtifactWorkflowPhase | undefined {
+  if (!gap) return undefined
+  const dependencyOrder: VisualWebArtifactWorkflowPhase[] = [
+    'web_research',
+    'html_artifact',
+    'website_preview',
+    'browser_open',
+    'navigation_check',
+    'browser_screenshot',
+    'visual_inspection',
+    'visual_inspection_pass',
+    'present_file',
+  ]
+  return dependencyOrder.find((phase) => gap.missingPhases.includes(phase))
+}
+
+function visualWebArtifactRequiredToolNames(
+  gap: VisualWebArtifactCompletionGap,
+): ReadonlySet<string> | undefined {
+  const phase = nextVisualWebArtifactPhase(gap)
+  switch (phase) {
+    case 'web_research': return new Set(['web_search', 'web_fetch', 'fetch_page'])
+    case 'html_artifact': return new Set(['write_file'])
+    case 'website_preview': return new Set(['start_process', 'build_and_start'])
+    case 'browser_open':
+    case 'navigation_check':
+    case 'browser_screenshot': return new Set(['browser'])
+    case 'visual_inspection': return new Set(['inspect_image'])
+    case 'visual_inspection_pass': return new Set(['edit_file'])
+    case 'present_file': return new Set(['present_file'])
+    default: return undefined
+  }
+}
+
+function visualWebArtifactPhaseInstruction(
+  gap: VisualWebArtifactCompletionGap | undefined,
+): string {
+  switch (nextVisualWebArtifactPhase(gap)) {
+    case 'web_research': return 'issue one bounded parallel batch of at most three complementary web_search calls'
+    case 'html_artifact': return 'write the one complete canonical self-contained HTML presentation using exact retrieved source URLs'
+    case 'website_preview': return 'start one managed Website preview for the canonical HTML'
+    case 'browser_open': return 'open the canonical HTML once in Browser at the desktop viewport'
+    case 'navigation_check': return 'perform exactly one forward Browser click or keypress and verify the changed slide state'
+    case 'browser_screenshot': return 'save exactly one screenshot of the current post-navigation Browser state'
+    case 'visual_inspection': return 'inspect that exact current screenshot and request exactly NO DEFECTS or at most three concrete defects'
+    case 'visual_inspection_pass': return 'apply one targeted edit for the concrete visual defects already reported'
+    case 'present_file': return 'call present_file exactly once for the verified canonical HTML'
+    default: return 'continue the next missing durable phase'
+  }
+}
+
+type CanonicalArtifactRepairPhase = 'search' | 'read' | 'edit'
+
+function researchArtifactSourceRepairPhase(
+  messages: readonly ModelMessage[],
+  canonicalPath: string,
+): CanonicalArtifactRepairPhase | undefined {
+  const active = activeTaskMessageSlice(messages)
+  const calls = new Map<string, ToolCallRecord>()
+  for (const message of active) {
+    if (message.role !== 'assistant') continue
+    for (const rawCall of message.tool_calls ?? []) {
+      calls.set(rawCall.id, normalizeAneraRuntimeToolCall({
+        id: rawCall.id,
+        name: rawCall.function.name,
+        arguments: parseArguments(rawCall.function.arguments),
+      }))
+    }
+  }
+  let blockedPresentationIndex = -1
+  let blockedPresentationNeedsResearch = false
+  for (let index = 0; index < active.length; index += 1) {
+    const message = active[index]
+    const missingSourceLedger = typeof message.content === 'string'
+      && /no successful retrieved source URL/i.test(message.content)
+    if (
+      message.role !== 'tool'
+      || !message.tool_call_id
+      || typeof message.content !== 'string'
+      || !/research-source verification failed/i.test(message.content)
+      || (!missingSourceLedger && !/(?:add at least one exact retrieved source URL|remove or replace unsupported external URLs)/i.test(message.content))
+    ) continue
+    const call = calls.get(message.tool_call_id)
+    if (
+      call?.name === 'present_file'
+      && typeof call.arguments.path === 'string'
+      && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+    ) {
+      blockedPresentationIndex = index
+      blockedPresentationNeedsResearch = missingSourceLedger
+    }
+  }
+  if (blockedPresentationIndex < 0) return undefined
+
+  let currentReadCompleted = false
+  let sourceRetrievedAfterBlock = false
+  for (let index = blockedPresentationIndex + 1; index < active.length; index += 1) {
+    const message = active[index]
+    if (message.role !== 'tool' || !message.tool_call_id || !toolResultProvesExecutedSuccess(message)) continue
+    const call = calls.get(message.tool_call_id)
+    if (!call) continue
+    if (retrievedResearchSourceUrls(call, message).length > 0) sourceRetrievedAfterBlock = true
+    const path = typeof call.arguments.path === 'string'
+      ? arenaWorkspacePathForVision(call.arguments.path)
+      : undefined
+    if (path !== canonicalPath) continue
+    if (['write_file', 'edit_file', 'apply_patch'].includes(call.name)) return undefined
+    if (call.name === 'read_file') currentReadCompleted = true
+  }
+  if (blockedPresentationNeedsResearch && !sourceRetrievedAfterBlock) return 'search'
+  return currentReadCompleted ? 'edit' : 'read'
+}
+
+function visualArtifactDefectRepairPhase(
+  messages: readonly ModelMessage[],
+  canonicalPath: string,
+): CanonicalArtifactRepairPhase | undefined {
+  const occurrences = successfulTaskToolOccurrences(messages)
+  const latestMutation = occurrences.filter(({ call }) => (
+    ['write_file', 'edit_file', 'apply_patch'].includes(call.name)
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+  )).at(-1)
+  const boundary = latestMutation?.resultMessageIndex ?? Number.NEGATIVE_INFINITY
+  const inspection = occurrences.filter(({ call, resultMessageIndex }) => (
+    call.name === 'inspect_image' && resultMessageIndex > boundary
+  )).at(-1)
+  if (!inspection || visualInspectionPassed(inspection.result)) return undefined
+  const currentReadCompleted = occurrences.some(({ call, resultMessageIndex }) => (
+    call.name === 'read_file'
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+    && resultMessageIndex > inspection.resultMessageIndex
+  ))
+  return currentReadCompleted ? 'edit' : 'read'
+}
+
 function canonicalArtifactDiagnosticReadRequired(messages: readonly ModelMessage[]): boolean {
   const latest = messages.at(-1)
-  if (latest?.role !== 'tool' || latest.tool_result_status !== 'failed' || !latest.tool_call_id) return false
-  if (typeof latest.content !== 'string' || !/context not found|read the file to verify/i.test(latest.content)) return false
-  if (/closest current excerpt/i.test(latest.content) && !/closest excerpt truncated/i.test(latest.content)) return false
+  if (latest?.role !== 'tool' || !latest.tool_call_id || typeof latest.content !== 'string') return false
+  const editContextMissing = latest.tool_result_status === 'failed'
+    && /context not found|read the file to verify/i.test(latest.content)
+    && (!/closest current excerpt/i.test(latest.content) || /closest excerpt truncated/i.test(latest.content))
+  const researchPresentationNeedsCurrentBytes = latest.tool_result_status === 'succeeded'
+    && /research-source verification failed/i.test(latest.content)
+    && /(?:add at least one exact retrieved source URL|remove or replace unsupported external URLs)/i.test(latest.content)
+  if (!editContextMissing && !researchPresentationNeedsCurrentBytes) return false
   for (let index = messages.length - 2; index >= 0; index -= 1) {
     const message = messages[index]
     if (message.role !== 'assistant') continue
     const call = message.tool_calls?.find((candidate) => candidate.id === latest.tool_call_id)
-    return call?.function.name === 'edit_file'
+    return editContextMissing
+      ? call?.function.name === 'edit_file'
+      : call?.function.name === 'present_file'
   }
   return false
 }
@@ -5457,26 +5822,8 @@ function webResearchCitationEvidence(messages: ModelMessage[]): WebResearchCitat
   for (const message of taskMessages) {
     if (message.role !== 'tool' || !message.tool_call_id || message.tool_result_status === 'failed') continue
     const call = toolNames.get(message.tool_call_id)
-    if (!call || !['web_search', 'fetch_page', 'web_fetch'].includes(call.name)) continue
-    let payload: Record<string, unknown> | undefined
-    try {
-      const parsed = JSON.parse(message.content ?? '') as unknown
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>
-    } catch {
-      // A non-JSON compatibility result cannot provide a trusted URL ledger.
-    }
-    if (!payload || payload.status !== 'success') continue
-    if (call.name === 'web_search' && Array.isArray(payload.results)) {
-      for (const result of payload.results) {
-        if (!result || typeof result !== 'object' || Array.isArray(result)) continue
-        const canonical = canonicalCitationUrl(String((result as Record<string, unknown>).url ?? ''))
-        if (canonical) sourceUrls.add(canonical)
-      }
-      continue
-    }
-    const resultUrl = canonicalCitationUrl(String(payload.url ?? ''))
-      ?? canonicalCitationUrl(String(call.arguments.url ?? ''))
-    if (resultUrl) sourceUrls.add(resultUrl)
+    if (!call) continue
+    for (const url of retrievedResearchSourceUrls(call, message)) sourceUrls.add(url)
   }
   const allowedUrls = new Set(sourceUrls)
   for (const message of taskMessages) {

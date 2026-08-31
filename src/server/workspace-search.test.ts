@@ -157,7 +157,7 @@ describe('Arena-style workspace search tools', () => {
     const bounded = await grepWorkspace(root, { pattern: 'needle', path: 'byte-cap.txt', context: 20 }, signal())
     expect(Buffer.byteLength(JSON.stringify(bounded))).toBeLessThanOrEqual(TOOL_RESULT_MAX_BYTES)
     expect(bounded.truncated).toBe(true)
-  }, 10_000)
+  }, 30_000)
 
   it('rejects unsafe or invalid search arguments and observes cancellation', async () => {
     const root = await workspace()

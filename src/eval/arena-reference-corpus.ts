@@ -490,7 +490,7 @@ function renderCorpusReadme(manifest: ArenaReferenceCorpusManifest): string {
   const rows = manifest.runs.map((run) => `| ${run.taskId} | ${run.taskVersion} | ${run.eventCount} | ${run.agentDurationMs} | ${String(run.captureQuality).replaceAll('_', ' ')} | ${run.taskResult} | ${RUN_OBSERVATIONS[run.taskId] || '结构化历史观察'} |`).join('\n')
   return `# Arena 手工 reference corpus intake
 
-日期：${manifest.generatedAt.slice(0, 10)}
+日期：${manifest.generatedAt.slice(0, 10)}${'  '}
 范围：Arena Agent Mode 桌面端；只读接入；移动端排除
 
 ## 判定

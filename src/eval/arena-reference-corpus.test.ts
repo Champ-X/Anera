@@ -16,6 +16,10 @@ import { traceFromJsonl } from './trace-io.js'
 
 const temporaryRoots: string[] = []
 const committedReportRoot = resolve('reports/arena-reference-corpus-2026-08-30')
+const committedManifestPath = join(committedReportRoot, 'manifest.json')
+const committedManifest = existsSync(committedManifestPath)
+  ? JSON.parse(readFileSync(committedManifestPath, 'utf8')) as ArenaReferenceCorpusManifest
+  : undefined
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
@@ -182,8 +186,9 @@ post_run:
     expect(manifest.coverage).toMatchObject({ distinctCapabilityIds: ['H57'], unmappedObservations: 2 })
   })
 
-  it('keeps the committed curated manifest hashes and event counts internally consistent', () => {
-    const manifest = JSON.parse(readFileSync(join(committedReportRoot, 'manifest.json'), 'utf8')) as ArenaReferenceCorpusManifest
+  it.skipIf(!committedManifest)('keeps the committed curated manifest hashes and event counts internally consistent', () => {
+    if (!committedManifest) throw new Error('Committed private report is unavailable')
+    const manifest = committedManifest
     const canonicalNames = readdirSync(join(committedReportRoot, 'canonical')).filter((name) => name.endsWith('.jsonl')).sort()
     const manifestNames = manifest.runs.map((run) => run.curatedCanonical.replace(/^canonical\//, '')).sort()
     let totalEvents = 0
@@ -200,8 +205,8 @@ post_run:
     expect(totalEvents).toBe(manifest.inventory.totalCanonicalEvents)
   })
 
-  const committedManifest = JSON.parse(readFileSync(join(committedReportRoot, 'manifest.json'), 'utf8')) as ArenaReferenceCorpusManifest
-  it.skipIf(!existsSync(committedManifest.sourceRoot))('exactly regenerates the committed report from its read-only source', () => {
+  it.skipIf(!committedManifest || !existsSync(committedManifest.sourceRoot))('exactly regenerates the committed report from its read-only source', () => {
+    if (!committedManifest) throw new Error('Committed private report is unavailable')
     const root = temporaryRoot()
     const regenerated = join(root, 'regenerated')
     generateArenaReferenceCorpus({

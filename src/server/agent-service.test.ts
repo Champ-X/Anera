@@ -1680,6 +1680,130 @@ describe('agent context preparation', () => {
     ])).toBe(true)
   })
 
+  it('recovers visual HTML routing and time-sensitive research intent only from a trusted checkpoint continuation', () => {
+    const checkpoint: ModelMessage = {
+      role: 'user',
+      content: `${projectArenaCompactionCheckpoint('Unfinished user task: research this week\'s AI hotspots and create polished HTML Slides for presentation.')}`
+        + '\n\n[Harness operator context: Continue the unfinished task from the trusted checkpoint and retained messages; this is not a new user request.]',
+      arena_system_messages: [{ kind: 'compaction', position: 'leading' }],
+    }
+    const continuation: ModelMessage = {
+      role: 'user',
+      content: '[Harness operator action: Continue] Resume the unfinished task without repeating completed work.',
+    }
+    const messages = [checkpoint, continuation]
+    expect(isVisualWebArtifactTask(messages)).toBe(true)
+    expect(isSingleArtifactWebTask(messages)).toBe(true)
+    expect(selectAgentToolDefinitions(routingState(messages)).map((tool) => tool.function.name)).toContain('browser')
+    expect(visualWebArtifactCompletionGap(messages)).toMatchObject({
+      missingPhases: expect.arrayContaining(['web_research', 'html_artifact']),
+    })
+
+    const untrusted = [{ ...checkpoint, arena_system_messages: undefined }, continuation]
+    expect(isVisualWebArtifactTask(untrusted)).toBe(false)
+  })
+
+  it('recovers the canonical HTML path from a successful compacted write_file mutation', () => {
+    const messages: ModelMessage[] = [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_compacted_html',
+        type: 'function',
+        function: {
+          name: 'write_file',
+          arguments: JSON.stringify({
+            path: 'ai-week.html',
+            _historicalMutation: {
+              operation: 'write_file',
+              payload: 'omitted_after_consumption',
+              argumentBytes: 24_577,
+              sha256: 'fixture',
+            },
+          }),
+        },
+      }],
+    }, {
+      role: 'tool',
+      tool_call_id: 'call_compacted_html',
+      tool_result_status: 'succeeded',
+      content: '{"status":"success","path":"ai-week.html"}',
+    }]
+    expect(visualWebArtifactCompletionGap(messages, { forceTask: true, requiresResearch: false })).toMatchObject({
+      canonicalPath: 'ai-week.html',
+      missingPhases: expect.not.arrayContaining(['html_artifact']),
+    })
+  })
+
+  it('restores the canonical visual-research phase from a trusted checkpoint on AgentService resume', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-visual-checkpoint-resume-'))
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    let modelCall = 0
+    const stream = vi.fn(async (options: {
+      messages: ModelMessage[]
+      tools: Array<{ function: { name: string } }>
+    }) => {
+      modelCall += 1
+      if (modelCall === 1) throw new Error('fixture interruption before checkpoint restore')
+      const names = options.tools.map((tool) => tool.function.name)
+      expect(names).toContain('web_search')
+      expect(names).not.toContain('write_file')
+      expect(options.messages[0]?.content).toContain('canonical self-contained Web deliverable already exists at "ai-week.html"')
+      expect(options.messages[0]?.content).toContain('Harness visual HTML presentation contract')
+      throw new Error('fixture stop after recovered routing assertion')
+    })
+    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 1_000 })
+    try {
+      await agent.submit(session.summary.id, { content: 'Seed an interrupted task.' })
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await store.get(session.summary.id)).summary.status === 'failed' && !agent.isRunning(session.summary.id)) break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+      const checkpoint: ModelMessage = {
+        role: 'user',
+        content: `${projectArenaCompactionCheckpoint('Unfinished user task: research this week\'s AI hotspots and create polished HTML Slides for presentation.')}`
+          + '\n\n[Harness operator context: Continue the unfinished task from the trusted checkpoint and retained messages; this is not a new user request.]',
+        arena_system_messages: [{ kind: 'compaction', position: 'leading' }],
+      }
+      await store.update(session.summary.id, (state) => {
+        state.messages = [checkpoint, {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_compacted_resume_html',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'ai-week.html',
+                _historicalMutation: { operation: 'write_file', payload: 'omitted_after_consumption' },
+              }),
+            },
+          }],
+        }, {
+          role: 'tool',
+          tool_call_id: 'call_compacted_resume_html',
+          tool_result_status: 'succeeded',
+          content: '{"status":"success","path":"ai-week.html"}',
+        }, {
+          role: 'assistant',
+          content: 'The canonical HTML write completed before the interruption.',
+        }]
+      })
+      await agent.resume(session.summary.id)
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await store.get(session.summary.id)).summary.status === 'failed' && !agent.isRunning(session.summary.id)) break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+      expect(modelCall).toBe(2)
+    } finally {
+      await agent.shutdown()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('requires the full research, preview, interaction, visual, and presentation chain for HTML Slides', () => {
     const step = (
       id: string,
@@ -1700,17 +1824,27 @@ describe('agent context preparation', () => {
       role: 'user',
       content: '看看本周的AI领域热点，创建一个精美的HTML Slides进行展示。',
     }
+    const canonicalBrowserUrl = 'http://127.0.0.1:49123/workspace/ses_fixture/preview/ai-week.html'
     const research = step('search', 'web_search', { query: 'AI news this week', depth: '2' }, JSON.stringify({
       status: 'success',
       results: [{ url: 'https://news.example/ai-week', title: 'AI week' }],
+    }))
+    const emptyResearch = step('search-empty', 'web_search', { query: 'AI news this week', depth: '2' }, JSON.stringify({
+      status: 'success',
+      results: [],
     }))
     const write = step('write', 'write_file', {
       path: 'ai-week.html',
       content: '<!doctype html><html><body><main class="slide">AI week</main><a href="https://news.example/ai-week">Source</a></body></html>',
     }, '{"status":"success"}')
     const preview = step('preview', 'start_process', { command: 'npm run preview' }, 'Website preview is running at http://127.0.0.1:4173')
-    const open = step('open', 'browser', { action: 'open', path: 'ai-week.html' }, '{"url":"http://127.0.0.1:4173"}')
-    const navigate = step('next', 'browser', { action: 'press', key: 'ArrowRight' }, '{"text":"2 / 6"}')
+    const exitedPreview = step('preview-exited', 'start_process', { command: 'npm run preview' }, JSON.stringify({
+      status: 'exited', exit_code: 0,
+    }))
+    const open = step('open', 'browser', { action: 'open', path: 'ai-week.html' }, JSON.stringify({ url: canonicalBrowserUrl }))
+    const navigate = step('next', 'browser', { action: 'press', key: 'ArrowRight' }, JSON.stringify({
+      url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
     const screenshot = step('shot', 'browser', { action: 'screenshot', screenshot_path: 'evidence/ai-week.png' }, 'Saved browser screenshot to evidence/ai-week.png (123 bytes).')
     const inspect = step('inspect', 'inspect_image', {
       path: 'evidence/ai-week.png',
@@ -1725,15 +1859,83 @@ describe('agent context preparation', () => {
       .toEqual({ canonicalPath: 'ai-week.html', missingPhases: ['present_file'] })
     expect(visualWebArtifactCompletionGap([request, ...research, ...write, ...preview, ...open, ...navigate, ...screenshot, ...inspect, ...present]))
       .toBeUndefined()
+    expect(visualWebArtifactCompletionGap([request, ...research, ...write, ...exitedPreview, ...open, ...navigate, ...screenshot, ...inspect, ...present]))
+      .toEqual({ canonicalPath: 'ai-week.html', missingPhases: ['website_preview'] })
+    expect(visualWebArtifactCompletionGap([request, ...emptyResearch, ...write, ...preview, ...open, ...navigate, ...screenshot, ...inspect, ...present]))
+      .toMatchObject({ canonicalPath: 'ai-week.html', missingPhases: expect.arrayContaining(['web_research']) })
+
+    const decoyBrowserUrl = 'http://127.0.0.1:49123/workspace/ses_fixture/preview/decoy.html'
+    const decoyOpen = step('open-decoy', 'browser', { action: 'open', path: 'decoy.html' }, JSON.stringify({ url: decoyBrowserUrl }))
+    const decoyNavigate = step('next-decoy', 'browser', { action: 'press', key: 'ArrowRight' }, JSON.stringify({
+      url: `${decoyBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
+    const browserPhases = ['browser_open', 'navigation_check', 'browser_screenshot', 'visual_inspection', 'present_file']
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...decoyOpen, ...decoyNavigate, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ canonicalPath: 'ai-week.html', missingPhases: expect.arrayContaining(browserPhases) })
+    const mismatchedOpen = step('open-mismatched-result', 'browser', { action: 'open', path: 'ai-week.html' }, JSON.stringify({ url: decoyBrowserUrl }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...mismatchedOpen, ...decoyNavigate, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ canonicalPath: 'ai-week.html', missingPhases: expect.arrayContaining(browserPhases) })
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...navigate, ...decoyOpen, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ canonicalPath: 'ai-week.html', missingPhases: expect.arrayContaining(browserPhases) })
+    const navigationWithoutUrl = step('next-without-url', 'browser', { action: 'press', key: 'ArrowRight' }, '{"text":"2 / 6"}')
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...navigationWithoutUrl, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({
+      canonicalPath: 'ai-week.html',
+      missingPhases: expect.arrayContaining(['navigation_check', 'browser_screenshot', 'visual_inspection', 'present_file']),
+    })
+    const escape = step('escape', 'browser', { action: 'press', key: 'Escape' }, JSON.stringify({
+      url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...escape, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ missingPhases: expect.arrayContaining(['navigation_check']) })
+    const clickWithoutRef = step('next-click-no-ref', 'browser', { action: 'click', text: 'Next' }, JSON.stringify({
+      url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...clickWithoutRef, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ missingPhases: expect.arrayContaining(['navigation_check']) })
+    const unchangedClick = step('next-click-unchanged', 'browser', { action: 'click', ref: 'e12' }, JSON.stringify({
+      url: canonicalBrowserUrl,
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...unchangedClick, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ missingPhases: expect.arrayContaining(['navigation_check']) })
+    const validClick = step('next-click', 'browser', { action: 'click', ref: 'e12' }, JSON.stringify({
+      url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...validClick, ...screenshot, ...inspect, ...present,
+    ])).toBeUndefined()
+    const navigationAway = step('next-away', 'browser', { action: 'click', text: 'Other deck' }, JSON.stringify({ url: decoyBrowserUrl }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...navigate, ...navigationAway, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({
+      canonicalPath: 'ai-week.html',
+      missingPhases: expect.arrayContaining(['navigation_check', 'browser_screenshot', 'visual_inspection', 'present_file']),
+    })
     const defective = step('inspect-defect', 'inspect_image', {
       path: 'evidence/ai-week.png',
       prompt: 'Return exactly NO DEFECTS or concrete defects.',
     }, 'Visual inspection:\nThe footer clips at the viewport edge.')
     expect(visualWebArtifactCompletionGap([request, ...research, ...write, ...preview, ...open, ...navigate, ...screenshot, ...defective, ...present]))
       .toMatchObject({ missingPhases: expect.arrayContaining(['visual_inspection_pass']) })
+    const misleadingPass = step('inspect-misleading-pass', 'inspect_image', {
+      path: 'evidence/ai-week.png',
+      prompt: 'Return exactly NO DEFECTS or concrete defects.',
+    }, 'Visual inspection:\nNOT NO DEFECTS: the footer clips at the viewport edge.')
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...navigate, ...screenshot, ...misleadingPass, ...present,
+    ])).toMatchObject({ missingPhases: expect.arrayContaining(['visual_inspection_pass']) })
 
-    const repairedOpen = step('open-repaired', 'browser', { action: 'open', path: 'ai-week.html' }, '{"url":"http://127.0.0.1:4173"}')
-    const repairedNavigate = step('next-repaired', 'browser', { action: 'press', key: 'ArrowRight' }, '{"text":"2 / 6"}')
+    const repairedOpen = step('open-repaired', 'browser', { action: 'open', path: 'ai-week.html' }, JSON.stringify({ url: canonicalBrowserUrl }))
+    const repairedNavigate = step('next-repaired', 'browser', { action: 'press', key: 'ArrowRight' }, JSON.stringify({
+      url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
     const repairedScreenshot = step('shot-repaired', 'browser', { action: 'screenshot', screenshot_path: 'evidence/ai-week-repaired.png' }, 'Saved browser screenshot to evidence/ai-week-repaired.png (124 bytes).')
     const repairedInspect = step('inspect-repaired', 'inspect_image', {
       path: 'evidence/ai-week-repaired.png',
@@ -1748,7 +1950,194 @@ describe('agent context preparation', () => {
       request, ...research, ...write, ...preview, ...open, ...navigate, ...screenshot, ...defective, ...present,
       ...repairedCycle, ...repairedPresent,
     ])).toBeUndefined()
+
+    const compactedContinue: ModelMessage = {
+      role: 'user',
+      content: '[Harness operator action: Continue] The visual HTML presentation is not complete. Continue the next verification phase.',
+    }
+    expect(visualWebArtifactCompletionGap(
+      [...research, ...write, ...preview, ...open, compactedContinue],
+      { forceTask: true, requiresResearch: true, canonicalPath: 'ai-week.html' },
+    )).toMatchObject({
+      canonicalPath: 'ai-week.html',
+      missingPhases: expect.arrayContaining(['navigation_check', 'browser_screenshot', 'visual_inspection', 'present_file']),
+    })
   })
+
+  it('closes the tool surface after a visual HTML workflow passes and forces the next response to be Final', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-visual-html-final-'))
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const initialHtml = '<!doctype html><html><body><main class="slide">AI week</main><button aria-label="Next">Next</button><a href="https://invented.example/ai-week">Source</a></body></html>'
+    let currentHtml = initialHtml
+    const calls = [
+      { id: 'visual-search-empty', name: 'web_search', arguments: { query: 'AI news this week', depth: '2' } },
+      { id: 'visual-search', name: 'web_search', arguments: { query: 'AI news this week', depth: '2' } },
+      { id: 'visual-write', name: 'write_file', arguments: { path: 'ai-week.html', content: initialHtml } },
+      { id: 'visual-preview', name: 'start_process', arguments: { command: 'npm run preview' } },
+      { id: 'visual-open', name: 'browser', arguments: { action: 'open', path: 'ai-week.html' } },
+      { id: 'visual-next', name: 'browser', arguments: { action: 'press', key: 'ArrowRight' } },
+      { id: 'visual-shot', name: 'browser', arguments: { action: 'screenshot', screenshot_path: 'ai-week.png' } },
+      { id: 'visual-inspect-defect', name: 'inspect_image', arguments: { path: 'ai-week.png', prompt: 'Return exactly NO DEFECTS or concrete defects.' } },
+      { id: 'visual-read-repair', name: 'read_file', arguments: { path: 'ai-week.html' } },
+      { id: 'visual-edit-repair', name: 'edit_file', arguments: { path: 'ai-week.html', old_text: '<main class="slide">', new_text: '<main class="slide repaired">' } },
+      { id: 'visual-open-repaired', name: 'browser', arguments: { action: 'open', path: 'ai-week.html' } },
+      { id: 'visual-next-repaired', name: 'browser', arguments: { action: 'press', key: 'ArrowRight' } },
+      { id: 'visual-shot-repaired', name: 'browser', arguments: { action: 'screenshot', screenshot_path: 'ai-week.png' } },
+      { id: 'visual-inspect-repaired', name: 'inspect_image', arguments: { path: 'ai-week.png', prompt: 'Return exactly NO DEFECTS or concrete defects.' } },
+      { id: 'visual-present-unverified-source', name: 'present_file', arguments: { path: 'ai-week.html' } },
+      { id: 'visual-read-source-repair', name: 'read_file', arguments: { path: 'ai-week.html' } },
+      { id: 'visual-edit-source-repair', name: 'edit_file', arguments: { path: 'ai-week.html', old_text: 'https://invented.example/ai-week', new_text: 'https://news.example/ai-week' } },
+      { id: 'visual-open-grounded', name: 'browser', arguments: { action: 'open', path: 'ai-week.html' } },
+      { id: 'visual-next-grounded', name: 'browser', arguments: { action: 'press', key: 'ArrowRight' } },
+      { id: 'visual-shot-grounded', name: 'browser', arguments: { action: 'screenshot', screenshot_path: 'ai-week.png' } },
+      { id: 'visual-inspect-grounded', name: 'inspect_image', arguments: { path: 'ai-week.png', prompt: 'Return exactly NO DEFECTS or concrete defects.' } },
+      { id: 'visual-present', name: 'present_file', arguments: { path: 'ai-week.html' } },
+    ]
+    let modelCall = 0
+    let callCursor = 0
+    let prematureStopIssued = false
+    const stream = vi.fn(async (options: {
+      messages: ModelMessage[]
+      tools: ToolDefinition[]
+      onContent: (delta: string) => void
+    }) => {
+      modelCall += 1
+      if (!prematureStopIssued && callCursor === 5) {
+        prematureStopIssued = true
+        const draft = 'Draft ready [source](https://news.example/ai-week).'
+        options.onContent(draft)
+        return {
+          content: draft, reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+          usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13, cachedPromptTokens: 0 },
+          modelCallCount: 1,
+        }
+      }
+      const call = calls[callCursor]
+      callCursor += 1
+      if (call) {
+        const names = options.tools.map((tool) => tool.function.name)
+        if (['visual-search-empty', 'visual-search'].includes(call.id)) {
+          expect(names).toContain('web_search')
+          expect(names).not.toContain('write_file')
+          expect(names).not.toContain('present_file')
+        }
+        if (['visual-read-repair', 'visual-read-source-repair'].includes(call.id)) expect(names).toEqual(['read_file'])
+        if (['visual-edit-repair', 'visual-edit-source-repair'].includes(call.id)) expect(names).toEqual(['edit_file'])
+        if (call.id === 'visual-present') expect(names).toEqual(['present_file'])
+        return {
+          content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
+          toolCalls: [{
+            id: call.id,
+            type: 'function' as const,
+            function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+          }],
+          usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 0 },
+          modelCallCount: 1,
+        }
+      }
+      expect(options.tools).toEqual([])
+      expect(options.messages[0]?.content).toContain('All required durable boundaries are complete')
+      const final = 'HTML Slides 已完成并发布。'
+      options.onContent(final)
+      return {
+        content: final, reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+        usage: { promptTokens: 12, completionTokens: 4, totalTokens: 16, cachedPromptTokens: 0 },
+        modelCallCount: 1,
+      }
+    })
+    const execute = vi.fn(async (call: { id: string; name: string; arguments: Record<string, unknown> }) => {
+      if (call.id === 'visual-search-empty') return {
+        content: JSON.stringify({ status: 'success', results: [] }),
+        isError: false,
+      }
+      if (call.name === 'web_search') return {
+        content: JSON.stringify({
+          status: 'success',
+          results: [{ id: 1, title: 'AI week', url: 'https://news.example/ai-week', description: 'Current AI news.' }],
+        }),
+        isError: false,
+      }
+      if (call.name === 'write_file') {
+        currentHtml = initialHtml
+        await writeFile(resolve(store.workspaceDir(session.summary.id), 'ai-week.html'), currentHtml, 'utf8')
+        return { content: '{"status":"success"}', isError: false }
+      }
+      if (call.name === 'browser' && call.arguments.action === 'screenshot') {
+        await store.update(session.summary.id, (state) => {
+          if (state.artifacts.some((artifact) => artifact.path === 'ai-week.png')) return
+          state.artifacts.push({
+            id: 'visual-shot-artifact',
+            sessionId: session.summary.id,
+            path: 'ai-week.png',
+            name: 'ai-week.png',
+            kind: 'image',
+            mime: 'image/png',
+            createdAt: '2026-08-31T00:00:00.000Z',
+            downloadUrl: `/api/sessions/${session.summary.id}/download?path=ai-week.png`,
+          })
+        })
+        return { content: '{"status":"success","path":"ai-week.png"}', isError: false }
+      }
+      if (call.name === 'browser' && call.arguments.action === 'open') return {
+        content: JSON.stringify({
+          url: 'http://127.0.0.1:49123/workspace/ses_fixture/preview/ai-week.html',
+          text: '1 / 6',
+        }),
+        isError: false,
+      }
+      if (call.name === 'browser' && ['click', 'press'].includes(String(call.arguments.action || ''))) return {
+        content: JSON.stringify({
+          url: 'http://127.0.0.1:49123/workspace/ses_fixture/preview/ai-week.html#slide-2',
+          text: '2 / 6',
+        }),
+        isError: false,
+      }
+      if (call.id === 'visual-inspect-defect') return {
+        content: 'Visual inspection:\nThe footer overlaps the slide content.',
+        isError: false,
+      }
+      if (call.name === 'read_file') return {
+        content: JSON.stringify({ status: 'success', kind: 'text', content: currentHtml, hasMore: false }),
+        isError: false,
+      }
+      if (call.name === 'edit_file') {
+        currentHtml = currentHtml.replace(String(call.arguments.old_text), String(call.arguments.new_text))
+        await writeFile(resolve(store.workspaceDir(session.summary.id), 'ai-week.html'), currentHtml, 'utf8')
+        return { content: '{"status":"success"}', isError: false }
+      }
+      if (call.name === 'inspect_image') return { content: 'Visual inspection:\nNO DEFECTS', isError: false }
+      return { content: JSON.stringify({ status: 'success', path: call.arguments.path }), isError: false }
+    })
+    const agent = new AgentService(store, {
+      client: { stream } as never,
+      tools: { execute } as never,
+      runTimeoutMs: 5_000,
+    })
+    try {
+      await agent.submit(session.summary.id, {
+        content: '看看本周的AI领域热点，创建一个精美的HTML Slides进行展示。',
+      })
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if ((await store.get(session.summary.id)).summary.status === 'completed') break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+      const state = await store.get(session.summary.id)
+      const events = await store.events(session.summary.id)
+      expect(
+        state.summary.status,
+        JSON.stringify(events.filter((event) => ['error', 'tool.failed', 'turn.completed'].includes(event.type))),
+      ).toBe('completed')
+      expect(modelCall).toBe(24)
+      expect(execute).toHaveBeenCalledTimes(21)
+      expect(events.filter((event) => event.type === 'tool.failed')).toHaveLength(0)
+      expect(events.filter((event) => event.type === 'assistant.final')).toHaveLength(1)
+    } finally {
+      await agent.shutdown()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 10_000)
 
   it('detects an explicit missing file deliverable and clears the gate only after the artifact exists', () => {
     const messages: ModelMessage[] = [{
@@ -2457,7 +2846,8 @@ describe('agent context preparation', () => {
       }
       if (modelCall === 3) {
         expect(names).toContain('read_file')
-        expect(options.messages[0]?.content).toContain('temporarily available for one diagnostic read')
+        expect(names).toEqual(['read_file'])
+        expect(options.messages[0]?.content).toContain('read_file is the only tool available for this one diagnostic step')
         return {
           content: '', reasoningContent: '', finishReason: 'tool_calls',
           toolCalls: [{

@@ -14,9 +14,10 @@ let agent
 let base = ''
 
 try {
-  const [{ createApp }, { config }] = await Promise.all([
+  const [{ createApp }, { config }, { isSingleArtifactWebTask, isVisualWebArtifactTask, visualWebArtifactCompletionGap }] = await Promise.all([
     import(pathToFileURL(resolve(projectRoot, 'dist-server/server/app.js')).href),
     import(pathToFileURL(resolve(projectRoot, 'dist-server/server/config.js')).href),
+    import(pathToFileURL(resolve(projectRoot, 'dist-server/server/agent-service.js')).href),
   ])
   const created = await createApp({
     dataRoot,
@@ -66,8 +67,8 @@ try {
   const completedCalls = completed.map((event) => event.data.call || {})
   const completedNames = completedCalls.map((call) => call.name)
   const successfulPresent = completed.find((event) => event.data.call?.name === 'present_file')
-  const presentedPath = String(successfulPresent?.data.call?.arguments?.path || '')
-  const htmlArtifact = snapshot.artifacts.find((artifact) => artifact.path === presentedPath && /\.html?$/i.test(artifact.path))
+  const presentedPath = normalizeWorkspacePath(successfulPresent?.data.call?.arguments?.path)
+  const htmlArtifact = snapshot.artifacts.find((artifact) => normalizeWorkspacePath(artifact.path) === presentedPath && /\.html?$/i.test(artifact.path))
     || snapshot.artifacts.find((artifact) => /\.html?$/i.test(artifact.path))
   if (!htmlArtifact) throw new Error('No HTML artifact was produced')
 
@@ -91,7 +92,7 @@ try {
   const navigationIndex = completedLastIndex((call) => call.name === 'browser' && ['click', 'press'].includes(call.arguments?.action), screenshotIndex >= 0 ? screenshotIndex : completed.length)
   const openIndex = completedLastIndex((call) => call.name === 'browser' && call.arguments?.action === 'open', navigationIndex >= 0 ? navigationIndex : completed.length)
   const screenshotCall = completedCalls[screenshotIndex]
-  const screenshotPath = String(screenshotCall?.arguments?.screenshot_path || screenshotCall?.arguments?.path || '')
+  const screenshotPath = normalizeWorkspacePath(screenshotCall?.arguments?.screenshot_path || screenshotCall?.arguments?.path)
   let screenshotBytes = Buffer.alloc(0)
   if (screenshotPath) {
     const response = await fetch(`${base}/api/sessions/${session.id}/download?path=${encodeURIComponent(screenshotPath)}`)
@@ -106,8 +107,15 @@ try {
   const sequencePassed = [searchIndex, writeIndex, previewIndex, openIndex, navigationIndex, screenshotIndex, inspectIndex, presentIndex]
     .every((value, index, all) => value >= 0 && (index === 0 || value > all[index - 1]))
   const unexpectedFailures = failed.filter((event) => event.data.notExecuted !== true)
+  const internalState = await created.store.get(session.id)
+  const completionGap = visualWebArtifactCompletionGap(internalState.messages, {
+    forceTask: true,
+    requiresResearch: true,
+    canonicalPath: htmlArtifact.path,
+  })
   const checks = {
     completed: snapshot.session.status === 'completed',
+    canonicalWorkflowComplete: completionGap === undefined,
     exactPromptPreserved: snapshot.events.some((event) => event.type === 'turn.started' && event.data.content === prompt),
     fullToolSequence: sequencePassed,
     researchBeforeArtifact: searchIndex >= 0 && searchIndex < writeIndex,
@@ -150,6 +158,11 @@ try {
       agentModel: config.model,
       visionModel: config.visionModel,
       temperature: config.modelTemperature,
+    },
+    internalWorkflowDiagnostic: {
+      classifiedSingleArtifact: isSingleArtifactWebTask(internalState.messages),
+      classifiedVisualWebArtifact: isVisualWebArtifactTask(internalState.messages),
+      completionGap: completionGap ?? null,
     },
     sessionId: session.id,
     status: snapshot.session.status,
@@ -240,4 +253,15 @@ async function fingerprintCurrentImplementation(root) {
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function normalizeWorkspacePath(value) {
+  return String(value || '')
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^file:\/\/+/i, '/')
+    .replace(/^\/home\/user\/?/i, '')
+    .replace(/^~\/?/, '')
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '')
 }

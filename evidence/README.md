@@ -10,6 +10,7 @@ This directory is the compact, publication-safe evidence surface for the replica
 | [`ui-state-coverage-summary.json`](./ui-state-coverage-summary.json) | 61/61 deterministic desktop states and interaction gates | Cross-product pixel parity or mobile coverage |
 | [`live-web-provider-summary.json`](./live-web-provider-summary.json) | Live Tavily/Firecrawl admission, pagination, and cache behavior | Provider dollar cost or Arena provider identity |
 | [`live-vision-summary.json`](./live-vision-summary.json) | Live DeepSeek Vision dispatch, metering, tool chain, and corrected historical cost | A new bill or an Arena vision baseline |
+| [`html-slides-live-summary.json`](./html-slides-live-summary.json) | The exact recording prompt closing research → HTML → preview → Browser navigation → screenshot → Vision → presentation with a fingerprinted production bundle | An Arena-side trace, same-viewport pixel baseline, or provider-identity match |
 | [`arena-reference-corpus-summary.md`](./arena-reference-corpus-summary.md) / [JSON](./arena-reference-corpus-summary.json) | Historical structured Arena intake counts and limits | A current v2.0 paired parity score |
 | [`arena-video-audit-summary.md`](./arena-video-audit-summary.md) | Sanitized timeline and gap conclusion from one private recording | The private recording or any screenshot from it |
 
