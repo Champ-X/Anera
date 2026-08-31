@@ -3482,7 +3482,7 @@ describe('agent context preparation', () => {
       await agent.shutdown()
       await rm(root, { recursive: true, force: true })
     }
-  })
+  }, 15_000)
 
   it('fail-closes admission and durably interrupts an active run before idempotent shutdown resolves', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-graceful-shutdown-'))

@@ -179,7 +179,7 @@ const evidenceSourceRows = [
   ['冻结公开 deployment', '59 scripts + 1 route', '冻结 active registry、schema、prompt/UI 文案与 transport', 'dpl_A1V…；2026-08-30；未登录只读'],
   ['历史 Arena corpus', '9 runs · 231 events', '校准事件 schema、失败透明度和产品生命周期', 'v1.x 历史协议；v2 eligible = 0'],
   ['完整登录态录屏', '259.660s · 3452×2082', '恢复可见事件偏序、用户动作与终态面板', '原始帧与账户画面不公开'],
-  ['Anera 内部门禁', '940 regressions + 18 tasks', '自动化回归覆盖 Harness/耐久性；独立质量任务检查结果', '两类证据分开计；不替代 Arena paired trace'],
+  ['Anera 内部门禁', '938 pass · 2 skip + 18 tasks', '自动化回归覆盖 Harness/耐久性；独立质量任务检查结果', '私有 corpus 审计在公开 checkout 跳过；不替代 Arena paired trace'],
   ['原提示 canary 快照', '10 model · 10 tool', '同一 episode 闭合 research、HTML、Browser、Vision 与 present', '绑定 c365…9f8 构建；非当前 tree attestation'],
   ['静态公开回放', '4 redacted Sessions', '让访问者审阅已提交的脱敏事件、用量字段与 Artifact 投影', '原始 runtime 不公开；只读'],
 ]

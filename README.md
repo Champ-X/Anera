@@ -17,7 +17,7 @@
 | 冻结质量任务 | 18/18 | 平均质量 99.44，118 次工具调用，0 次工具失败 |
 | 原提示 HTML Slides canary | ✅ | 联网研究、HTML、Preview、Browser、截图、视觉检查、发布与唯一 Final 全链通过 |
 | 桌面 UI 状态 | 61/61 | 1440×900，0 console error，0 外层溢出 |
-| 工程门禁 | 52 / 940 | 52 个测试文件、940 项测试全部通过；typecheck 和 production build 通过 |
+| 工程门禁 | 52 / 940 | 发现 940 项：公开 checkout 预期 938 项通过、2 项私有 corpus 审计跳过；typecheck 和 production build 通过 |
 
 这里的“完成”指 **Anera 自身主体能力闭环**，不代表已取得 Arena 私有源码或模型权重，也不代表与 Arena 的随机策略、逐像素 UI、逐步轨迹和成本完全相同。
 
