@@ -1,0 +1,1154 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { DeepSeekClient } from './deepseek.js'
+
+afterEach(() => vi.unstubAllGlobals())
+
+describe('DeepSeek client', () => {
+  it('supports a tool-free bounded completion for context checkpoints', async () => {
+    let submitted: Record<string, unknown> | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response([
+        'data: {"choices":[{"delta":{"content":"checkpoint"},"finish_reason":null}]}',
+        '',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }))
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192 })
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Summarize.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      maxOutputTokens: 1800,
+      model: 'override-model',
+    })
+
+    expect(result.content).toBe('checkpoint')
+    expect(result.usage.totalTokens).toBe(12)
+    expect(submitted?.max_tokens).toBe(1800)
+    expect(submitted?.model).toBe('override-model')
+    expect(submitted?.temperature).toBe(0)
+    expect(submitted).not.toHaveProperty('tools')
+    expect(submitted).not.toHaveProperty('tool_choice')
+  })
+
+  it('parses CRLF SSE blocks and a final event without a blank-line terminator', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response([
+      'data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12,"prompt_cache_hit_tokens":4}}',
+    ].join('\r\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })))
+    const onContent = vi.fn()
+    const onReasoning = vi.fn()
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192 })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Parse.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning,
+    })
+
+    expect(result).toMatchObject({
+      content: 'answer',
+      reasoningContent: 'think',
+      finishReason: 'stop',
+      usage: { promptTokens: 9, completionTokens: 3, totalTokens: 12, cachedPromptTokens: 4 },
+    })
+    expect(onContent).toHaveBeenCalledWith('answer')
+    expect(onReasoning).toHaveBeenCalledWith('think')
+  })
+
+  it('keeps a successful response without provider usage distinct from an authoritative completed call', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response([
+      'data: {"choices":[{"delta":{"content":"answer without usage"},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })))
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Answer.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'answer without usage',
+      modelRequestCount: 1,
+      modelCallCount: 0,
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedPromptTokens: 0 },
+    })
+  })
+
+  it('attaches physical request accounting to an HTTP error without inventing token usage', async () => {
+    const fetchMock = vi.fn(async () => new Response('provider unavailable', { status: 503 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Fail honestly.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })).rejects.toMatchObject({
+      message: expect.stringContaining('503'),
+      modelRequestCount: 1,
+      modelCallCount: 0,
+      modelUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedPromptTokens: 0 },
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('retries a transport failure only before any visible stream delta', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(streamResponse('recovered'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test',
+      baseUrl: 'https://api.example',
+      model: 'test-model',
+      maxOutputTokens: 8192,
+      maxRetries: 2,
+      retryBaseDelayMs: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })
+
+    expect(result.content).toBe('recovered')
+    expect(result).toMatchObject({ modelRequestCount: 2, modelCallCount: 1 })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onContent).toHaveBeenCalledOnce()
+  })
+
+  it('bounds each provider attempt until its first SSE event and safely retries a pre-stream stall', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async (_url: string, init?: RequestInit) => await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) throw new Error('Missing provider abort signal')
+        const abort = () => reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+        if (signal.aborted) abort()
+        else signal.addEventListener('abort', abort, { once: true })
+      }))
+      .mockResolvedValueOnce(streamResponse('recovered after first-event timeout'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      firstEventTimeoutMs: 10, maxRetries: 1, retryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover a stalled request.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'recovered after first-event timeout',
+      modelRequestCount: 2,
+      modelCallCount: 1,
+      usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12 },
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onContent.mock.calls.flat().join('')).toBe('recovered after first-event timeout')
+  })
+
+  it('clears the first-event deadline after a valid SSE event instead of timing out a quiet continuation', async () => {
+    const encoder = new TextEncoder()
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"started"},"finish_reason":null}]}\n\n'))
+        setTimeout(() => {
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":2,"total_tokens":8}}\n\n'))
+          controller.close()
+        }, 30)
+      },
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const fetchMock = vi.fn(async () => response)
+    vi.stubGlobal('fetch', fetchMock)
+    const onReasoning = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      firstEventTimeoutMs: 10, maxRetries: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Allow silence after streaming starts.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning,
+    })
+
+    expect(result).toMatchObject({ content: 'done', reasoningContent: 'started', finishReason: 'stop' })
+    expect(onReasoning).toHaveBeenCalledWith('started')
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('settles observed usage from a failed hidden stream attempt before retrying', async () => {
+    const failedAttempt = new Response([
+      'data: {"choices":[{"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_cache_hit_tokens":4}}',
+      '',
+      'data: {"error":{"message":"service unavailable after usage"}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(failedAttempt)
+      .mockResolvedValueOnce(streamResponse('recovered after accounted failure'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 1, retryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Retry and account for both calls.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'recovered after accounted failure',
+      modelCallCount: 2,
+      usage: { promptTokens: 17, completionTokens: 4, totalTokens: 21, cachedPromptTokens: 4 },
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onContent.mock.calls.flat().join('')).toBe('recovered after accounted failure')
+  })
+
+  it('attaches observed usage when a visible partial stream later fails', async () => {
+    const partial = `${'visible-part '.repeat(30)}unfinished-tail`
+    const fetchMock = vi.fn(async () => new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: partial }, finish_reason: null }] })}`,
+      '',
+      'data: {"choices":[{"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14,"prompt_cache_hit_tokens":8}}',
+      '',
+      'data: {"error":{"message":"terminal stream error"}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 0,
+    })
+
+    let failure: unknown
+    try {
+      await client.stream({
+        messages: [{ role: 'user', content: 'Do not replay the partial.' }], tools: [], signal: new AbortController().signal,
+        onContent, onReasoning: () => {},
+      })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toMatchObject({
+      message: 'terminal stream error',
+      modelUsage: { promptTokens: 11, completionTokens: 3, totalTokens: 14, cachedPromptTokens: 8 },
+      modelCallCount: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(onContent.mock.calls.flat().join('')).toBe(partial.slice(0, partial.lastIndexOf(' ', partial.length - 257) + 1))
+  })
+
+  it('attaches observed usage when the stream closes without a finish reason', async () => {
+    const fetchMock = vi.fn(async () => new Response([
+      'data: {"choices":[{"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":13,"completion_tokens":1,"total_tokens":14,"prompt_cache_hit_tokens":10}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Account for a missing terminal event.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })).rejects.toMatchObject({
+      message: expect.stringContaining('finish reason'),
+      modelUsage: { promptTokens: 13, completionTokens: 1, totalTokens: 14, cachedPromptTokens: 10 },
+      modelCallCount: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('retries two zero-output stop completions and accumulates their real usage', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(emptyCompletionResponse())
+      .mockResolvedValueOnce(emptyCompletionResponse())
+      .mockResolvedValueOnce(streamResponse('recovered from empty completions'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test',
+      baseUrl: 'https://api.example',
+      model: 'test-model',
+      maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2,
+      emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover empty completions.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })
+
+    expect(result.content).toBe('recovered from empty completions')
+    expect(result.modelCallCount).toBe(3)
+    expect(result.usage).toEqual({
+      promptTokens: 20,
+      completionTokens: 2,
+      totalTokens: 22,
+      cachedPromptTokens: 0,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(onContent).toHaveBeenCalledOnce()
+    expect(onContent).toHaveBeenCalledWith('recovered from empty completions')
+  })
+
+  it('retries a provider protocol sentinel before it becomes visible and preserves its usage', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(providerErrorCompletionResponse())
+      .mockResolvedValueOnce(streamResponse('recovered from provider sentinel'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2, emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover the provider protocol.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'recovered from provider sentinel',
+      finishReason: 'stop',
+      modelCallCount: 2,
+      usage: { promptTokens: 15, completionTokens: 19, totalTokens: 34, cachedPromptTokens: 0 },
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onContent.mock.calls.flat().join('')).toBe('recovered from provider sentinel')
+    expect(onContent.mock.calls.flat().join('')).not.toContain('message with role')
+  })
+
+  it('fails honestly after the provider protocol sentinel exhausts its hidden retry budget', async () => {
+    const fetchMock = vi.fn(async () => providerErrorCompletionResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2, emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Do not publish provider errors.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })).rejects.toMatchObject({
+      message: expect.stringContaining('DeepSeek provider completion error'),
+      modelUsage: { promptTokens: 15, completionTokens: 51, totalTokens: 66, cachedPromptTokens: 0 },
+      modelCallCount: 3,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(onContent).not.toHaveBeenCalled()
+  })
+
+  it('returns the final empty completion after the bounded retry budget is exhausted', async () => {
+    const fetchMock = vi.fn(async () => emptyCompletionResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test',
+      baseUrl: 'https://api.example',
+      model: 'test-model',
+      maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2,
+      emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Bound empty retries.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({ content: '', reasoningContent: '', toolCalls: [], finishReason: 'stop', modelCallCount: 3 })
+    expect(result.usage).toEqual({ promptTokens: 15, completionTokens: 0, totalTokens: 15, cachedPromptTokens: 0 })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('attaches completed empty-response usage when a later attempt fails', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(emptyCompletionResponse())
+      .mockResolvedValueOnce(new Response('invalid request after retry', { status: 400 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2, emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    let failure: unknown
+    try {
+      await client.stream({
+        messages: [{ role: 'user', content: 'Preserve failed retry usage.' }], tools: [], signal: new AbortController().signal,
+        onContent: () => {}, onReasoning: () => {},
+      })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toMatchObject({
+      message: expect.stringContaining('400'),
+      modelUsage: { promptTokens: 5, completionTokens: 0, totalTokens: 5, cachedPromptTokens: 0 },
+      modelCallCount: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('attaches completed empty-response usage when cancellation aborts retry backoff', async () => {
+    const fetchMock = vi.fn(async () => emptyCompletionResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2, emptyCompletionRetryBaseDelayMs: 5_000,
+    })
+    const pending = client.stream({
+      messages: [{ role: 'user', content: 'Cancel during empty retry wait.' }], tools: [], signal: controller.signal,
+      onContent: () => {}, onReasoning: () => {},
+    })
+    for (let attempt = 0; attempt < 100 && fetchMock.mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1))
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    controller.abort(new DOMException('Cancelled', 'AbortError'))
+
+    let failure: unknown
+    try {
+      await pending
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toMatchObject({
+      name: 'AbortError',
+      modelUsage: { promptTokens: 5, completionTokens: 0, totalTokens: 5, cachedPromptTokens: 0 },
+      modelCallCount: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('never retries a completion after visible reasoning has been emitted', async () => {
+    const fetchMock = vi.fn(async () => new Response([
+      'data: {"choices":[{"delta":{"reasoning_content":"visible thought"},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const onReasoning = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxEmptyCompletionRetries: 2, emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Do not replay visible reasoning.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning,
+    })
+
+    expect(result.reasoningContent).toBe('visible thought')
+    expect(result.modelCallCount).toBe(1)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(onReasoning).toHaveBeenCalledOnce()
+  })
+
+  it('removes private tool-result and Arena system-part provenance from provider messages', async () => {
+    let submitted: Record<string, unknown> | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return streamResponse('Recovered.')
+    }))
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192 })
+    await client.stream({
+      messages: [
+        {
+          role: 'user',
+          content: '<arena-system-message>\nThe next message part will be the user providing feedback about the previous message.\n</arena-system-message>\n\nCorrect it.\n\n<arena-system-message>\nUploaded workspace files:\n- uploads/a.txt\n</arena-system-message>',
+          arena_system_messages: [
+            { kind: 'custom_feedback', position: 'leading', reviewedNodeId: 'evt_reviewed' },
+            { kind: 'attachments', position: 'trailing' },
+          ],
+        },
+        {
+          role: 'assistant', content: null,
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: '{"status":"success"}', tool_result_status: 'succeeded' },
+      ],
+      tools: [], signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {},
+    })
+
+    const messages = submitted?.messages as Array<Record<string, unknown>>
+    expect(messages[0]).toEqual({
+      role: 'user',
+      content: '<arena-system-message>\nThe next message part will be the user providing feedback about the previous message.\n</arena-system-message>\n\nCorrect it.\n\n<arena-system-message>\nUploaded workspace files:\n- uploads/a.txt\n</arena-system-message>',
+    })
+    expect(messages[2]).toEqual({ role: 'tool', tool_call_id: 'call_1', content: '{"status":"success"}' })
+    expect(JSON.stringify(submitted)).not.toContain('tool_result_status')
+    expect(JSON.stringify(submitted)).not.toContain('arena_system_messages')
+  })
+
+  it('translates Arena image-data tool results into provider multimodal content', async () => {
+    let submitted: Record<string, unknown> | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return streamResponse('Image inspected.')
+    }))
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'vision-model', maxOutputTokens: 8192 })
+    await client.stream({
+      messages: [
+        { role: 'user', content: 'Read the image.' },
+        {
+          role: 'assistant', content: null,
+          tool_calls: [{ id: 'call_image', type: 'function', function: { name: 'read_file', arguments: '{"path":"image.png"}' } }],
+        },
+        {
+          role: 'tool', tool_call_id: 'call_image', content: '{"kind":"image","mediaType":"image/png"}',
+          tool_result_status: 'succeeded',
+          tool_content_parts: [{ type: 'image-data', data: 'iVBORw0KGgo=', mediaType: 'image/png' }],
+        },
+      ],
+      tools: [], signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {},
+    })
+
+    const messages = submitted?.messages as Array<Record<string, unknown>>
+    expect(messages[2]).toEqual({
+      role: 'tool',
+      tool_call_id: 'call_image',
+      content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } }],
+    })
+    expect(JSON.stringify(submitted)).not.toContain('tool_content_parts')
+  })
+
+  it('does not replay a failed stream after a visible delta was emitted', async () => {
+    const partial = `${'visible-word '.repeat(30)}unfinished-tail`
+    const fetchMock = vi.fn(async () => failingAfterDeltaResponse(partial))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test',
+      baseUrl: 'https://api.example',
+      model: 'test-model',
+      maxOutputTokens: 8192,
+      maxRetries: 2,
+      retryBaseDelayMs: 1,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Do not duplicate.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })).rejects.toMatchObject({
+      message: expect.stringContaining('fetch failed after streaming'),
+      modelRequestCount: 1,
+      modelCallCount: 0,
+      modelUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedPromptTokens: 0 },
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(onContent).toHaveBeenCalledOnce()
+    expect(onContent.mock.calls.flat().join('')).toBe(partial.slice(0, partial.lastIndexOf(' ', partial.length - 257) + 1))
+  })
+
+  it('rejects a gracefully truncated stream after visible content without replaying it', async () => {
+    const partial = `${'visible-word '.repeat(30)}unfinished-tail`
+    const fetchMock = vi.fn(async () => new Response(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: partial }, finish_reason: null }] })}\n\n`,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test',
+      baseUrl: 'https://api.example',
+      model: 'test-model',
+      maxOutputTokens: 8192,
+      maxRetries: 2,
+      retryBaseDelayMs: 1,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Do not accept a partial answer.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })).rejects.toThrow(/ended before a finish reason/)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(onContent).toHaveBeenCalledOnce()
+    expect(onContent.mock.calls.flat().join('').length).toBeGreaterThan(0)
+  })
+
+  it('retries a gracefully truncated stream when no visible delta was emitted', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"partial","function":{"name":"read_file","arguments":"{\\\""}}]},"finish_reason":null}]}\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      ))
+      .mockResolvedValueOnce(streamResponse('recovered'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test',
+      baseUrl: 'https://api.example',
+      model: 'test-model',
+      maxOutputTokens: 8192,
+      maxRetries: 2,
+      retryBaseDelayMs: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Retry before exposing anything.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result.content).toBe('recovered')
+    expect(result.toolCalls).toEqual([])
+  })
+
+  it('coalesces streamed tool arguments into visible deltas and preserves their exact text', async () => {
+    const argumentsText = JSON.stringify({ path: 'slides.html', content: `${'<section>你好</section>\n'.repeat(140)}` })
+    const fragments = Array.from({ length: Math.ceil(argumentsText.length / 700) }, (_, index) => (
+      argumentsText.slice(index * 700, (index + 1) * 700)
+    ))
+    const blocks = fragments.map((fragment, index) => `data: ${JSON.stringify({
+      choices: [{
+        delta: {
+          tool_calls: [{
+            index: 0,
+            ...(index === 0 ? { id: 'call_write' } : {}),
+            function: {
+              ...(index === 0 ? { name: 'write_file' } : {}),
+              arguments: fragment,
+            },
+          }],
+        },
+        finish_reason: null,
+      }],
+    })}\n\n`)
+    blocks.push(`data: ${JSON.stringify({
+      choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 12, completion_tokens: 42, total_tokens: 54 },
+    })}\n\n`)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(blocks.join(''), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })))
+    const onToolCallDelta = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Create slides.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {}, onToolCallDelta,
+    })
+
+    expect(onToolCallDelta.mock.calls.length).toBeGreaterThan(1)
+    expect(onToolCallDelta.mock.calls.map(([delta]) => delta.idDelta ?? '').join('')).toBe('call_write')
+    expect(onToolCallDelta.mock.calls.map(([delta]) => delta.nameDelta ?? '').join('')).toBe('write_file')
+    expect(onToolCallDelta.mock.calls.map(([delta]) => delta.argumentsDelta ?? '').join('')).toBe(argumentsText)
+    expect(result.toolCalls[0]).toMatchObject({
+      id: 'call_write',
+      function: { name: 'write_file', arguments: argumentsText },
+    })
+  })
+
+  it('does not replay a truncated provider stream after a tool draft became visible', async () => {
+    const longArguments = JSON.stringify({ path: 'draft.html', content: 'x'.repeat(2_000) })
+    const first = new Response(`data: ${JSON.stringify({
+      choices: [{
+        delta: { tool_calls: [{ index: 0, id: 'call_visible', function: { name: 'write_file', arguments: longArguments } }] },
+        finish_reason: null,
+      }],
+    })}\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(streamResponse('must not replay'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onToolCallDelta = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 1,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Create a visible draft.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {}, onToolCallDelta,
+    })).rejects.toThrow(/ended before a finish reason/)
+    expect(onToolCallDelta).toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('synthesizes collision-free ids for id-less streamed tool calls and preserves provider duplicate ids', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response([
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{}"}},{"index":1,"function":{"name":"read_file","arguments":"{}"}},{"index":2,"id":"duplicate","function":{"name":"read_file","arguments":"{}"}},{"index":3,"id":"duplicate","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}',
+      '',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })))
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Call tools.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })
+
+    expect(result.toolCalls.map((call) => call.id)).toEqual([
+      'call_1',
+      'call_1_generated_1',
+      'duplicate',
+      'duplicate',
+    ])
+  })
+
+  it('continues a tool-free output-length completion without replaying visible text and accumulates usage', async () => {
+    const submitted: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return submitted.length === 1
+        ? lengthResponse('Part one ')
+        : streamResponse('part two.')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 32,
+      maxLengthContinuations: 2,
+    })
+    const tools = [{
+      type: 'function' as const,
+      function: { name: 'read_file', description: 'Read a file.', parameters: { type: 'object', properties: {} } },
+    }]
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Write a complete answer.' }], tools, signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'Part one part two.',
+      finishReason: 'stop',
+      modelCallCount: 2,
+      usage: { promptTokens: 15, completionTokens: 5, totalTokens: 20, cachedPromptTokens: 0 },
+    })
+    expect(onContent.mock.calls.map(([delta]) => delta)).toEqual(['Part one ', 'part two.'])
+    expect(submitted[0]).toMatchObject({ tools, tool_choice: 'auto' })
+    expect(submitted[1]).toMatchObject({ tools, tool_choice: 'none' })
+    expect(submitted[1].messages).toEqual([
+      { role: 'user', content: 'Write a complete answer.' },
+      { role: 'assistant', content: 'Part one ' },
+      {
+        role: 'user',
+        content: expect.stringContaining('output only the missing suffix'),
+      },
+    ])
+  })
+
+  it('preserves a delimiter-free visible prefix when continuing a long single token', async () => {
+    // The emoji straddles the buffer's initial 344-code-unit commit limit, so
+    // this also proves the fallback never publishes a split surrogate pair.
+    let seed = 0x5eed1234
+    const randomToken = (length: number) => Array.from({ length }, () => {
+      seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0
+      return 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[seed % 36]
+    }).join('')
+    const prefix = `${randomToken(343)}😀${randomToken(255)}`
+    const regeneratedTail = prefix.slice(-64)
+    const suffix = randomToken(40)
+    const submitted: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return submitted.length === 1
+        ? lengthResponse(prefix)
+        : streamResponse(`${regeneratedTail}${suffix}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 32,
+      maxLengthContinuations: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Return one exact long marker without separators.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: `${prefix}${suffix}`,
+      finishReason: 'stop',
+      modelCallCount: 2,
+    })
+    expect(onContent.mock.calls.flat().join('')).toBe(`${prefix}${suffix}`)
+    for (const [delta] of onContent.mock.calls as Array<[string]>) {
+      expect(delta).not.toMatch(/[\uD800-\uDBFF]$/u)
+      expect(delta).not.toMatch(/^[\uDC00-\uDFFF]/u)
+    }
+    expect(submitted[1].messages).toEqual([
+      { role: 'user', content: 'Return one exact long marker without separators.' },
+      { role: 'assistant', content: prefix },
+      { role: 'user', content: expect.stringContaining(JSON.stringify(regeneratedTail)) },
+    ])
+  })
+
+  it('returns an honest length finish after the bounded continuation budget is exhausted', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse('Part A '))
+      .mockResolvedValueOnce(lengthResponse('Part B '))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Keep going.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result).toMatchObject({ content: 'Part A Part B ', finishReason: 'length', modelCallCount: 2 })
+    expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 6, totalTokens: 16, cachedPromptTokens: 0 })
+  })
+
+  it('keeps a partial answer truncated when bounded continuation attempts end in empty stops', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse('Partial prefix.'))
+      .mockResolvedValueOnce(emptyCompletionResponse())
+      .mockResolvedValueOnce(emptyCompletionResponse())
+      .mockResolvedValueOnce(emptyCompletionResponse())
+      .mockResolvedValueOnce(emptyCompletionResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 2, maxEmptyCompletionRetries: 2, emptyCompletionRetryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Complete this.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(onContent.mock.calls.map(([delta]) => delta)).toEqual(['Partial prefix.'])
+    expect(result).toMatchObject({ content: 'Partial prefix.', finishReason: 'length', modelCallCount: 5 })
+    expect(result.usage).toEqual({ promptTokens: 25, completionTokens: 3, totalTokens: 28, cachedPromptTokens: 0 })
+  })
+
+  it('keeps a partial answer truncated when a continuation stops after reasoning without a suffix', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse('Partial prefix.'))
+      .mockResolvedValueOnce(reasoningOnlyResponse('I have not produced the missing suffix.'))
+      .mockResolvedValueOnce(reasoningOnlyResponse('I still have not produced the missing suffix.'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const onReasoning = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 2,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Complete this.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning,
+    })
+
+    expect(result).toMatchObject({ content: 'Partial prefix.', finishReason: 'length', modelCallCount: 3 })
+    expect(onContent.mock.calls.map(([delta]) => delta)).toEqual(['Partial prefix.'])
+    expect(onReasoning).toHaveBeenCalledWith('I have not produced the missing suffix.')
+    expect(onReasoning).toHaveBeenCalledWith('I still have not produced the missing suffix.')
+  })
+
+  it('suppresses restarted continuation prefixes and emits only the novel suffix', async () => {
+    const first = Array.from({ length: 20 }, (_, index) => String(index + 1).padStart(2, '0')).join(',')
+    const shorterRestart = Array.from({ length: 15 }, (_, index) => String(index + 1).padStart(2, '0')).join(',')
+    const completed = Array.from({ length: 25 }, (_, index) => String(index + 1).padStart(2, '0')).join(',')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse(first))
+      .mockResolvedValueOnce(lengthResponse(`I will continue.\n\n${shorterRestart}`))
+      .mockResolvedValueOnce(streamResponse(completed))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 2,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Count.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result.content).toBe(completed)
+    expect(result.modelCallCount).toBe(3)
+    expect(onContent.mock.calls.flat().join('')).toBe(completed)
+    expect(onContent.mock.calls.flat().join('')).not.toContain(`${shorterRestart}${shorterRestart}`)
+  })
+
+  it('never replaces an already-visible prefix with a longer divergent restart', async () => {
+    const first = Array.from({ length: 30 }, (_, index) => String(index + 1).padStart(2, '0')).join(',')
+    const divergent = `I will continue.\n${first.slice(0, 40)}CORRUPTED-${'x'.repeat(120)}`
+    const completed = `${first},31,32,33,34,35`
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse(first))
+      .mockResolvedValueOnce(lengthResponse(divergent))
+      .mockResolvedValueOnce(streamResponse(completed))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 2,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Count without replacing visible text.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result.content).toBe(completed)
+    expect(result.modelCallCount).toBe(3)
+    expect(onContent.mock.calls.flat().join('')).toBe(completed)
+  })
+
+  it('drops an uncommitted partial line before appending a continued complete line', async () => {
+    const firstComplete = '0001|ANERA-LONG-FINAL-V1\n'
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse(`${firstComplete}0002|AN`))
+      .mockResolvedValueOnce(streamResponse('0002|ANERA-LONG-FINAL-V1\n0003|ANERA-LONG-FINAL-V1'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Write three exact lines.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    const expected = `${firstComplete}0002|ANERA-LONG-FINAL-V1\n0003|ANERA-LONG-FINAL-V1`
+    expect(result).toMatchObject({ content: expected, finishReason: 'stop', modelCallCount: 2 })
+    expect(onContent.mock.calls.flat().join('')).toBe(expected)
+    expect(result.content).not.toContain('0002|AN0002|')
+  })
+
+  it('retries an overlap-only stop while continuation budget remains', async () => {
+    const prefix = 'AlreadyVisibleDelimiterFreePrefix731'
+    const suffix = 'MissingSuffix947'
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse(prefix))
+      .mockResolvedValueOnce(streamResponse(prefix))
+      .mockResolvedValueOnce(streamResponse(`${prefix}${suffix}`))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 2,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Complete the exact token.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(result).toMatchObject({
+      content: `${prefix}${suffix}`,
+      finishReason: 'stop',
+      modelCallCount: 3,
+    })
+    expect(onContent.mock.calls.flat().join('')).toBe(`${prefix}${suffix}`)
+  })
+
+  it('reports an exact-prefix-only stop continuation as unresolved instead of completed', async () => {
+    const first = 'Already visible partial answer.'
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse(first))
+      .mockResolvedValueOnce(streamResponse(`Preamble\n${first}`))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 16,
+      maxLengthContinuations: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Complete the answer.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({ content: first, finishReason: 'length', modelCallCount: 2 })
+    expect(onContent.mock.calls.map(([delta]) => delta)).toEqual([first])
+  })
+
+  it('honors provider retry directives and rejects excessive server delays', async () => {
+    const neverRetry = vi.fn(async () => new Response('busy', {
+      status: 503,
+      headers: { 'x-should-retry': 'false' },
+    }))
+    vi.stubGlobal('fetch', neverRetry)
+    const noRetryClient = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 1,
+    })
+    await expect(noRetryClient.stream({
+      messages: [{ role: 'user', content: 'No retry.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })).rejects.toThrow(/503/)
+    expect(neverRetry).toHaveBeenCalledOnce()
+
+    const forcedRetry = vi.fn()
+      .mockResolvedValueOnce(new Response('retry this', {
+        status: 400,
+        headers: { 'x-should-retry': 'true', 'retry-after-ms': '0' },
+      }))
+      .mockResolvedValueOnce(streamResponse('directed recovery'))
+    vi.stubGlobal('fetch', forcedRetry)
+    const directedClient = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 1,
+    })
+    expect((await directedClient.stream({
+      messages: [{ role: 'user', content: 'Honor the directive.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })).content).toBe('directed recovery')
+    expect(forcedRetry).toHaveBeenCalledTimes(2)
+
+    const excessiveDelay = vi.fn(async () => new Response('slow down', {
+      status: 429,
+      headers: { 'retry-after-ms': '500' },
+    }))
+    vi.stubGlobal('fetch', excessiveDelay)
+    const boundedClient = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 1, maxRetryDelayMs: 10,
+    })
+    await expect(boundedClient.stream({
+      messages: [{ role: 'user', content: 'Bound delays.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })).rejects.toThrow(/exceeding the 1s harness limit/)
+    expect(excessiveDelay).toHaveBeenCalledOnce()
+  })
+})
+
+function streamResponse(content: string): Response {
+  return new Response([
+    `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}`,
+    '',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}',
+    '',
+    'data: [DONE]',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function emptyCompletionResponse(): Response {
+  return new Response([
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5}}',
+    '',
+    'data: [DONE]',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function providerErrorCompletionResponse(): Response {
+  return new Response([
+    `data: ${JSON.stringify({ choices: [{ delta: { content: "✋ Error: A message with role 'tool' found without preceding user message." }, finish_reason: null }] })}`,
+    '',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":17,"total_tokens":22}}',
+    '',
+    'data: [DONE]',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function lengthResponse(content: string): Response {
+  return new Response([
+    `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}`,
+    '',
+    'data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}',
+    '',
+    'data: [DONE]',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function reasoningOnlyResponse(reasoning: string): Response {
+  return new Response([
+    `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning }, finish_reason: null }] })}`,
+    '',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}',
+    '',
+    'data: [DONE]',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function failingAfterDeltaResponse(content = 'partial'): Response {
+  let pullCount = 0
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      pullCount += 1
+      if (pullCount === 1) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`))
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1))
+      controller.error(new TypeError('fetch failed after streaming'))
+    },
+  })
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}

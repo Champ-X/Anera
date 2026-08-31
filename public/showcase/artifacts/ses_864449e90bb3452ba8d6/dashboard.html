@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anera Ops — Agent Operations Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    background: #EFEBE3; /* soft beige main background */
+    color: #1b1b1f;
+  }
+  .dashboard { display: flex; min-height: 100vh; }
+
+  /* ---------- Sidebar ---------- */
+  .sidebar {
+    width: 236px;
+    flex-shrink: 0;
+    background: #131B31; /* dark navy */
+    color: #fff;
+    padding: 26px 18px;
+    display: flex;
+    flex-direction: column;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding-bottom: 30px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .brand-dot {
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: #FF8A3D; /* orange */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .brand-dot svg { display: block; }
+  .brand-name {
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    font-size: 15px;
+  }
+  .nav { margin-top: 24px; display: flex; flex-direction: column; gap: 4px; }
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: #B7BFCF;
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .nav-item.active {
+    background: #2A3450; /* lighter navy highlight */
+    color: #fff;
+  }
+  .nav-item svg { flex-shrink: 0; }
+
+  /* ---------- Main ---------- */
+  .main {
+    flex: 1;
+    padding: 30px 32px;
+    min-width: 0;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 28px;
+    flex-wrap: wrap;
+  }
+  .header h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.3px; }
+  .header .sub { color: #7c7c7c; font-size: 14px; margin-top: 5px; }
+  .new-run {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #131B31;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    padding: 11px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  /* Cards */
+  .grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    margin-bottom: 22px;
+  }
+  .card {
+    border-radius: 14px;
+    padding: 22px 22px 26px;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(20,20,30,0.06);
+  }
+  .card.dark { background: #131B31; color: #fff; }
+  .card.orange { background: #FF8A3D; color: #fff; }
+
+  .kpi-label {
+    font-size: 11px;
+    letter-spacing: 1.2px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .card.light .kpi-label { color: #9a9a9a; }
+  .kpi-value { font-size: 34px; font-weight: 700; margin-top: 12px; letter-spacing: -0.6px; }
+  .kpi-delta {
+    margin-top: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .kpi-delta .arrow { font-size: 14px; }
+  .delta-up { color: #1FA37B; }   /* green */
+  .delta-down { color: #FF8A3D; } /* orange */
+
+  /* Charts row */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1.15fr 1fr;
+    gap: 20px;
+    margin-bottom: 22px;
+  }
+  .chart-title { font-size: 16px; font-weight: 700; }
+  .chart-sub { color: #9b9b9b; font-size: 13px; margin-top: 3px; }
+  .dark .chart-sub { color: #93A0BC; }
+
+  .donut-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 34px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .donut-box { text-align: center; position: relative; }
+  .donut-center {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+  }
+  .donut-center .total-label { font-size: 9px; letter-spacing: 1px; color: #93A0BC; }
+  .donut-center .total-value { font-size: 22px; font-weight: 700; }
+  .legend { display: flex; flex-direction: column; gap: 14px; }
+  .legend-item { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+  .legend-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+  .legend-item .pct { color: #93A0BC; font-weight: 600; }
+
+  /* Table */
+  .table-card { background: #fff; border-radius: 14px; padding: 22px 22px 10px; box-shadow: 0 1px 3px rgba(20,20,30,0.06); }
+  .table-card .chart-title { margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    font-size: 11px;
+    letter-spacing: 1.1px;
+    color: #9a9a9a;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 10px 14px;
+    border-bottom: 1px solid #ece8e0;
+  }
+  td {
+    padding: 15px 14px;
+    font-size: 14px;
+    border-bottom: 1px solid #f1ede5;
+    vertical-align: middle;
+  }
+  td.run { font-weight: 600; color: #33303a; }
+  td.task { color: #4a4a52; }
+  td.status.completed { color: #1FA37B; font-weight: 600; }
+  td.status.running { color: #F5792E; font-weight: 600; }
+  td.duration { color: #33303a; font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+
+  .avatar {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    background: #DDE4EE;
+    display: inline-block;
+    margin-right: 9px;
+    vertical-align: middle;
+  }
+  .avatar.run-2 { background: #FCE3D0; }
+
+  /* Spinner for running state */
+  .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(245,121,46,0.3);
+    border-top-color: #F5792E;
+    border-radius: 50%;
+    margin-right: 7px;
+    vertical-align: -1px;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Responsive */
+  @media (max-width: 760px) {
+    .sidebar { display: none; }
+    .main { padding: 22px 18px; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .grid-2 { grid-template-columns: 1fr; }
+    .header h1 { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="dashboard">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-dot">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8" fill="#fff" fill-opacity="0.9"/></svg>
+      </div>
+      <span class="brand-name">ANERA&nbsp;OPS</span>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h18v18H3z"/></svg>
+        Overview
+      </div>
+      <div class="nav-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/></svg>
+        Runs
+      </div>
+      <div class="nav-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 8h14M5 12h10M5 16h6"/></svg>
+        Artifacts
+      </div>
+      <div class="nav-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-8M22 20H2"/></svg>
+        Evaluations
+      </div>
+      <div class="nav-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
+        Settings
+      </div>
+    </nav>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="header">
+      <div>
+        <h1>Agent operations</h1>
+        <div class="sub">Thursday, 28 August &middot; Live workspace health</div>
+      </div>
+      <button class="new-run">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        New run
+      </button>
+    </div>
+
+    <!-- KPI cards -->
+    <div class="grid-3">
+      <div class="card light">
+        <div class="kpi-label">Completed Runs</div>
+        <div class="kpi-value">1,284</div>
+        <div class="kpi-delta delta-up"><span class="arrow">&#9650;</span> +12.8%</div>
+      </div>
+      <div class="card orange">
+        <div class="kpi-label">Success Rate</div>
+        <div class="kpi-value">92.4%</div>
+      </div>
+      <div class="card light">
+        <div class="kpi-label">Median Duration</div>
+        <div class="kpi-value">48s</div>
+        <div class="kpi-delta delta-down"><span class="arrow">&#9660;</span> -6.2%</div>
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid-2">
+      <!-- Runs by day -->
+      <div class="card light">
+        <div class="chart-title">Runs by day</div>
+        <div class="chart-sub">Last seven days</div>
+        <svg viewBox="0 0 460 190" width="100%" height="190" role="img" aria-label="Runs by day bar chart">
+          <g>
+            <rect x="24" y="60"  width="34" rx="5"  height="108" fill="#8B8CF0"/>
+            <rect x="92" y="42"  width="34" rx="5"  height="126" fill="#8B8CF0"/>
+            <rect x="160" y="28" width="34" rx="5"  height="140" fill="#8B8CF0"/>
+            <rect x="228" y="50" width="34" rx="5"  height="118" fill="#8B8CF0"/>
+            <rect x="296" y="20" width="34" rx="5"  height="148" fill="#8B8CF0"/>
+            <rect x="364" y="34" width="34" rx="5"  height="134" fill="#8B8CF0"/>
+            <rect x="412" y="80" width="24" rx="5"  height="88"  fill="#8B8CF0" opacity="0" />
+            <!-- tallest bar Wed at x=296 -->
+          </g>
+          <g font-family="inherit" font-size="12" fill="#9c9c9c" text-anchor="middle">
+            <text x="41"  y="182">Fri</text>
+            <text x="109" y="182">Sat</text>
+            <text x="177" y="182">Sun</text>
+            <text x="245" y="182">Mon</text>
+            <text x="313" y="182">Tue</text>
+            <text x="381" y="182">Wed</text>
+            <text x="430" y="182">Thu</text>
+          </g>
+        </svg>
+      </div>
+
+      <!-- Tool mix -->
+      <div class="card dark">
+        <div class="chart-title">Tool mix</div>
+        <div class="chart-sub">Share by call volume</div>
+        <div class="donut-wrap">
+          <div class="donut-box">
+            <svg width="150" height="150" viewBox="0 0 120 120" role="img" aria-label="Tool mix donut chart">
+              <circle cx="60" cy="60" r="46" fill="none" stroke="#303A55" stroke-width="20"/>
+              <circle cx="60" cy="60" r="46" fill="none" stroke="#FF8A3D" stroke-width="20"
+                      stroke-dasharray="138.1 289" stroke-dashoffset="34.6" transform="rotate(-90 60 60)"/>
+              <circle cx="60" cy="60" r="46" fill="none" stroke="#4D7CFE" stroke-width="20"
+                      stroke-dasharray="93.3 289" stroke-dashoffset="172.7" transform="rotate(-90 60 60)"/>
+            </svg>
+            <div class="donut-center">
+              <div class="total-label">TOTAL CALLS</div>
+              <div class="total-value">3,942</div>
+            </div>
+          </div>
+          <div class="legend">
+            <div class="legend-item"><span class="legend-dot" style="background:#FF8A3D"></span> Shell <span class="pct">46%</span></div>
+            <div class="legend-item"><span class="legend-dot" style="background:#4D7CFE"></span> Web <span class="pct">31%</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table -->
+    <div class="table-card">
+      <div class="chart-title">Recent runs</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th><th>Task</th><th>Status</th><th>Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="run"><span class="avatar"></span>AR-2841</td>
+            <td class="task">Build dashboard</td>
+            <td class="status completed">Completed</td>
+            <td class="duration">52s</td>
+          </tr>
+          <tr>
+            <td class="run"><span class="avatar run-2"></span>AR-2840</td>
+            <td class="task">Research sources</td>
+            <td class="status running"><span class="spinner"></span>Running</td>
+            <td class="duration">1m 18s</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+</div>
+</body>
+</html>

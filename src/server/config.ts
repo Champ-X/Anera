@@ -1,0 +1,247 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import {
+  DEFAULT_DEEPSEEK_VISION_PRICING,
+  type DeepSeekVisionPricing,
+} from './vision-pricing.js'
+
+function loadDotEnv(path: string): Record<string, string> {
+  let text = ''
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch {
+    return {}
+  }
+
+  const result: Record<string, string> = {}
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!match) continue
+    let value = match[2].trim()
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1)
+    } else {
+      value = value.replace(/\s+#.*$/, '').trim()
+    }
+    result[match[1]] = value
+  }
+  return result
+}
+
+const projectRoot = resolve(process.cwd())
+const dotEnv = loadDotEnv(resolve(projectRoot, '.env'))
+
+function env(name: string, fallback = ''): string {
+  return process.env[name]?.trim() || dotEnv[name]?.trim() || fallback
+}
+
+export function resolveTavilyApiKey(read: (name: string) => string): string {
+  return read('TAVILY_API_KEY') || read('TAVILY_API_KRY')
+}
+
+export function resolveModelTemperature(value: string): number {
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 2 ? parsed : 0
+}
+
+function positiveInt(name: string, fallback: number): number {
+  const parsed = Number.parseInt(env(name), 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function positiveNumber(name: string, fallback: number): number {
+  const parsed = Number.parseFloat(env(name))
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+function optionalNonNegativeNumber(value: string): number | undefined {
+  if (!value.trim()) return undefined
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+/** Resolve all six Vision rates independently; text cache pricing is deliberately not consulted. */
+export function resolveDeepSeekVisionPricing(read: (name: string) => string): DeepSeekVisionPricing {
+  const legacyCacheMiss = optionalNonNegativeNumber(read('DEEPSEEK_VISION_INPUT_COST_PER_MILLION_USD'))
+  const legacyOutput = optionalNonNegativeNumber(read('DEEPSEEK_VISION_OUTPUT_COST_PER_MILLION_USD'))
+  const rate = (name: string, fallback: number): number => optionalNonNegativeNumber(read(name)) ?? fallback
+  return {
+    offPeak: {
+      cacheHitInputPerMillionUsd: rate(
+        'DEEPSEEK_VISION_CACHE_HIT_OFF_PEAK_COST_PER_MILLION_USD',
+        DEFAULT_DEEPSEEK_VISION_PRICING.offPeak.cacheHitInputPerMillionUsd,
+      ),
+      cacheMissInputPerMillionUsd: rate(
+        'DEEPSEEK_VISION_CACHE_MISS_OFF_PEAK_COST_PER_MILLION_USD',
+        legacyCacheMiss ?? DEFAULT_DEEPSEEK_VISION_PRICING.offPeak.cacheMissInputPerMillionUsd,
+      ),
+      outputPerMillionUsd: rate(
+        'DEEPSEEK_VISION_OUTPUT_OFF_PEAK_COST_PER_MILLION_USD',
+        legacyOutput ?? DEFAULT_DEEPSEEK_VISION_PRICING.offPeak.outputPerMillionUsd,
+      ),
+    },
+    peak: {
+      cacheHitInputPerMillionUsd: rate(
+        'DEEPSEEK_VISION_CACHE_HIT_PEAK_COST_PER_MILLION_USD',
+        DEFAULT_DEEPSEEK_VISION_PRICING.peak.cacheHitInputPerMillionUsd,
+      ),
+      cacheMissInputPerMillionUsd: rate(
+        'DEEPSEEK_VISION_CACHE_MISS_PEAK_COST_PER_MILLION_USD',
+        legacyCacheMiss ?? DEFAULT_DEEPSEEK_VISION_PRICING.peak.cacheMissInputPerMillionUsd,
+      ),
+      outputPerMillionUsd: rate(
+        'DEEPSEEK_VISION_OUTPUT_PEAK_COST_PER_MILLION_USD',
+        legacyOutput ?? DEFAULT_DEEPSEEK_VISION_PRICING.peak.outputPerMillionUsd,
+      ),
+    },
+  }
+}
+
+function booleanFlag(name: string, fallback = false): boolean {
+  const value = env(name)
+  if (!value) return fallback
+  if (['1', 'true', 'yes', 'on'].includes(value.toLowerCase())) return true
+  if (['0', 'false', 'no', 'off'].includes(value.toLowerCase())) return false
+  throw new Error(`${name} must be one of true/false, 1/0, yes/no, or on/off`)
+}
+
+function customFeedbackArm(): 'control' | 'treatment-1' | 'treatment-2' {
+  const value = env('ANERA_CUSTOM_FEEDBACK_ARM', 'treatment-1')
+  if (value === 'control' || value === 'treatment-1' || value === 'treatment-2') return value
+  throw new Error('ANERA_CUSTOM_FEEDBACK_ARM must be control, treatment-1, or treatment-2')
+}
+
+function modelList(primary: string): string[] {
+  const configured = env('ANERA_AGENT_MODELS', primary)
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+  return [...new Set([primary, ...configured])]
+}
+
+function configuredList(value: string): string[] {
+  return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))]
+}
+
+const primaryModel = env('DEEPSEEK_MODEL', 'deepseek-chat')
+const speechModel = env('ANERA_SPEECH_MODEL', 'gpt-4o-mini-tts')
+const imageModel = env('ANERA_IMAGE_MODEL', 'gpt-image-1')
+const githubAppPrivateKeyPath = env('ANERA_GITHUB_APP_PRIVATE_KEY_PATH')
+const contextWindowTokens = positiveInt('ANERA_CONTEXT_WINDOW_TOKENS', 128_000)
+const contextCompactionThresholdTokens = positiveInt(
+  'ANERA_CONTEXT_COMPACTION_TOKENS',
+  Math.floor(contextWindowTokens * 0.8),
+)
+const deepSeekVisionPricing = resolveDeepSeekVisionPricing(env)
+if (contextCompactionThresholdTokens >= contextWindowTokens) {
+  throw new Error(`ANERA_CONTEXT_COMPACTION_TOKENS (${contextCompactionThresholdTokens}) must be below ANERA_CONTEXT_WINDOW_TOKENS (${contextWindowTokens})`)
+}
+
+export const config = {
+  projectRoot,
+  dataRoot: resolve(projectRoot, env('ANERA_DATA_DIR', '.anera')),
+  port: positiveInt('ANERA_PORT', 4174),
+  publicBaseUrl: env('ANERA_PUBLIC_BASE_URL').replace(/\/+$/, ''),
+  deepseekApiKey: env('DEEPSEEK_API_KEY'),
+  deepseekBaseUrl: env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
+  // Keep the historical TAVILY_API_KRY spelling working for existing local
+  // environments while preferring the provider's standard variable name.
+  tavilyApiKey: resolveTavilyApiKey(env),
+  tavilyBaseUrl: env('ANERA_TAVILY_BASE_URL', 'https://api.tavily.com').replace(/\/+$/, ''),
+  firecrawlApiKey: env('FIRECRAWL_API_KEY'),
+  firecrawlBaseUrl: env('ANERA_FIRECRAWL_BASE_URL', 'https://api.firecrawl.dev/v1').replace(/\/+$/, ''),
+  pexelsApiKey: env('PEXELS_API_KEY'),
+  imageApiKey: env('ANERA_IMAGE_API_KEY', env('OPENAI_API_KEY')),
+  imageBaseUrl: env('ANERA_IMAGE_BASE_URL', 'https://api.openai.com/v1'),
+  imageModel,
+  // A battle must use genuinely distinct provider model ids. Keeping the
+  // default to the primary route alone makes offer_options fail closed until
+  // operators explicitly configure at least one additional compatible model.
+  imageBattleModels: [...new Set([
+    imageModel,
+    ...configuredList(env('ANERA_IMAGE_BATTLE_MODELS')),
+  ])],
+  speechModel,
+  model: primaryModel,
+  modelTemperature: resolveModelTemperature(env('DEEPSEEK_TEMPERATURE', '0')),
+  agentModels: modelList(primaryModel),
+  customFeedbackArm: customFeedbackArm(),
+  visionModel: env('DEEPSEEK_VISION_MODEL', 'deepseek-v4-flash-vision-exp'),
+  maxAgentSteps: positiveInt('ANERA_MAX_AGENT_STEPS', 30),
+  maxToolCallsPerStep: positiveInt('ANERA_MAX_TOOL_CALLS_PER_STEP', 16),
+  maxToolCallsPerRun: positiveInt('ANERA_MAX_TOOL_CALLS_PER_RUN', 96),
+  maxParallelToolCalls: positiveInt('ANERA_MAX_PARALLEL_TOOL_CALLS', 6),
+  runTimeoutMs: positiveInt('ANERA_RUN_TIMEOUT_MS', 30 * 60 * 1000),
+  websiteIdleSleepMs: positiveInt('ANERA_WEBSITE_IDLE_SLEEP_MS', 5 * 60 * 1000),
+  maxOutputTokens: positiveInt('ANERA_MAX_OUTPUT_TOKENS', 8192),
+  modelFirstEventTimeoutMs: positiveInt('ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS', 60_000),
+  maxLengthContinuations: positiveInt('ANERA_MAX_LENGTH_CONTINUATIONS', 2),
+  sessionTokenLimit: positiveInt('ANERA_SESSION_TOKEN_LIMIT', 1_000_000),
+  dailyFreeCredits: positiveInt('ANERA_DAILY_FREE_CREDITS', 2_500),
+  creditsPerUsd: positiveInt('ANERA_CREDITS_PER_USD', 1_000),
+  toolTimeoutMs: positiveInt('ANERA_TOOL_TIMEOUT_MS', 120_000),
+  maxToolOutputBytes: positiveInt('ANERA_MAX_TOOL_OUTPUT_BYTES', 160_000),
+  maxReadBytes: positiveInt('ANERA_MAX_READ_BYTES', 240_000),
+  textReadPageBytes: positiveInt('ANERA_TEXT_READ_PAGE_BYTES', 80_000),
+  textReadPageLines: positiveInt('ANERA_TEXT_READ_PAGE_LINES', 2_000),
+  attachmentPageBytes: positiveInt('ANERA_ATTACHMENT_PAGE_BYTES', 120_000),
+  contextWindowTokens,
+  contextCompactionThresholdTokens,
+  contextSerializationHardLimitBytes: positiveInt(
+    'ANERA_CONTEXT_SERIALIZATION_HARD_LIMIT_BYTES',
+    positiveInt('ANERA_CONTEXT_COMPACTION_BYTES', 1_000_000),
+  ),
+  contextRetainGroups: positiveInt('ANERA_CONTEXT_RETAIN_GROUPS', 8),
+  maxVisionImageBytes: positiveInt('ANERA_MAX_VISION_IMAGE_BYTES', 12 * 1024 * 1024),
+  maxVisionOutputTokens: positiveInt('ANERA_MAX_VISION_OUTPUT_TOKENS', 4096),
+  maxGeneratedAudioBytes: positiveInt('ANERA_MAX_GENERATED_AUDIO_BYTES', 25 * 1024 * 1024),
+  inputCostPerMillionUsd: positiveNumber('DEEPSEEK_INPUT_COST_PER_MILLION_USD', 0.27),
+  cachedInputCostPerMillionUsd: positiveNumber('DEEPSEEK_CACHED_INPUT_COST_PER_MILLION_USD', 0.07),
+  outputCostPerMillionUsd: positiveNumber('DEEPSEEK_OUTPUT_COST_PER_MILLION_USD', 1.1),
+  deepSeekVisionPricing,
+  // Compatibility aliases for callers that do not yet carry a per-request
+  // pricing snapshot. Production Vision calls use deepSeekVisionPricing.
+  visionCachedInputCostPerMillionUsd: deepSeekVisionPricing.offPeak.cacheHitInputPerMillionUsd,
+  visionInputCostPerMillionUsd: deepSeekVisionPricing.offPeak.cacheMissInputPerMillionUsd,
+  visionOutputCostPerMillionUsd: deepSeekVisionPricing.offPeak.outputPerMillionUsd,
+  imageGenerationInputCostPerMillionUsd: positiveNumber('ANERA_IMAGE_INPUT_COST_PER_MILLION_USD', 5),
+  imageGenerationOutputCostPerMillionUsd: positiveNumber('ANERA_IMAGE_OUTPUT_COST_PER_MILLION_USD', 40),
+  speechInputCostPerMillionUsd: positiveNumber(
+    'ANERA_SPEECH_INPUT_COST_PER_MILLION_USD',
+    speechModel.startsWith('gpt-4o-mini-tts') ? 0.6 : 0,
+  ),
+  speechOutputCostPerMillionUsd: positiveNumber(
+    'ANERA_SPEECH_OUTPUT_COST_PER_MILLION_USD',
+    speechModel.startsWith('gpt-4o-mini-tts') ? 12 : 0,
+  ),
+  speechCharacterCostPerMillionUsd: positiveNumber(
+    'ANERA_SPEECH_CHARACTER_COST_PER_MILLION_USD',
+    speechModel === 'tts-1-hd' ? 30 : speechModel === 'tts-1' ? 15 : 0,
+  ),
+  browserExecutablePath: env('ANERA_BROWSER_EXECUTABLE'),
+  // Arena tasks execute in an isolated workspace. Keep the production entry
+  // point fail closed by default; unsupported local hosts must opt out
+  // explicitly instead of silently running model-authored shell on the host.
+  requireOsSandbox: booleanFlag('ANERA_REQUIRE_OS_SANDBOX', true),
+  githubToken: env('ANERA_GITHUB_TOKEN'),
+  githubClientId: env('ANERA_GITHUB_CLIENT_ID'),
+  githubClientSecret: env('ANERA_GITHUB_CLIENT_SECRET'),
+  githubCallbackUrl: env('ANERA_GITHUB_CALLBACK_URL'),
+  githubAppId: env('ANERA_GITHUB_APP_ID'),
+  githubAppSlug: env('ANERA_GITHUB_APP_SLUG'),
+  githubAppPrivateKeyPath: githubAppPrivateKeyPath ? resolve(projectRoot, githubAppPrivateKeyPath) : '',
+  githubApiBaseUrl: env('ANERA_GITHUB_API_BASE_URL', 'https://api.github.com').replace(/\/+$/, ''),
+  githubOAuthBaseUrl: env('ANERA_GITHUB_OAUTH_BASE_URL', 'https://github.com').replace(/\/+$/, ''),
+  githubOAuthStateTtlMs: positiveInt('ANERA_GITHUB_OAUTH_STATE_TTL_MS', 10 * 60 * 1000),
+  githubCloneTimeoutMs: positiveInt('ANERA_GITHUB_CLONE_TIMEOUT_MS', 5 * 60 * 1000),
+  githubMaxFiles: positiveInt('ANERA_GITHUB_MAX_FILES', 20_000),
+  githubMaxBytes: positiveInt('ANERA_GITHUB_MAX_BYTES', 512 * 1024 * 1024),
+  githubMaxFileBytes: positiveInt('ANERA_GITHUB_MAX_FILE_BYTES', 50 * 1024 * 1024),
+}
+
+export type AneraConfig = typeof config

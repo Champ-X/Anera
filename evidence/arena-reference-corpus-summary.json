@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "arena-reference-corpus-intake",
+  "sourceSchemaVersion": "anera-arena-reference-corpus/1.1",
+  "generatedAt": "2026-08-30T23:00:00+08:00",
+  "provenance": {
+    "source": "reports/arena-reference-corpus-2026-08-30/manifest.json",
+    "sourceBytes": 30846,
+    "sourceSha256": "18fba028d19df21aae0e0522fd643659608292952bfb895d714b9d85c9bffe71",
+    "rawEvidenceCopied": false
+  },
+  "scope": {
+    "product": "Arena Agent Mode",
+    "visualScope": "desktop",
+    "mobileExcluded": true,
+    "frozenTaskCount": 65
+  },
+  "inventory": {
+    "taskDirectories": 43,
+    "runDirectories": 50,
+    "metadataRuns": 16,
+    "includedStructuredRuns": 9,
+    "invalidMetadataRetries": 7,
+    "rawOnlyRunsWithoutMetadata": 34,
+    "curatedCanonicalRuns": 9,
+    "totalCanonicalEvents": 231,
+    "captureQuality": { "complete": 8, "completeWithDeclaredGaps": 1 },
+    "arenaUiOutcomes": { "success": 9 },
+    "taskOracleResults": { "pass": 5, "partial": 3, "fail": 1 }
+  },
+  "coverage": {
+    "coveredCapabilityCount": 17,
+    "totalCapabilityCount": 57,
+    "unmappedObservations": 4,
+    "rawOnlyTaskCount": 34,
+    "missingTaskCount": 22
+  },
+  "runs": [
+    { "taskId": "A01", "taskVersion": "1.1", "events": 9, "agentDurationMs": 9705, "capture": "complete", "oracle": "pass" },
+    { "taskId": "A02", "taskVersion": "1.1", "events": 39, "agentDurationMs": 20488, "capture": "complete_with_declared_gaps", "oracle": "pass" },
+    { "taskId": "A03", "taskVersion": "1.6", "events": 41, "agentDurationMs": 25950, "capture": "complete", "oracle": "partial" },
+    { "taskId": "A04", "taskVersion": "1.7", "events": 19, "agentDurationMs": 13536, "capture": "complete", "oracle": "pass" },
+    { "taskId": "D01", "taskVersion": "1.8", "events": 22, "agentDurationMs": 589000, "capture": "complete", "oracle": "fail" },
+    { "taskId": "F04", "taskVersion": "1.8", "events": 19, "agentDurationMs": 313000, "capture": "complete", "oracle": "partial" },
+    { "taskId": "L05", "taskVersion": "1.8", "events": 19, "agentDurationMs": 129905, "capture": "complete", "oracle": "pass" },
+    { "taskId": "U02", "taskVersion": "1.8", "events": 31, "agentDurationMs": 269274, "capture": "complete", "oracle": "partial" },
+    { "taskId": "U03", "taskVersion": "1.8", "events": 32, "agentDurationMs": 161000, "capture": "complete", "oracle": "pass" }
+  ],
+  "parityReadiness": {
+    "currentTaskVersionEligibleReferenceRuns": 0,
+    "pairedAneraCandidateRuns": 0,
+    "eligiblePairedRuns": 0,
+    "formalParityScoreAvailable": false,
+    "efficiencyBaselineAvailable": false,
+    "sameViewportDomPngBaselineAvailable": false,
+    "arenaModelCallsTokensCostVisible": false
+  }
+}

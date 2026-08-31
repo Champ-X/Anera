@@ -1,0 +1,11 @@
+.anera
+.anera-*
+.env
+.env.*
+!.env.showcase
+reports
+evidence
+node_modules
+dist-server
+coverage
+*.log

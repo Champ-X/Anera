@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "desktop-ui-state-coverage",
+  "sourceSchemaVersion": "anera-ui-contract/1.0",
+  "provenance": {
+    "source": "reports/ui-execution-log-v23/capture-summary.json",
+    "sourceBytes": 9847,
+    "sourceSha256": "d034b733e2b4078d9dbee171ca2a3b2f511cafa5e41c34b53c97df50df8b0ebc"
+  },
+  "result": {
+    "passed": true,
+    "stateCount": 61,
+    "captureCount": 61,
+    "consoleErrorCount": 0,
+    "horizontalOverflowCount": 0,
+    "outerShellVerticalOverflowCount": 0,
+    "taskReviewInteractionCount": 5,
+    "taskCompletionInteractionCount": 3
+  },
+  "coveredSurfaces": [
+    "direct /agent draft",
+    "Agent Leaderboard ranking and Pareto",
+    "conversation search",
+    "empty, running, completed, timed-out, and token-limit states",
+    "Thought, Plan, grouped command output, Final, and Review",
+    "Task Completion and custom-feedback variants",
+    "structured ask_user and Approval",
+    "Workspace persistence and reload interleavings",
+    "Website and docked file preview",
+    "Markdown, DOCX, XLSX, and PPTX viewers",
+    "GitHub connection and Coding repository states",
+    "Credits states",
+    "Undo success, failure, and compaction"
+  ],
+  "interactionGates": {
+    "taskReviewOptimisticRollback": true,
+    "taskCompletionOptimisticRollback": true,
+    "taskCompletionThankYou": true,
+    "customFeedbackArenaTransport": true,
+    "undoFailureAndCompaction": true,
+    "conversationFollowAllChecks": true,
+    "currentBashAutoExpanded": true,
+    "dockedPreviewOpened": true,
+    "hitlPersistedAfterRefresh": true,
+    "workspacePersistencePersistedAfterRefresh": true,
+    "saveAnimationReplayedAfterRefresh": false,
+    "undoDurableExactlyOnce": true
+  },
+  "scope": {
+    "visualScope": "desktop",
+    "mobileExcluded": true,
+    "arenaScreenshotIncluded": false,
+    "arenaPixelParityEvidence": false
+  }
+}

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser Harness E2E</title>
+</head>
+<body>
+  <h1>Browser Harness E2E</h1>
+  <p id="count">0</p>
+  <button id="increment">Increment</button>
+  <script>
+    let count = 0;
+    const countEl = document.getElementById('count');
+    document.getElementById('increment').addEventListener('click', () => {
+      count += 1;
+      countEl.textContent = count;
+    });
+  </script>
+</body>
+</html>

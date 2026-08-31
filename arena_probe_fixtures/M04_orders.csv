@@ -1,0 +1,5 @@
+order_id,customer_tier,sku,qty,unit_price
+O-1001,gold,A,3,10.00
+O-1002,silver,B,5,8.00
+O-1003,standard,A,1,10.00
+O-1004,gold,C,10,2.50

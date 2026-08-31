@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "live-web-provider-cache-canary",
+  "sourceSchemaVersion": "anera-web-provider-cache-canary/1.2",
+  "generatedAt": "2026-08-30T20:19:19.570Z",
+  "provenance": {
+    "source": "reports/real-smokes/web-provider-cache-2026-08-30T20-19-19.570Z.json",
+    "sourceBytes": 6313,
+    "sourceSha256": "b050c84aedbf3572f893e68a5fcee492f05726216684857dad4cc59ac32b6bce"
+  },
+  "execution": {
+    "description": "Live Tavily and Firecrawl through the production ToolExecutor",
+    "passed": true,
+    "credentialsConfigured": { "tavily": true, "firecrawl": true },
+    "credentialValuesStored": false,
+    "pexelsBypassed": true,
+    "searchResultCount": 4,
+    "persistedImageResultCount": 5,
+    "fetchedPageChunkCount": 4,
+    "firstChunkBytes": 240000,
+    "continuationExercised": true
+  },
+  "metering": {
+    "webSearch": { "provider": "tavily", "providerCalls": 1, "responseBytes": 3909, "outcome": "success" },
+    "imageSearchFallback": { "provider": "tavily", "providerCalls": 1, "responseBytes": 56771, "outcome": "success" },
+    "firstFetch": { "provider": "firecrawl", "cache": "miss", "providerCalls": 1, "responseBytes": 769266, "outcome": "success" },
+    "repeatedFetch": { "provider": "firecrawl", "cache": "hit", "providerCalls": 0, "responseBytes": 0 },
+    "continuationFetch": { "provider": "firecrawl", "cache": "hit", "providerCalls": 0, "responseBytes": 0 },
+    "nextTurnFetch": { "provider": "firecrawl", "cache": "miss", "providerCalls": 1, "responseBytes": 769266, "outcome": "success" },
+    "providerCostUsd": null,
+    "providerCostStatus": "not_available"
+  },
+  "checks": {
+    "searchUsesTavilyOnce": true,
+    "searchResultUrlsAdmitted": true,
+    "imageSearchUsesTavilyFallbackOnce": true,
+    "imageResultsAreAdmittedAndPersisted": true,
+    "firstFetchUsesFirecrawlOnce": true,
+    "repeatedFetchUsesZeroProviders": true,
+    "continuationUsesZeroProviders": true,
+    "nextTurnDoesNotReuseSnapshot": true,
+    "costsRemainExplicitlyUnknown": true
+  },
+  "scope": {
+    "arenaParityGate": "paused",
+    "mobileExcluded": true,
+    "arenaProviderIdentityKnown": false
+  }
+}

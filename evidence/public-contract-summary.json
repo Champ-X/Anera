@@ -1,0 +1,89 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "arena-public-contract",
+  "generatedAt": "2026-08-30T16:48:28.336Z",
+  "provenance": {
+    "source": "reports/arena-public-contract/latest.json",
+    "sourceBytes": 119169,
+    "sourceSha256": "d5f0be67aa203fca0ac4d0764ecf176bf5e411b3b80a731698936644a6816cd7",
+    "sourcePolicy": "Unauthenticated, read-only public HTML and JavaScript assets; no Cookie header or cookie jar.",
+    "arenaDeploymentId": "dpl_A1Vbar2TqcbueSZE1rhwVjSrYyPY"
+  },
+  "result": {
+    "passed": true,
+    "issueCount": 0,
+    "activeRegistryMissingLocally": 0,
+    "expectedActiveToolsMissingPublicly": 0,
+    "unexpectedActiveTools": 0,
+    "activeSchemaMismatches": 0,
+    "activeDescriptionMismatches": 0,
+    "promptProjectionMismatches": 0,
+    "publicUiStringsMissingLocally": 0,
+    "completedUiStringsMissingLocally": 0
+  },
+  "publicAssetIntake": {
+    "scriptAssetCount": 59,
+    "supplementalCompletedRouteCount": 1
+  },
+  "currentActiveAgentRegistry": {
+    "toolCount": 19,
+    "schemaAndDescriptionEvidenceCount": 19,
+    "tools": [
+      "add_voice",
+      "ask_user",
+      "bash",
+      "compact",
+      "edit_file",
+      "fetch_page",
+      "generate_image",
+      "generate_speech",
+      "get_process_output",
+      "image_search",
+      "list_connector_tools",
+      "list_files",
+      "present_file",
+      "propose_plan",
+      "read_file",
+      "start_process",
+      "stop_process",
+      "web_search",
+      "write_file"
+    ]
+  },
+  "publicPromptTemplates": [
+    {
+      "identifier": "SYSTEM_PROMPT_TEMPLATE",
+      "characters": 5124,
+      "sha256": "2ccb1e4aaed61f27fe60f49aefcdc50548e0c3a55f7dec44ab637c85de801298"
+    },
+    {
+      "identifier": "CODING_SYSTEM_PROMPT_TEMPLATE",
+      "characters": 3021,
+      "sha256": "a15295ffffd3dedf8c5debb5b19bc9637668adfe0c9e0112e5cf005e900e350b"
+    },
+    {
+      "identifier": "CODING_CLOSED_SESSION_GUIDANCE",
+      "characters": 666,
+      "sha256": "9d1ef7d6a7a2506ab0867cc95def035cabdda1009fe1346c000694b9d36ab999"
+    }
+  ],
+  "observableContractCoverage": {
+    "promptAnchorCount": 8,
+    "generalUiStringCount": 26,
+    "completedRouteUiStringCount": 21,
+    "previewSwitcher": true,
+    "taskReview": true,
+    "taskCompletion": true,
+    "taskCompletionThankYou": true,
+    "customFeedback": true,
+    "undoLastTurn": true,
+    "newChatTransport": true,
+    "existingTurnTransport": true,
+    "signedUploadTransport": true
+  },
+  "limitations": {
+    "privateBackendObserved": false,
+    "authenticatedAccountDataUsed": false,
+    "endToEndParityClaim": false
+  }
+}

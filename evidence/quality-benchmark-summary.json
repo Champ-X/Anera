@@ -1,0 +1,71 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "harness-quality-benchmark",
+  "sourceSchemaVersion": "anera-harness-quality/1.9",
+  "generatedAt": "2026-08-30T09:44:00.127Z",
+  "provenance": {
+    "source": "reports/quality-benchmarks/harness-quality-2026-08-30T09-44-00-127Z.json",
+    "sourceBytes": 430256,
+    "sourceSha256": "fbe6e57f3ff99abb5da9ca6978b1f4ce33f3abb56a17f6af4c4d3be13add5334"
+  },
+  "benchmark": {
+    "type": "Natural-language tasks with real DeepSeek planning/tool selection and deterministic outcome oracles",
+    "scope": "full",
+    "passed": true,
+    "passedTasks": 18,
+    "taskCount": 18,
+    "qualityScore": 99.44,
+    "criticalChecksPassed": true,
+    "efficiencyBudgetsPassed": true,
+    "failedToolCalls": 0,
+    "activeDurationMs": 517760,
+    "modelCalls": 115,
+    "toolCalls": 118,
+    "promptTokens": 1442015,
+    "completionTokens": 60343,
+    "cachedPromptTokens": 1370112,
+    "cacheHitRatio": 0.950137134495827,
+    "estimatedCostUsd": 0.18169895
+  },
+  "taskScores": [
+    { "name": "natural_data_analysis", "score": 90 },
+    { "name": "adversarial_sql_database_analysis", "score": 100 },
+    { "name": "adversarial_finance_reconciliation", "score": 100 },
+    { "name": "natural_code_repair", "score": 100 },
+    { "name": "natural_multifile_feature", "score": 100 },
+    { "name": "natural_dependency_upgrade", "score": 100 },
+    { "name": "natural_office_workbook", "score": 100 },
+    { "name": "natural_office_document", "score": 100 },
+    { "name": "natural_office_presentation", "score": 100 },
+    { "name": "natural_state_machine_feature", "score": 100 },
+    { "name": "natural_attachment_decision", "score": 100 },
+    { "name": "natural_long_document_synthesis", "score": 100 },
+    { "name": "adversarial_incident_handoff", "score": 100 },
+    { "name": "natural_website_build", "score": 100 },
+    { "name": "natural_visual_reconstruction", "score": 100 },
+    { "name": "natural_pdf_report", "score": 100 },
+    { "name": "natural_research_decision", "score": 100 },
+    { "name": "adversarial_web_research", "score": 100 }
+  ],
+  "visualReconstruction": {
+    "passed": true,
+    "qualityScore": 100,
+    "activeDurationMs": 64367,
+    "modelCalls": 11,
+    "toolCalls": 8,
+    "failedTools": 0,
+    "estimatedCostUsd": 0.01856406,
+    "viewport": { "width": 1200, "height": 800 },
+    "dimensionEqual": true,
+    "pixelSimilarity": 0.96252,
+    "meanAbsoluteError": 0.03748,
+    "changedRatio": 0.068344,
+    "semanticEditableHtml": true,
+    "interactionVerified": true
+  },
+  "scope": {
+    "arenaParityEvidence": false,
+    "mobileExcluded": true,
+    "note": "The 90-point data-analysis row was a frozen evaluator false negative; the historical full report remains immutable."
+  }
+}

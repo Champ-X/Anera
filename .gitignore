@@ -1,0 +1,20 @@
+node_modules/
+dist-client/
+dist-server/
+
+# Local runtime state, generated evaluation workspaces, and credentials.
+.anera/
+.anera-*/
+.env
+.env.*
+!.env.example
+!.env.showcase
+
+# The research workspace contains hundreds of generated captures. A curated,
+# path-scrubbed evidence set lives in /evidence and is committed instead.
+reports/
+
+.vercel/
+coverage/
+*.log
+.DS_Store

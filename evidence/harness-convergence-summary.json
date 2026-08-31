@@ -1,0 +1,70 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "harness-convergence",
+  "sourceSchemaVersion": "anera-harness-convergence/1.1",
+  "generatedAt": "2026-08-30T20:24:27.664Z",
+  "provenance": {
+    "source": "reports/real-smokes/harness-convergence-2026-08-30T20-24-27-664Z.json",
+    "sourceBytes": 27835,
+    "sourceSha256": "35f4539c95b0336e34cb1ba7b6fc3654ae3057514dd4dcc6cb751865b625be1a"
+  },
+  "execution": {
+    "model": "real configured DeepSeek provider",
+    "passed": true,
+    "passedScenarios": 9,
+    "scenarioCount": 9,
+    "activeDurationMs": 71395,
+    "wallMs": 74123,
+    "modelCalls": 58,
+    "toolCalls": 42,
+    "promptTokens": 496034,
+    "completionTokens": 4724,
+    "cachedPromptTokens": 480768,
+    "cacheHitRatio": 0.9692238838466718,
+    "estimatedCostUsd": 0.04313908
+  },
+  "activeToolCoverage": {
+    "required": 19,
+    "covered": 19,
+    "missing": [],
+    "passed": true,
+    "tools": [
+      "add_voice",
+      "ask_user",
+      "bash",
+      "compact",
+      "edit_file",
+      "fetch_page",
+      "generate_image",
+      "generate_speech",
+      "get_process_output",
+      "image_search",
+      "list_connector_tools",
+      "list_files",
+      "present_file",
+      "propose_plan",
+      "read_file",
+      "start_process",
+      "stop_process",
+      "web_search",
+      "write_file"
+    ]
+  },
+  "scenarios": [
+    { "name": "no_tool_efficiency", "passed": true, "modelCalls": 1, "toolCalls": 0, "failedTools": 0 },
+    { "name": "file_shell_process_compaction", "passed": true, "modelCalls": 13, "toolCalls": 11, "failedTools": 0 },
+    { "name": "research_to_artifact", "passed": true, "modelCalls": 5, "toolCalls": 4, "failedTools": 0 },
+    { "name": "image_search_generate_present", "passed": true, "modelCalls": 8, "toolCalls": 5, "failedTools": 0 },
+    { "name": "browser_screenshot_to_vision", "passed": true, "modelCalls": 8, "toolCalls": 6, "failedTools": 0 },
+    { "name": "voice_selection_to_speech", "passed": true, "modelCalls": 7, "toolCalls": 3, "failedTools": 0 },
+    { "name": "ask_and_plan_revision", "passed": true, "modelCalls": 8, "toolCalls": 7, "failedTools": 0 },
+    { "name": "tool_failure_recovery", "passed": true, "modelCalls": 5, "toolCalls": 4, "failedTools": 1, "note": "The single failed read is intentional recovery evidence." },
+    { "name": "dynamic_connector_loading", "passed": true, "modelCalls": 3, "toolCalls": 2, "failedTools": 0 }
+  ],
+  "scope": {
+    "arenaParityGate": "paused",
+    "mobileExcluded": true,
+    "fixtureMediaSpeechCostsAreExternalProviderCharges": false,
+    "arenaParityEvidence": false
+  }
+}

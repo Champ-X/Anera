@@ -1,0 +1,69 @@
+{
+  "schemaVersion": "anera-public-evidence-summary/1.0",
+  "evidenceType": "live-vision-task",
+  "sourceSchemaVersion": "anera-vision-task-smoke/1.0",
+  "generatedAt": "2026-08-30T20:29:46.421Z",
+  "provenance": {
+    "smokeSource": "reports/real-smokes/vision-task-2026-08-30T20-29-46-421Z.json",
+    "smokeSourceBytes": 2442,
+    "smokeSourceSha256": "a0a4e78c5df1ad896b25a189cc0e2f9632053cc7623af7e60b3be3c362aa706d",
+    "pricingSidecar": "reports/real-smokes/vision-pricing-reconciliation-2026-08-31.json",
+    "pricingSidecarBytes": 3137,
+    "pricingSidecarSha256": "778d5151f5991e8e662f1c27e520cd8bbdc03bc67f3770ae8122039f1826323a"
+  },
+  "execution": {
+    "productionBundle": true,
+    "liveProvider": true,
+    "providerFixture": false,
+    "provider": "DeepSeek OpenAI-compatible chat/completions",
+    "model": "deepseek-v4-flash-vision-exp",
+    "status": "completed",
+    "passed": true,
+    "activeDurationMs": 158878,
+    "modelCalls": 13,
+    "toolCalls": 9,
+    "promptTokens": 123592,
+    "completionTokens": 14599,
+    "totalTokens": 138191,
+    "cachedPromptTokens": 119296,
+    "historicalSessionEstimatedCostUsd": 0.02556954
+  },
+  "visionMetering": {
+    "physicalRequests": 3,
+    "meteredCalls": 3,
+    "cacheHitInputTokens": 0,
+    "cacheMissInputTokens": 1621,
+    "outputTokens": 9949,
+    "totalTokens": 11570,
+    "historicalVisionCostUsd": 0.01138157,
+    "correctedOffPeakVisionCostUsd": 0.00692296,
+    "correctedSessionEstimatedCostUsd": 0.02111093,
+    "costInterpretation": "Mechanically adjusted historical estimate; not a new provider bill."
+  },
+  "toolChain": [
+    "inspect_image",
+    "write_file",
+    "start_process",
+    "start_process",
+    "browser",
+    "browser",
+    "inspect_image",
+    "browser",
+    "present_file"
+  ],
+  "checks": {
+    "completed": true,
+    "requiredVisionModelUsed": true,
+    "physicalVisionRequestRecorded": true,
+    "meteredVisionCallRecorded": true,
+    "positiveVisionTokenUsage": true,
+    "requiredToolsCompleted": true,
+    "dashboardArtifactCreated": true
+  },
+  "privacy": {
+    "sessionIdIncluded": false,
+    "localPreviewUrlIncluded": false,
+    "sourceImageIncluded": false,
+    "credentialValuesIncluded": false
+  }
+}

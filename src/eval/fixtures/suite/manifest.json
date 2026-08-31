@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "anera-eval-suite/1.0",
+  "baselineVersion": "observable-parity-v1",
+  "expectedTaskCount": 1,
+  "visualScope": "desktop",
+  "visualBaselinePassed": true,
+  "runs": [
+    {
+      "taskId": "A01",
+      "reference": "arena.jsonl",
+      "candidate": "anera.jsonl",
+      "captureQuality": "complete",
+      "unmappedCount": 0,
+      "quality": {
+        "referenceTaskResult": "pass",
+        "candidateTaskResult": "pass",
+        "candidateOraclePass": true,
+        "candidateConstraintViolations": [],
+        "criticalViolations": []
+      }
+    }
+  ]
+}

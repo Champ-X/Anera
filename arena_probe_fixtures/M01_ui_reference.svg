@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="title desc">
+  <title id="title">Anera operations dashboard reference</title>
+  <desc id="desc">A dark navy sidebar and a pale dashboard containing metric cards, a bar chart, and a recent runs table.</desc>
+  <rect width="1200" height="800" fill="#f4f1ea"/>
+  <rect width="228" height="800" fill="#172235"/>
+  <circle cx="42" cy="42" r="15" fill="#ff6b45"/>
+  <text x="69" y="49" font-family="Arial, sans-serif" font-size="23" font-weight="700" fill="#ffffff">ANERA OPS</text>
+  <g font-family="Arial, sans-serif" font-size="16" fill="#aeb9c9">
+    <text x="32" y="120" fill="#ffffff" font-weight="700">Overview</text>
+    <text x="32" y="166">Runs</text>
+    <text x="32" y="212">Artifacts</text>
+    <text x="32" y="258">Evaluations</text>
+    <text x="32" y="304">Settings</text>
+  </g>
+  <rect x="20" y="88" width="188" height="50" rx="10" fill="#263750"/>
+  <text x="32" y="120" font-family="Arial, sans-serif" font-size="16" font-weight="700" fill="#ffffff">Overview</text>
+  <text x="268" y="58" font-family="Arial, sans-serif" font-size="30" font-weight="700" fill="#172235">Agent operations</text>
+  <text x="268" y="87" font-family="Arial, sans-serif" font-size="15" fill="#667085">Thursday, 28 August · Live workspace health</text>
+  <rect x="1010" y="34" width="150" height="48" rx="24" fill="#172235"/>
+  <text x="1041" y="64" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#ffffff">+ New run</text>
+  <g font-family="Arial, sans-serif">
+    <rect x="268" y="124" width="270" height="132" rx="18" fill="#ffffff"/>
+    <text x="292" y="157" font-size="14" fill="#667085">COMPLETED RUNS</text>
+    <text x="292" y="211" font-size="42" font-weight="700" fill="#172235">1,284</text>
+    <text x="432" y="211" font-size="14" font-weight="700" fill="#20845a">+12.8%</text>
+    <rect x="558" y="124" width="270" height="132" rx="18" fill="#ff6b45"/>
+    <text x="582" y="157" font-size="14" fill="#ffe6df">SUCCESS RATE</text>
+    <text x="582" y="211" font-size="42" font-weight="700" fill="#ffffff">92.4%</text>
+    <rect x="848" y="124" width="312" height="132" rx="18" fill="#ffffff"/>
+    <text x="872" y="157" font-size="14" fill="#667085">MEDIAN DURATION</text>
+    <text x="872" y="211" font-size="42" font-weight="700" fill="#172235">48s</text>
+    <text x="982" y="211" font-size="14" font-weight="700" fill="#9b5c00">-6.2%</text>
+  </g>
+  <rect x="268" y="280" width="570" height="286" rx="18" fill="#ffffff"/>
+  <text x="292" y="320" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#172235">Runs by day</text>
+  <text x="292" y="345" font-family="Arial, sans-serif" font-size="13" fill="#667085">Last seven days</text>
+  <line x1="310" y1="510" x2="800" y2="510" stroke="#d9dee7"/>
+  <g fill="#5b75e5">
+    <rect x="330" y="426" width="42" height="84" rx="6"/>
+    <rect x="397" y="390" width="42" height="120" rx="6"/>
+    <rect x="464" y="410" width="42" height="100" rx="6"/>
+    <rect x="531" y="360" width="42" height="150" rx="6"/>
+    <rect x="598" y="378" width="42" height="132" rx="6"/>
+    <rect x="665" y="338" width="42" height="172" rx="6"/>
+    <rect x="732" y="350" width="42" height="160" rx="6"/>
+  </g>
+  <g font-family="Arial, sans-serif" font-size="12" fill="#667085" text-anchor="middle">
+    <text x="351" y="535">Fri</text><text x="418" y="535">Sat</text><text x="485" y="535">Sun</text>
+    <text x="552" y="535">Mon</text><text x="619" y="535">Tue</text><text x="686" y="535">Wed</text><text x="753" y="535">Thu</text>
+  </g>
+  <rect x="858" y="280" width="302" height="286" rx="18" fill="#172235"/>
+  <text x="884" y="320" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#ffffff">Tool mix</text>
+  <circle cx="1009" cy="421" r="72" fill="none" stroke="#34445c" stroke-width="26"/>
+  <circle cx="1009" cy="421" r="72" fill="none" stroke="#ff6b45" stroke-width="26" stroke-dasharray="210 452" transform="rotate(-90 1009 421)"/>
+  <circle cx="1009" cy="421" r="72" fill="none" stroke="#5b75e5" stroke-width="26" stroke-dasharray="140 452" stroke-dashoffset="-210" transform="rotate(-90 1009 421)"/>
+  <text x="1009" y="416" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" fill="#aeb9c9">TOTAL CALLS</text>
+  <text x="1009" y="445" text-anchor="middle" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#ffffff">3,942</text>
+  <g font-family="Arial, sans-serif" font-size="13" fill="#d9e1ed">
+    <circle cx="892" cy="525" r="5" fill="#ff6b45"/><text x="905" y="530">Shell 46%</text>
+    <circle cx="994" cy="525" r="5" fill="#5b75e5"/><text x="1007" y="530">Web 31%</text>
+  </g>
+  <rect x="268" y="590" width="892" height="174" rx="18" fill="#ffffff"/>
+  <text x="292" y="626" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#172235">Recent runs</text>
+  <g font-family="Arial, sans-serif" font-size="13" fill="#667085">
+    <text x="292" y="660">RUN</text><text x="510" y="660">TASK</text><text x="790" y="660">STATUS</text><text x="1010" y="660">DURATION</text>
+    <line x1="292" y1="671" x2="1136" y2="671" stroke="#e4e7ec"/>
+    <text x="292" y="700" fill="#172235">AR-2841</text><text x="510" y="700" fill="#172235">Build dashboard</text><text x="790" y="700" fill="#20845a">Completed</text><text x="1010" y="700">52s</text>
+    <line x1="292" y1="713" x2="1136" y2="713" stroke="#eef0f3"/>
+    <text x="292" y="742" fill="#172235">AR-2840</text><text x="510" y="742" fill="#172235">Research sources</text><text x="790" y="742" fill="#9b5c00">Running</text><text x="1010" y="742">1m 18s</text>
+  </g>
+</svg>
