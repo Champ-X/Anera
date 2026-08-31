@@ -15,7 +15,7 @@
 | Public contract | **Verified** | 在冻结的 Arena 公开 deployment 上，19 个 active tools、参数 schema/描述、公开 prompt 投影、关键 UI 文案、上传与新对话 transport 无审计 drift。 |
 | Harness capability | **Verified** | 9/9 能力场景通过，19/19 active tools 被覆盖，共 42 次 tool calls。 |
 | Internal task quality | **Verified** | 18/18 内部任务通过，平均质量分 99.44，critical/效率门禁全通过，0 个失败工具。 |
-| Anera UI state coverage | **Verified** | 61/61 桌面状态回归通过，0 console error，0 水平溢出，0 outer-shell 垂直溢出。 |
+| Anera UI state coverage | **Verified** | 62/62 桌面状态回归通过，0 console error，0 水平溢出，0 outer-shell 垂直溢出。 |
 | Exact paired trace | **N/A** | 尚无符合当前版本规则的 Arena reference / Anera candidate 配对。 |
 | Same-viewport pixel parity | **N/A** | 尚无同 viewport、字体、缩放与人工动作脚本下的 DOM/PNG 配对。 |
 
@@ -98,12 +98,12 @@ Anera 没有把“终端显示 success”当成任务正确性。每一层证据
 | 公开契约审计 | PASS；19/19 active tools | 未登录公开 bundle 快照 | 不代表 Arena 私有后端完全相同。 |
 | Harness convergence | 9/9 场景；19/19 工具；42 calls | 真实 DeepSeek 规划 + 确定性外部 fixture | 不代表所有外部 provider 都在该次运行中真实调用。 |
 | 内部质量基准 | 18/18；99.44；0 failed tools | 真实 DeepSeek + deterministic outcome oracles | 该报告明确记录 `arenaParityEvidence: false`，不是 Arena parity 分数。 |
-| UI 状态回归 | 61/61；0 console / horizontal / outer-shell vertical overflow | Anera 桌面端自身截图与交互回归 | 不是 Arena 同 viewport PNG diff。 |
+| UI 状态回归 | 62/62；0 console / horizontal / outer-shell vertical overflow | Anera 桌面端自身截图与交互回归 | 不是 Arena 同 viewport PNG diff。 |
 | Web provider canary | PASS | Tavily / Firecrawl 生产 ToolExecutor 真实路径 | 该证据不能用于证明 Arena 使用同一 provider。 |
 | Vision task smoke | PASS；`liveProvider: true` | DeepSeek Vision 真实路径，inspect → build → browser → inspect → present | 不是下文原始 HTML Slides prompt 的同 episode 实证。 |
 | 原提示 HTML Slides canary 快照 | PASS；10 model / 10 tool；78.112 s；`$0.03741436` | 真实 DeepSeek 文本/视觉路径；报告绑定当时 production bundle fingerprint | 不是当前 working tree 的 fresh attestation，也不是 Arena trace、成本或像素 parity。 |
 
-这些数值必须保持分层。`19/19`、`9/9`、`18/18`、`99.44` 和 `61/61` 不能被算术合并成“99% Arena parity”。
+这些数值必须保持分层。`19/19`、`9/9`、`18/18`、`99.44` 和 `62/62` 不能被算术合并成“99% Arena parity”。
 
 ## 代表性任务：AI 热点 HTML Slides
 

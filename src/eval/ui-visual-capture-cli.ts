@@ -18,6 +18,7 @@ import {
   seedVisualRunningFixture,
   seedVisualTaskCompletionFixture,
   seedVisualTaskReviewFixture,
+  seedVisualWritingFixture,
   seedVisualWorkspacePersistenceFixture,
 } from './ui-visual-fixture.js'
 
@@ -85,6 +86,18 @@ interface WorkspaceFileInteractionCheck {
   dockedPreviewOpened: true
   workspaceHiddenWhilePreviewOpen: true
   workspaceRestoredAfterPreviewClose: true
+}
+
+interface StreamingWriteInteractionCheck {
+  path: 'ai-weekly-2026-08-31.html'
+  visibleTailLines: 8
+  firstVisibleLine: 415
+  lastVisibleLine: 422
+  timelineByteBadgeAbsent: true
+  workspaceDraftVisible: true
+  workspaceBytesMatchUtf8: true
+  composerLocked: true
+  stopVisible: true
 }
 
 const args = parseArgs(process.argv.slice(2))
@@ -1367,6 +1380,53 @@ try {
   conversationFollowInteractionChecks.nearBottomGrowthFollowed = true
   await capture('running-tool-desktop')
 
+  const writing = await seedVisualWritingFixture(created.store)
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 })
+  await page.locator('.app-shell').waitFor({ state: 'visible' })
+  await selectDesktopSession(writing.title)
+  await expectSessionRoute(writing.id, writing.title)
+  await ensureWorkspaceOpen()
+  await setConversationScroll(page, 'bottom')
+  const writingRow = page.locator('.streaming-file-write.running')
+  await writingRow.waitFor({ state: 'visible' })
+  if (await writingRow.getAttribute('aria-label') !== `Writing ${writing.path}`) {
+    throw new Error('Streaming write did not expose the recorded Arena path')
+  }
+  const writingHeader = writingRow.locator('.streaming-file-write-head')
+  const writingHeaderSmallLabels = await writingHeader.locator('small').allTextContents()
+  if (writingHeaderSmallLabels.join('|') !== 'open') {
+    throw new Error(`Streaming write timeline repeated Workspace bytes: ${JSON.stringify(writingHeaderSmallLabels)}`)
+  }
+  const visibleWritingLines = writingRow.locator('.streaming-file-write-line')
+  if (await visibleWritingLines.count() !== 8) throw new Error('Streaming write did not show the final eight source lines')
+  const visibleWritingLineNumbers = await visibleWritingLines.locator(':scope > span').allTextContents()
+  if (visibleWritingLineNumbers.join('|') !== '415|416|417|418|419|420|421|422') {
+    throw new Error(`Streaming write line-number tail drifted: ${JSON.stringify(visibleWritingLineNumbers)}`)
+  }
+  const workspaceDraft = page.locator('.workspace-draft-file').filter({ hasText: writing.path })
+  await workspaceDraft.waitFor({ state: 'visible' })
+  const expectedDraftUsage = `${(writing.bytes / 1024).toFixed(1)}KB/128.0MB`
+  if (!(await page.locator('.workspace-usage').innerText()).replaceAll(' ', '').includes(expectedDraftUsage)) {
+    throw new Error(`Workspace did not project the streaming UTF-8 byte count ${expectedDraftUsage}`)
+  }
+  const writingComposer = page.getByRole('textbox', { name: 'Message' })
+  const composerLocked = await writingComposer.getAttribute('contenteditable') === 'false'
+    && await writingComposer.getAttribute('aria-disabled') === 'true'
+  const stopVisible = await page.getByRole('button', { name: 'Stop agent' }).isVisible()
+  if (!composerLocked || !stopVisible) throw new Error('Streaming write lost its locked composer or Stop control')
+  const streamingWriteInteractionCheck: StreamingWriteInteractionCheck = {
+    path: 'ai-weekly-2026-08-31.html',
+    visibleTailLines: 8,
+    firstVisibleLine: 415,
+    lastVisibleLine: 422,
+    timelineByteBadgeAbsent: true,
+    workspaceDraftVisible: true,
+    workspaceBytesMatchUtf8: true,
+    composerLocked: true,
+    stopVisible: true,
+  }
+  await capture('running-writing-desktop')
+
   const workspacePersistence = await seedVisualWorkspacePersistenceFixture(created.store)
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 })
   await page.locator('.app-shell').waitFor({ state: 'visible' })
@@ -1625,6 +1685,11 @@ try {
     && workspaceFileInteractionCheck.dockedPreviewOpened
     && workspaceFileInteractionCheck.workspaceHiddenWhilePreviewOpen
     && workspaceFileInteractionCheck.workspaceRestoredAfterPreviewClose
+  const streamingWriteInteractionsPassed = streamingWriteInteractionCheck.timelineByteBadgeAbsent
+    && streamingWriteInteractionCheck.workspaceDraftVisible
+    && streamingWriteInteractionCheck.workspaceBytesMatchUtf8
+    && streamingWriteInteractionCheck.composerLocked
+    && streamingWriteInteractionCheck.stopVisible
   const hitlInteractionsPassed = hitlInteractionCheck.pendingQuestionCount === 2
     && hitlInteractionCheck.pendingOptionCount === 4
     && hitlInteractionCheck.pendingCustomInputCount === 2
@@ -1665,6 +1730,7 @@ try {
     && websiteWorkspaceInteractionsPassed
     && executionLogInteractionsPassed
     && workspaceFileInteractionsPassed
+    && streamingWriteInteractionsPassed
     && hitlInteractionsPassed
   await writeFile(resolve(output, 'capture-summary.json'), `${JSON.stringify({
     schemaVersion: contract.schemaVersion,
@@ -1686,6 +1752,7 @@ try {
     conversationFollowInteractions: conversationFollowInteractionChecks,
     executionLogInteraction: executionLogInteractionCheck,
     workspaceFileInteraction: workspaceFileInteractionCheck,
+    streamingWriteInteraction: streamingWriteInteractionCheck,
     hitlInteraction: hitlInteractionCheck,
     websiteWorkspaceInteraction: websiteWorkspaceInteractionChecks,
     workspacePersistenceInteraction: workspacePersistenceInteractionCheck,
@@ -1693,7 +1760,7 @@ try {
     undoFailureAndCompaction: undoFailureAndCompactionPassed,
     passed,
   }, null, 2)}\n`, 'utf8')
-  process.stdout.write(`${JSON.stringify({ output, states: states.length, consoleErrors: errors.length, horizontalOverflows: overflows.length, verticalOverflows: verticalOverflows.length, agentDraftRouteInteractions: agentDraftRouteInteractionChecks, leaderboardInteractions: leaderboardInteractionChecks, conversationSearchInteractions: conversationSearchInteractionChecks, conversationFollowInteractions: conversationFollowInteractionChecks, executionLogInteraction: executionLogInteractionCheck, workspaceFileInteraction: workspaceFileInteractionCheck, hitlInteraction: hitlInteractionCheck, websiteWorkspaceInteraction: websiteWorkspaceInteractionChecks, workspacePersistenceInteraction: workspacePersistenceInteractionCheck, previewElementPickerInteraction: previewElementPickerInteractionChecks, taskReviewInteractions: taskReviewInteractionChecks.length, taskReviewOptimisticRollback: taskReviewGate.optimisticRollbackPassed, taskCompletionInteractions: taskCompletionInteractionChecks.length, taskCompletionOptimisticRollback: taskCompletionGate.optimisticRollbackPassed, taskCompletionThankYou: taskCompletionThankYouPassed, customFeedbackArenaTransport: customFeedbackArenaTransportPassed, undoInteraction: undoSuccess, undoFailureAndCompaction: undoFailureAndCompactionPassed, passed }, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify({ output, states: states.length, consoleErrors: errors.length, horizontalOverflows: overflows.length, verticalOverflows: verticalOverflows.length, agentDraftRouteInteractions: agentDraftRouteInteractionChecks, leaderboardInteractions: leaderboardInteractionChecks, conversationSearchInteractions: conversationSearchInteractionChecks, conversationFollowInteractions: conversationFollowInteractionChecks, executionLogInteraction: executionLogInteractionCheck, workspaceFileInteraction: workspaceFileInteractionCheck, streamingWriteInteraction: streamingWriteInteractionCheck, hitlInteraction: hitlInteractionCheck, websiteWorkspaceInteraction: websiteWorkspaceInteractionChecks, workspacePersistenceInteraction: workspacePersistenceInteractionCheck, previewElementPickerInteraction: previewElementPickerInteractionChecks, taskReviewInteractions: taskReviewInteractionChecks.length, taskReviewOptimisticRollback: taskReviewGate.optimisticRollbackPassed, taskCompletionInteractions: taskCompletionInteractionChecks.length, taskCompletionOptimisticRollback: taskCompletionGate.optimisticRollbackPassed, taskCompletionThankYou: taskCompletionThankYouPassed, customFeedbackArenaTransport: customFeedbackArenaTransportPassed, undoInteraction: undoSuccess, undoFailureAndCompaction: undoFailureAndCompactionPassed, passed }, null, 2)}\n`)
   if (!passed) process.exitCode = 1
 } finally {
   if (browser) await browser.close()

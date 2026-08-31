@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -12,6 +12,7 @@ import {
   completeVisualWorkspacePersistenceFixture,
   seedVisualFixtureSessions,
   seedVisualRunningFixture,
+  seedVisualWritingFixture,
   seedVisualWorkspacePersistenceFixture,
 } from './ui-visual-fixture.js'
 
@@ -121,6 +122,34 @@ describe('deterministic UI visual fixture', () => {
       expect(events.filter((event) => event.type === 'tool.output').map((event) => event.data.stream)).toEqual(['stdout', 'stderr'])
       expect(events.some((event) => event.type === 'tool.completed'
         && (event.data.call as { name?: string } | undefined)?.name === 'bash')).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('seeds the recorded Arena HTML Writing state as an uncommitted UTF-8 draft', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-ui-writing-fixture-test-'))
+    try {
+      const store = new SessionStore(root, 'fixture-model')
+      await store.initialize()
+      const writing = await seedVisualWritingFixture(store)
+      const state = await store.get(writing.id)
+      const events = await store.events(writing.id)
+      const delta = events.find((event) => event.type === 'assistant.tool_call.delta')
+
+      expect(state.summary).toMatchObject({
+        title: 'Visual Streaming HTML Write',
+        status: 'running',
+        workspaceBytes: 0,
+      })
+      expect(writing).toMatchObject({ path: 'ai-weekly-2026-08-31.html', lineCount: 422 })
+      expect(writing.bytes).toBe(Buffer.byteLength(writing.content))
+      expect(writing.content).toContain('全球继续加速 Agent 部署')
+      expect(delta?.data).toMatchObject({ index: 0, nameDelta: 'write_file' })
+      expect(String(delta?.data.argumentsDelta)).toContain('"path":"ai-weekly-2026-08-31.html"')
+      expect(String(delta?.data.argumentsDelta)).not.toMatch(/"}$/)
+      expect(events.some((event) => event.type === 'tool.started')).toBe(false)
+      await expect(stat(resolve(store.workspaceDir(writing.id), writing.path))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

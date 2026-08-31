@@ -673,18 +673,48 @@ export interface WorkspaceFileSnapshotEntry {
   sha256: string
 }
 
-export async function workspaceFileSnapshot(root: string, maxEntries = 2_000): Promise<Map<string, WorkspaceFileSnapshotEntry>> {
+export interface WorkspaceFileSnapshotOptions {
+  /** Optional hard support limit. Exceeding it fails explicitly; files are never silently omitted. */
+  maxEntries?: number
+  signal?: AbortSignal
+}
+
+/**
+ * Capture the complete file identity set used by durable Shell reconciliation.
+ * The legacy implementation silently stopped after 2,000 files, which could
+ * misclassify later files as unchanged or missing. The default is now complete;
+ * callers that need a support boundary may set one and receive an explicit
+ * failure instead of a partial snapshot.
+ */
+export async function workspaceFileSnapshot(
+  root: string,
+  options: number | WorkspaceFileSnapshotOptions = {},
+): Promise<Map<string, WorkspaceFileSnapshotEntry>> {
+  const maxEntries = typeof options === 'number' ? options : options.maxEntries
+  const signal = typeof options === 'number' ? undefined : options.signal
+  if (maxEntries !== undefined && (!Number.isInteger(maxEntries) || maxEntries < 1)) {
+    throw new Error('Workspace file snapshot limit must be a positive integer')
+  }
   const snapshot = new Map<string, WorkspaceFileSnapshotEntry>()
   async function visit(directory: string): Promise<void> {
-    if (snapshot.size >= maxEntries) return
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      if (isWorkspaceSnapshotExcludedPath(entry.name) || snapshot.size >= maxEntries) continue
+    signal?.throwIfAborted()
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => compareUtf8(left.name, right.name))
+    for (const entry of entries) {
+      signal?.throwIfAborted()
+      if (isWorkspaceSnapshotExcludedPath(entry.name)) continue
       const absolute = resolve(directory, entry.name)
       if (entry.isSymbolicLink()) continue
       if (entry.isDirectory()) await visit(absolute)
       else if (entry.isFile()) {
+        if (maxEntries !== undefined && snapshot.size >= maxEntries) {
+          throw new Error(`Workspace file snapshot exceeded ${maxEntries} files`)
+        }
         const info = await stat(absolute)
-        const content = await readFile(absolute)
+        signal?.throwIfAborted()
+        const content = signal
+          ? await readFile(absolute, { signal })
+          : await readFile(absolute)
         snapshot.set(relative(root, absolute).split(sep).join('/'), {
           size: info.size,
           mtimeMs: info.mtimeMs,
@@ -701,8 +731,23 @@ export async function workspaceFileSnapshot(root: string, maxEntries = 2_000): P
   return snapshot
 }
 
-export async function findWebsiteEntry(root: string): Promise<string | undefined> {
+export interface FindWebsiteEntryOptions {
+  signal?: AbortSignal
+  maxEntries?: number
+}
+
+const DEFAULT_WEBSITE_ENTRY_SCAN_LIMIT = 20_000
+
+export async function findWebsiteEntry(
+  root: string,
+  options: FindWebsiteEntryOptions = {},
+): Promise<string | undefined> {
+  const maxEntries = options.maxEntries ?? DEFAULT_WEBSITE_ENTRY_SCAN_LIMIT
+  if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+    throw new Error('Website entry scan limit must be a positive integer')
+  }
   for (const candidate of ['index.html', 'dashboard.html', 'app/index.html', 'public/index.html']) {
+    options.signal?.throwIfAborted()
     try {
       const target = resolveWorkspacePath(root, candidate)
       await assertNoSymlinkTraversal(root, target)
@@ -714,12 +759,37 @@ export async function findWebsiteEntry(root: string): Promise<string | undefined
   // Entry discovery operates on the live runtime, not the saved Workspace
   // projection. Build output such as dist/index.html must remain startable and
   // restartable even though it is intentionally absent from tree/ZIP saves.
-  const tree = await workspaceTreeWithPolicy(root, 500, isWorkspaceInternalPath)
-  const stack = [...tree]
-  while (stack.length > 0) {
-    const entry = stack.shift()!
-    if (entry.type === 'directory') stack.unshift(...(entry.children ?? []))
-    else if (entry.name.toLowerCase().endsWith('.html')) return entry.path
+  // Scan incrementally so a large tree does not have to be materialized before
+  // the first usable HTML entry can be returned. The explicit budget keeps an
+  // untrusted Workspace from turning automatic discovery into an unbounded
+  // traversal; callers with a run signal can stop it immediately.
+  let examinedEntries = 0
+  const visit = async (directory: string): Promise<string | undefined> => {
+    options.signal?.throwIfAborted()
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => Number(right.isDirectory()) - Number(left.isDirectory()) || compareUtf8(left.name, right.name))
+    for (const entry of entries) {
+      options.signal?.throwIfAborted()
+      const absolute = resolve(directory, entry.name)
+      const path = relative(root, absolute).split(sep).join('/')
+      if (isWorkspaceInternalPath(path) || entry.isSymbolicLink()) continue
+      examinedEntries += 1
+      if (examinedEntries > maxEntries) {
+        throw new Error(`Website entry discovery exceeded ${maxEntries} entries`)
+      }
+      if (entry.isDirectory()) {
+        const nested = await visit(absolute)
+        if (nested) return nested
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.html')) {
+        return path
+      }
+    }
+    return undefined
   }
-  return undefined
+  try {
+    return await visit(root)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
 }

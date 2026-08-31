@@ -216,29 +216,25 @@ export interface PartialJsonStringField {
   complete: boolean
 }
 
-/**
- * Decode a JSON string field while provider tool arguments are still partial.
- * A full JSON parse cannot work until the final quote and object delimiter
- * arrive, but the visible write preview must remain UTF-8 and escape correct.
- */
-export function partialJsonStringField(source: string, field: string): PartialJsonStringField | undefined {
-  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const match = new RegExp(`"${escapedField}"\\s*:\\s*"`).exec(source)
-  if (!match || match.index === undefined) return undefined
+interface ScannedJsonString extends PartialJsonStringField {
+  nextIndex: number
+}
+
+function scanJsonString(source: string, startIndex: number): ScannedJsonString {
   let value = ''
-  let index = match.index + match[0].length
+  let index = startIndex
   while (index < source.length) {
     const character = source[index++]
-    if (character === '"') return { value, complete: true }
+    if (character === '"') return { value, complete: true, nextIndex: index }
     if (character !== '\\') {
       value += character
       continue
     }
-    if (index >= source.length) return { value, complete: false }
+    if (index >= source.length) return { value, complete: false, nextIndex: index }
     const escape = source[index++]
     if (escape === 'u') {
       const digits = source.slice(index, index + 4)
-      if (!/^[0-9a-fA-F]{4}$/.test(digits)) return { value, complete: false }
+      if (!/^[0-9a-fA-F]{4}$/.test(digits)) return { value, complete: false, nextIndex: source.length }
       value += String.fromCharCode(Number.parseInt(digits, 16))
       index += 4
       continue
@@ -250,7 +246,47 @@ export function partialJsonStringField(source: string, field: string): PartialJs
             : escape === 'f' ? '\f'
               : escape
   }
-  return { value, complete: false }
+  return { value, complete: false, nextIndex: index }
+}
+
+/**
+ * Decode a JSON string field while provider tool arguments are still partial.
+ * A full JSON parse cannot work until the final quote and object delimiter
+ * arrive, but the visible write preview must remain UTF-8 and escape correct.
+ */
+export function partialJsonStringField(source: string, field: string): PartialJsonStringField | undefined {
+  const containers: Array<'{' | '['> = []
+  let index = 0
+  while (index < source.length) {
+    const character = source[index]
+    if (character === '{' || character === '[') {
+      containers.push(character)
+      index += 1
+      continue
+    }
+    if (character === '}' || character === ']') {
+      containers.pop()
+      index += 1
+      continue
+    }
+    if (character !== '"') {
+      index += 1
+      continue
+    }
+    const key = scanJsonString(source, index + 1)
+    if (!key.complete) return undefined
+    index = key.nextIndex
+    if (containers.length !== 1 || containers[0] !== '{') continue
+    while (/\s/.test(source[index] ?? '')) index += 1
+    if (source[index] !== ':') continue
+    index += 1
+    if (key.value !== field) continue
+    while (/\s/.test(source[index] ?? '')) index += 1
+    if (source[index] !== '"') return undefined
+    const value = scanJsonString(source, index + 1)
+    return { value: value.value, complete: value.complete }
+  }
+  return undefined
 }
 
 function streamedFileWrite(item: ToolCallDraftTimelineItem): { path: string; content: string; bytes: number } | undefined {
@@ -3936,7 +3972,6 @@ export function StreamingToolCallRow({ item }: { item: ToolCallDraftTimelineItem
       {item.status === 'running' ? <LoaderCircle className="spin" size={13} /> : <X size={13} />}
       <span>{action}</span>
       <code>{write.path}</code>
-      <small>{formatBytes(write.bytes).replace(' ', '')}</small>
       <small>open</small>
       {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
     </button>

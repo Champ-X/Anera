@@ -88,12 +88,11 @@ export async function grepWorkspace(
   const genericContext = boundedContext(args.context ?? args['-C'] ?? 0)
   const beforeCount = boundedContext(args['-B'] ?? genericContext)
   const afterCount = boundedContext(args['-A'] ?? genericContext)
-  const files = await collectWorkspaceFiles(root, args.path, signal)
   let truncated = false
 
   if (mode === 'files_with_matches') {
     const matchedFiles: string[] = []
-    for (const file of files) {
+    for await (const file of iterateWorkspaceFiles(root, args.path, signal)) {
       signal.throwIfAborted()
       if (!matchesFileFilter(file, args.glob) || await isProbablyBinary(file.absolutePath, file.size, signal)) continue
       const found = await fileHasMatch(file.absolutePath, expression, signal)
@@ -111,7 +110,7 @@ export async function grepWorkspace(
     const counts: Array<{ path: string; count: number }> = []
     let totalMatches = 0
     let shouldStop = false
-    for (const file of files) {
+    for await (const file of iterateWorkspaceFiles(root, args.path, signal)) {
       signal.throwIfAborted()
       if (!matchesFileFilter(file, args.glob) || await isProbablyBinary(file.absolutePath, file.size, signal)) continue
       let count = 0
@@ -141,7 +140,7 @@ export async function grepWorkspace(
   const matches: GrepMatch[] = []
   const matchedFiles = new Set<string>()
   let stopSearch = false
-  for (const file of files) {
+  for await (const file of iterateWorkspaceFiles(root, args.path, signal)) {
     signal.throwIfAborted()
     if (!matchesFileFilter(file, args.glob) || await isProbablyBinary(file.absolutePath, file.size, signal)) continue
     const before: LinePreview[] = []
@@ -196,10 +195,9 @@ export async function globWorkspace(
 ): Promise<GlobFilesResult> {
   validatePattern(args.pattern)
   validateGlob(args.pattern, 'pattern')
-  const files = await collectWorkspaceFiles(root, args.path, signal, true)
   const paths: string[] = []
   let truncated = false
-  for (const file of files) {
+  for await (const file of iterateWorkspaceFiles(root, args.path, signal, true)) {
     signal.throwIfAborted()
     if (!matchesSearchGlob(file.pathFromSearchRoot, args.pattern)) continue
     if (paths.length >= GLOB_MAX_FILES) {
@@ -211,31 +209,36 @@ export async function globWorkspace(
   return fitGlobResultBytes({ status: 'success', paths, truncated })
 }
 
-async function collectWorkspaceFiles(
+/**
+ * Yield a deterministic Workspace walk one file at a time. Search result caps
+ * can now stop traversal immediately instead of first materializing every file
+ * and stat result in a large tree.
+ */
+async function* iterateWorkspaceFiles(
   root: string,
   requestedPath: string | undefined,
   signal: AbortSignal,
   requireDirectory = false,
-): Promise<WorkspaceSearchFile[]> {
+): AsyncGenerator<WorkspaceSearchFile> {
   const target = resolveWorkspacePath(root, requestedPath ?? '.')
   await assertNoSymlinkTraversal(root, target)
   const targetInfo = await lstat(target)
   if (targetInfo.isSymbolicLink()) throw new Error('Symlink traversal is not allowed')
   if (requireDirectory && !targetInfo.isDirectory()) throw new Error('glob_files path must be a directory')
   const searchRoot = targetInfo.isDirectory() ? target : resolve(target, '..')
-  const result: WorkspaceSearchFile[] = []
 
-  const addFile = async (absolutePath: string): Promise<void> => {
+  const describeFile = async (absolutePath: string): Promise<WorkspaceSearchFile> => {
+    signal.throwIfAborted()
     const info = await stat(absolutePath)
-    result.push({
+    return {
       absolutePath,
       path: toPosix(relative(root, absolutePath)),
       pathFromSearchRoot: toPosix(relative(searchRoot, absolutePath)),
       size: info.size,
-    })
+    }
   }
 
-  const walk = async (directory: string): Promise<void> => {
+  const walk = async function* (directory: string): AsyncGenerator<WorkspaceSearchFile> {
     signal.throwIfAborted()
     const entries = (await readdir(directory, { withFileTypes: true }))
       .filter((entry) => !isWorkspaceSnapshotExcludedPath(entry.name))
@@ -244,15 +247,14 @@ async function collectWorkspaceFiles(
       signal.throwIfAborted()
       if (entry.isSymbolicLink()) continue
       const absolutePath = resolve(directory, entry.name)
-      if (entry.isDirectory()) await walk(absolutePath)
-      else if (entry.isFile()) await addFile(absolutePath)
+      if (entry.isDirectory()) yield* walk(absolutePath)
+      else if (entry.isFile()) yield await describeFile(absolutePath)
     }
   }
 
-  if (targetInfo.isFile()) await addFile(target)
-  else if (targetInfo.isDirectory()) await walk(target)
+  if (targetInfo.isFile()) yield await describeFile(target)
+  else if (targetInfo.isDirectory()) yield* walk(target)
   else throw new Error('Search path is neither a file nor a directory')
-  return result
 }
 
 async function fileHasMatch(absolutePath: string, expression: RegExp, signal: AbortSignal): Promise<boolean> {

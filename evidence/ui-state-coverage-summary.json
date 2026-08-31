@@ -3,14 +3,14 @@
   "evidenceType": "desktop-ui-state-coverage",
   "sourceSchemaVersion": "anera-ui-contract/1.0",
   "provenance": {
-    "source": "reports/ui-execution-log-v23/capture-summary.json",
-    "sourceBytes": 9847,
-    "sourceSha256": "d034b733e2b4078d9dbee171ca2a3b2f511cafa5e41c34b53c97df50df8b0ebc"
+    "source": "reports/ui-execution-log-v25/capture-summary.json",
+    "sourceBytes": 10218,
+    "sourceSha256": "238d91e1838730b39273757eb9f2b85264679c02f7ca8351b52898752255514b"
   },
   "result": {
     "passed": true,
-    "stateCount": 61,
-    "captureCount": 61,
+    "stateCount": 62,
+    "captureCount": 62,
     "consoleErrorCount": 0,
     "horizontalOverflowCount": 0,
     "outerShellVerticalOverflowCount": 0,
@@ -23,6 +23,7 @@
     "conversation search",
     "empty, running, completed, timed-out, and token-limit states",
     "Thought, Plan, grouped command output, Final, and Review",
+    "recorded active HTML Writing tail and provisional Workspace bytes",
     "Task Completion and custom-feedback variants",
     "structured ask_user and Approval",
     "Workspace persistence and reload interleavings",
@@ -40,6 +41,8 @@
     "undoFailureAndCompaction": true,
     "conversationFollowAllChecks": true,
     "currentBashAutoExpanded": true,
+    "streamingWriteTailAndWorkspaceBytes": true,
+    "streamingWriteTimelineByteBadgeAbsent": true,
     "dockedPreviewOpened": true,
     "hitlPersistedAfterRefresh": true,
     "workspacePersistencePersistedAfterRefresh": true,

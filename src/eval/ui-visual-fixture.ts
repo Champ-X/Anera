@@ -32,6 +32,15 @@ export interface VisualRunningFixture {
   title: string
 }
 
+export interface VisualWritingFixture {
+  id: string
+  title: string
+  path: string
+  content: string
+  bytes: number
+  lineCount: number
+}
+
 export interface VisualWorkspacePersistenceFixture {
   id: string
   title: string
@@ -98,6 +107,64 @@ export async function seedVisualRunningFixture(store: SessionStore): Promise<Vis
     }
   })
   return { id, title }
+}
+
+export async function seedVisualWritingFixture(store: SessionStore): Promise<VisualWritingFixture> {
+  const title = 'Visual Streaming HTML Write'
+  const path = 'ai-weekly-2026-08-31.html'
+  const prompt = '看看本周的AI领域热点，创建一个精美的HTML Slides进行展示。'
+  const padding = Array.from({ length: 414 }, (_, index) => (
+    `<div class="signal-card" data-index="${String(index + 1).padStart(3, '0')}">Weekly AI field note ${String(index + 1).padStart(3, '0')}</div>`
+  ))
+  const tail = [
+    '<div class="kicker"><span class="dot"></span>10 · AUGUST TIMELINE</div>',
+    '<h2>八月大事记：AI 史上最紧凑的一个月</h2>',
+    '<div class="display-grid g2">',
+    '<div class="timeline">',
+    '<div class="timeline-item"><div class="timeline-date">08-01</div><div class="body">OpenAI 公开重点事件</div></div>',
+    '<div class="timeline-item"><div class="timeline-date">08-06</div><div class="body">全球继续加速 Agent 部署</div></div>',
+    '<div class="timeline-item"><div class="timeline-date">08-12</div><div class="body">多模态模型进入生产环境</div></div>',
+    '</div>',
+  ]
+  const content = [...padding, ...tail].join('\n')
+  const lineCount = padding.length + tail.length
+  const argumentsText = JSON.stringify({ path, content }).slice(0, -2)
+  const session = await store.create({ isFreeSession: true })
+  const id = session.summary.id
+  const turnId = 'turn_visual_streaming_write'
+  const stepId = 'step_visual_streaming_write'
+
+  await store.append(id, 'turn.started', { content: prompt, attachments: [] }, { turnId })
+  await store.append(id, 'run.status', { status: 'running' }, { turnId })
+  await store.append(id, 'assistant.started', { step: 1 }, { turnId, stepId })
+  await store.append(id, 'assistant.thought.started', { step: 1 }, { turnId, stepId })
+  await store.append(id, 'assistant.thought.delta', {
+    delta: '信息已经足够充分了。现在开始制作自包含的 HTML 幻灯片，可在预览中直接播放。',
+  }, { turnId, stepId })
+  await store.append(id, 'assistant.thought.completed', {
+    text: '信息已经足够充分了。现在开始制作自包含的 HTML 幻灯片，可在预览中直接播放。',
+  }, { turnId, stepId })
+  await store.append(id, 'assistant.tool_call.delta', {
+    index: 0,
+    idDelta: 'call_visual_streaming_write',
+    nameDelta: 'write_file',
+    argumentsDelta: argumentsText,
+  }, { turnId, stepId })
+  await store.update(id, (state) => {
+    state.summary.title = title
+    state.summary.model = MODEL
+    state.summary.status = 'running'
+    state.summary.lastMessage = prompt
+    state.summary.workspaceBytes = 0
+    state.summary.usage = usage({
+      modelCalls: 4,
+      toolCalls: 4,
+      totalTokens: 18_642,
+      estimatedCostUsd: 0.0048,
+      durationMs: 92_000,
+    })
+  })
+  return { id, title, path, content, bytes: Buffer.byteLength(content), lineCount }
 }
 
 export async function advanceVisualRunningFixture(store: SessionStore, sessionId: string): Promise<void> {

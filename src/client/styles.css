@@ -205,7 +205,7 @@ button { color: inherit; }
 .streaming-file-write-head > span { flex: none; font-size: 12px; }
 .streaming-file-write-head > code { min-width: 0; max-width: 58%; overflow: hidden; border-radius: 3px; padding: 2px 5px; background: #f0eee9; color: #77736c; font: 9.5px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .streaming-file-write-head > small { flex: none; color: #99968e; font-size: 9px; }
-.streaming-file-write-head > small:first-of-type { margin-left: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.streaming-file-write-head > small:first-of-type { margin-left: auto; }
 .streaming-file-write-body { max-height: 154px; overflow: hidden; margin-left: 21px; padding: 4px 0 7px; color: #76736c; font: 9.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .streaming-file-write-line { min-width: 0; display: grid; grid-template-columns: 35px minmax(0, 1fr); }
 .streaming-file-write-line > span { padding-right: 9px; color: #b1aea6; text-align: right; user-select: none; }

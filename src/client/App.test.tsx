@@ -46,6 +46,7 @@ import {
   shouldAutoOpenWorkspace,
   spreadsheetCellDisplay,
   startProcessTimelineLabel,
+  StreamingToolCallRow,
   toolLabel,
   validHistorySearchReturnPath,
   websiteStatusLabel,
@@ -72,6 +73,56 @@ describe('streamed file-write projection', () => {
     expect(partialJsonStringField('{"content":"A\\u4f60\\u597d"}', 'content')).toEqual({
       value: 'A你好', complete: true,
     })
+  })
+
+  it('recognizes only a top-level field and ignores field-shaped text inside strings or nested objects', () => {
+    expect(partialJsonStringField(
+      '{"path":"safe-\\\"content\\\":\\\"forged","meta":{"content":"nested"},"content":"real"}',
+      'content',
+    )).toEqual({ value: 'real', complete: true })
+    expect(partialJsonStringField(
+      '{"meta":{"path":"nested.html"},"path":"top.html","content":"ok"}',
+      'path',
+    )).toEqual({ value: 'top.html', complete: true })
+  })
+
+  it('keeps surrogate-split UTF-8 bytes monotonic and removes an interrupted draft from Workspace', () => {
+    const argumentsText = JSON.stringify({ path: 'emoji.html', content: 'A😀你好' })
+    const surrogateBoundary = argumentsText.indexOf('😀') + 1
+    const firstEvents = [
+      event(1, 'assistant.started', { step: 1 }, 'step_emoji'),
+      event(2, 'assistant.tool_call.delta', {
+        index: 0,
+        nameDelta: 'write_file',
+        argumentsDelta: argumentsText.slice(0, surrogateBoundary),
+      }, 'step_emoji'),
+    ]
+    const first = fixture(firstEvents)
+    expect(workspaceWriteDraftsFromTimeline(projectTimeline(first))).toEqual([
+      { key: 'tool-draft-step_emoji:0', path: 'emoji.html', bytes: Buffer.byteLength('A\ud83d') },
+    ])
+
+    const complete = fixture([
+      ...firstEvents,
+      event(3, 'assistant.tool_call.delta', {
+        index: 0,
+        argumentsDelta: argumentsText.slice(surrogateBoundary),
+      }, 'step_emoji'),
+    ])
+    expect(workspaceWriteDraftsFromTimeline(projectTimeline(complete))).toEqual([
+      { key: 'tool-draft-step_emoji:0', path: 'emoji.html', bytes: Buffer.byteLength('A😀你好') },
+    ])
+
+    complete.session.status = 'interrupted'
+    const interruptedTimeline = projectTimeline(complete)
+    expect(workspaceWriteDraftsFromTimeline(interruptedTimeline)).toEqual([])
+    expect(complete.workspace).toEqual([])
+    expect(complete.artifacts).toEqual([])
+    const interrupted = interruptedTimeline.find((item) => item.kind === 'tool-draft')
+    if (!interrupted || interrupted.kind !== 'tool-draft') throw new Error('Interrupted write row was not projected')
+    const markup = renderToStaticMarkup(<StreamingToolCallRow item={interrupted} />)
+    expect(markup).toContain('Write interrupted')
+    expect(markup).toContain('emoji.html')
   })
 
   it('shows a provisional write and Workspace byte count, then hands the row to the durable tool', () => {

@@ -8,47 +8,20 @@
 
 > 当前结论：桌面 Agent Mode v1 主体能力已收敛，P0/P1 阻断项为 0，可以作为后续 Arena 对齐与能力迭代的稳定基线。
 
-## 一眼看懂当前状态
+[快速开始](#快速开始) · [核心能力](#核心能力) · [验证与证据](#验证与证据) · [当前范围](#当前范围) · [深入阅读](#深入阅读)
+
+## 当前状态
 
 | 项目 | 状态 | 说明 |
 | --- | ---: | --- |
 | 桌面 Agent Mode 主链 | ✅ | 任务 → 推理 → 工具 → 校验 → Artifact/Website → Final |
-| Active 工具基线 | 19/19 | schema、执行器、结果回灌、持久事件和真实控制循环均已闭环 |
-| 冻结质量任务 | 18/18 | 平均质量 99.44，118 次工具调用，0 次工具失败 |
+| Agent 主工具 | 19/19 | schema、执行器、结果回灌、持久事件和真实控制循环均已闭环 |
+| Harness 质量基线 | 18/18 | 冻结任务全部通过；平均质量 99.44，118 次工具调用，0 次工具失败 |
 | 原提示 HTML Slides canary | ✅ | 联网研究、HTML、Preview、Browser、截图、视觉检查、发布与唯一 Final 全链通过 |
-| 桌面 UI 状态 | 61/61 | 1440×900，0 console error，0 外层溢出 |
-| 工程门禁 | 52 / 940 | 发现 940 项：公开 checkout 预期 938 项通过、2 项私有 corpus 审计跳过；typecheck 和 production build 通过 |
+| 桌面 UI 状态 | 62/62 | 1440×900，0 console error，0 横向/外层纵向溢出 |
+| 工程门禁 | 52 / 948 | 52 个测试文件、948 项测试全部通过；typecheck 和 production build 通过 |
 
 这里的“完成”指 **Anera 自身主体能力闭环**，不代表已取得 Arena 私有源码或模型权重，也不代表与 Arena 的随机策略、逐像素 UI、逐步轨迹和成本完全相同。
-
-## 核心能力
-
-- **Agent 控制循环**：流式 Thought、工具选择、并行读取、顺序 mutation、失败恢复、唯一 Final。
-- **持久任务生命周期**：Cancel、Continue/Resume、context compaction、进程重启恢复、幂等事件和 usage 结算。
-- **Workspace 与执行环境**：文件读写/编辑/搜索、Shell、依赖安装、附件提取、受管 Process 和 Website Preview。
-- **联网研究**：Tavily 搜索、Firecrawl 抓取及安全 fallback；来源 URL ledger、引用校验和零来源 fail-closed。
-- **Browser 与视觉验证**：真实页面打开、交互、截图，以及 DeepSeek `deepseek-v4-flash-vision-exp` 视觉检查。
-- **Artifact 交付**：HTML、Markdown、图片、PDF、Office 文件等产物的 Workspace 投影、验证与 `present_file` 发布。
-- **Human-in-the-loop**：提问、选项、Plan 修订/接受、媒体选择和高影响外部操作 Approval。
-- **桌面工作台**：会话历史、执行时间线、Workspace、Artifact/Website 查看器和只读 Showcase。
-
-典型执行链如下：
-
-```text
-用户任务 / 附件
-      ↓
-意图与工具路由
-      ↓
-模型 ↔ 工具执行循环
-      ↓
-持久化 Session / Workspace / Usage
-      ↓
-来源、结构、Browser 与视觉门禁
-      ↓
-present_file / Website
-      ↓
-唯一用户可见 Final
-```
 
 ## 快速开始
 
@@ -88,6 +61,35 @@ npm start
 ```
 
 默认打开 `http://127.0.0.1:4174`。
+
+## 核心能力
+
+- **Agent 控制循环**：流式 Thought、工具选择、并行读取、顺序 mutation、失败恢复、唯一 Final。
+- **持久任务生命周期**：Cancel、Continue/Resume、context compaction、进程重启恢复、幂等事件和 usage 结算。
+- **Workspace 与执行环境**：文件读写/编辑/搜索、Shell、依赖安装、附件提取、受管 Process 和 Website Preview。
+- **联网研究**：Tavily 搜索、Firecrawl 抓取及安全 fallback；来源 URL ledger、引用校验和零来源 fail-closed。
+- **Browser 与视觉验证**：真实页面打开、交互、截图，以及 DeepSeek `deepseek-v4-flash-vision-exp` 视觉检查。
+- **Artifact 交付**：HTML、Markdown、图片、PDF、Office 文件等产物的 Workspace 投影、验证与 `present_file` 发布。
+- **Human-in-the-loop**：提问、选项、Plan 修订/接受、媒体选择和高影响外部操作 Approval。
+- **桌面工作台**：会话历史、执行时间线、Workspace、Artifact/Website 查看器和只读 Showcase。
+
+典型执行链：
+
+```text
+用户任务 / 附件
+      ↓
+意图与工具路由
+      ↓
+模型 ↔ 工具执行循环
+      ↓
+持久化 Session / Workspace / Usage
+      ↓
+来源、结构、Browser 与视觉门禁
+      ↓
+present_file / Website
+      ↓
+唯一用户可见 Final
+```
 
 ## 验证与证据
 

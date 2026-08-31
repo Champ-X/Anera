@@ -2464,7 +2464,7 @@ export class ToolExecutor {
     const authorization = brokerDecision.kind === 'authorized' ? brokerDecision : undefined
     if (authorization) this.store.registerSensitiveValues(context.sessionId, authorization.sensitiveValues)
     try {
-      const before = await workspaceFileSnapshot(workspace)
+      const before = await workspaceFileSnapshot(workspace, { signal: context.signal })
       const guardianId = createId('cmd')
       const reconciliationId = await this.store.stageShellReconciliation(
         context.sessionId,
@@ -2750,7 +2750,7 @@ export class ToolExecutor {
         const published = await this.preview(context, { process_id: ready.id })
         if (published.isError) return published
       } else {
-        const entryPath = await findWebsiteEntry(workspace)
+        const entryPath = await findWebsiteEntry(workspace, { signal: context.signal })
         if (!entryPath) {
           return {
             content: JSON.stringify({ status: 'error', message: 'No runnable npm script or HTML entry file found', stage: 'starting-server' }),
@@ -2920,7 +2920,7 @@ export class ToolExecutor {
   }> {
     const project = await readProjectConfiguration(this.store.workspaceDir(context.sessionId))
     if (!project.scripts.build) {
-      const entryPath = await findWebsiteEntry(this.store.workspaceDir(context.sessionId))
+      const entryPath = await findWebsiteEntry(this.store.workspaceDir(context.sessionId), { signal: context.signal })
       if (!entryPath && !['dev', 'start', 'preview'].some((name) => project.scripts[name])) {
         return { ok: false, message: 'No build script, runnable npm script, or HTML entry file found', stdout: '', stderr: '' }
       }
@@ -2944,7 +2944,7 @@ export class ToolExecutor {
     allowNetwork: boolean,
   ): Promise<Awaited<ReturnType<typeof runCommand>>> {
     const workspace = this.store.workspaceDir(context.sessionId)
-    const before = await workspaceFileSnapshot(workspace)
+    const before = await workspaceFileSnapshot(workspace, { signal: context.signal })
     const guardianId = createId('cmd')
     const reconciliationId = await this.store.stageShellReconciliation(
       context.sessionId,
@@ -4492,7 +4492,7 @@ export class ToolExecutor {
       return { content: `Dev-server Website preview is running at ${website.previewUrl}`, isError: false }
     }
     const requested = typeof args.path === 'string' ? args.path : undefined
-    const entryPath = requested || await findWebsiteEntry(workspace)
+    const entryPath = requested || await findWebsiteEntry(workspace, { signal: context.signal })
     if (!entryPath) throw new Error('No HTML entry file found')
     const target = resolveWorkspacePath(workspace, entryPath)
     await assertNoSymlinkTraversal(workspace, target)

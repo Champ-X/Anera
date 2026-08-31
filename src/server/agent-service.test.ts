@@ -9076,6 +9076,53 @@ describe('agent context preparation', () => {
     }
   })
 
+  it('persists a partial write delta for review but never executes, commits, or publishes it after provider failure', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-partial-write-failure-'))
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const stream = vi.fn(async (options: {
+      onToolCallDelta: (delta: { index: number; idDelta?: string; nameDelta?: string; argumentsDelta?: string }) => void
+    }) => {
+      options.onToolCallDelta({
+        index: 0,
+        idDelta: 'call_partial_write',
+        nameDelta: 'write_file',
+        argumentsDelta: '{"path":"draft.html","content":"visible 😀 prefix',
+      })
+      throw Object.assign(new TypeError('provider stream failed during write arguments'), {
+        modelUsage: { promptTokens: 14, completionTokens: 5, totalTokens: 19, cachedPromptTokens: 3 },
+        modelCallCount: 1,
+      })
+    })
+    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 1_000 })
+    try {
+      await agent.submit(session.summary.id, { content: 'Create draft.html and publish it only after the write succeeds.' })
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await store.get(session.summary.id)).summary.status === 'failed' && !agent.isRunning(session.summary.id)) break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+
+      const state = await store.get(session.summary.id)
+      const events = await store.events(session.summary.id)
+      expect(state.summary.status).toBe('failed')
+      expect(state.messages.some((message) => message.role === 'assistant')).toBe(false)
+      expect(state.artifacts).toEqual([])
+      expect(events.filter((event) => event.type === 'assistant.tool_call.delta')).toHaveLength(1)
+      expect(events.some((event) => ['tool.started', 'tool.completed', 'file.changed', 'artifact.created', 'file.presented'].includes(event.type))).toBe(false)
+      expect(events.findLast((event) => event.type === 'error')).toMatchObject({
+        data: {
+          message: 'provider stream failed during write arguments',
+          partialResponsePersisted: false,
+        },
+      })
+      await expect(readFile(resolve(store.workspaceDir(session.summary.id), 'draft.html'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await agent.shutdown()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('preserves an exact-only Final constraint across failed-run Continue', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-exact-final-resume-'))
     const store = new SessionStore(root, 'test-model')

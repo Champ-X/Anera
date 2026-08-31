@@ -35,7 +35,7 @@ export async function createStaticDeploymentSnapshot(
 ): Promise<StaticDeploymentSnapshot> {
   const manifestPath = deploymentSnapshotManifestPath(target)
   await removeDeploymentManifestSidecars(target)
-  const selected = await selectStaticSource(workspace)
+  const selected = await selectStaticSource(workspace, signal)
   const source = resolveWorkspacePath(workspace, selected.sourceDirectory)
   await assertNoSymlinkTraversal(workspace, source)
   const files: Array<{ absolute: string; path: string; bytes: number }> = []
@@ -198,8 +198,9 @@ async function removeDeploymentManifestSidecars(target: string): Promise<void> {
   ])
 }
 
-async function selectStaticSource(workspace: string): Promise<{ sourceDirectory: string; entryPath: string }> {
+async function selectStaticSource(workspace: string, signal: AbortSignal): Promise<{ sourceDirectory: string; entryPath: string }> {
   for (const sourceDirectory of ['dist', 'build', 'out']) {
+    signal.throwIfAborted()
     const entry = resolveWorkspacePath(workspace, `${sourceDirectory}/index.html`)
     try {
       await assertNoSymlinkTraversal(workspace, entry)
@@ -208,7 +209,7 @@ async function selectStaticSource(workspace: string): Promise<{ sourceDirectory:
       // Continue through deterministic build output candidates.
     }
   }
-  const entry = await findWebsiteEntry(workspace)
+  const entry = await findWebsiteEntry(workspace, { signal })
   if (!entry) throw new Error('No deployable HTML entry file found')
   const sourceDirectory = dirname(entry).split(sep).join('/') || '.'
   return { sourceDirectory, entryPath: basename(entry) }

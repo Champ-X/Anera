@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -271,6 +271,24 @@ describe('workspace boundary', () => {
     await expect(readFile(resolve(workspace, 'node_modules/pkg/index.js'), 'utf8')).resolves.toBe('hidden\n')
   })
 
+  it('captures more than the legacy 2,000-file boundary without silent truncation', async () => {
+    const workspace = await root()
+    await mkdir(resolve(workspace, 'bulk'))
+    await Promise.all(Array.from({ length: 2_005 }, (_, index) => (
+      writeFile(resolve(workspace, `bulk/file-${String(index).padStart(4, '0')}.txt`), `${index}\n`)
+    )))
+
+    const snapshot = await workspaceFileSnapshot(workspace)
+    expect(snapshot).toHaveLength(2_005)
+    expect(snapshot.has('bulk/file-2004.txt')).toBe(true)
+    await expect(workspaceFileSnapshot(workspace, 2)).rejects.toThrow('Workspace file snapshot exceeded 2 files')
+
+    const controller = new AbortController()
+    controller.abort(new DOMException('stop snapshot', 'AbortError'))
+    await expect(workspaceFileSnapshot(workspace, { signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'AbortError' })
+  }, 30_000)
+
   it('discovers a live build entry without adding it to the saved Workspace tree', async () => {
     const workspace = await root()
     await writeWorkspaceFile(workspace, 'dist/index.html', '<h1>built</h1>\n')
@@ -278,6 +296,28 @@ describe('workspace boundary', () => {
 
     await expect(findWebsiteEntry(workspace)).resolves.toBe('dist/index.html')
     await expect(workspaceTree(workspace)).resolves.toEqual([])
+  })
+
+  it('discovers an HTML entry after more than 500 live nodes without materializing the full tree', async () => {
+    const workspace = await root()
+    await Promise.all(Array.from({ length: 550 }, (_, index) => (
+      writeWorkspaceFile(workspace, `aaa-generated/chunk-${String(index).padStart(4, '0')}.js`, 'generated\n')
+    )))
+    await writeWorkspaceFile(workspace, 'zzz-site/presentation.html', '<h1>late entry</h1>\n')
+
+    await expect(findWebsiteEntry(workspace)).resolves.toBe('zzz-site/presentation.html')
+  })
+
+  it('makes Website entry traversal budget exhaustion and cancellation explicit', async () => {
+    const workspace = await root()
+    await writeWorkspaceFile(workspace, 'a/one.txt', '1\n')
+    await writeWorkspaceFile(workspace, 'b/two.txt', '2\n')
+    await writeWorkspaceFile(workspace, 'c/site.html', '<h1>entry</h1>\n')
+
+    await expect(findWebsiteEntry(workspace, { maxEntries: 2 })).rejects.toThrow('Website entry discovery exceeded 2 entries')
+    const controller = new AbortController()
+    controller.abort(new DOMException('stop discovery', 'AbortError'))
+    await expect(findWebsiteEntry(workspace, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
   })
 
   it('authoritatively measures every visible regular file for terminal persistence', async () => {

@@ -127,6 +127,8 @@ export async function captureUiStateContract(
       failedTools: document.querySelectorAll('.tool-row.failed').length,
       timedOutTools: document.querySelectorAll('.tool-row.timed_out').length,
       expandedTools: document.querySelectorAll('.tool-body').length,
+      streamingFileWrites: document.querySelectorAll('.streaming-file-write').length,
+      streamingFileWriteLines: document.querySelectorAll('.streaming-file-write-line').length,
       artifacts: document.querySelectorAll('.artifact-card').length,
       approvals: document.querySelectorAll('.approval-card').length,
       pendingApprovals: document.querySelectorAll('.approval-card.pending').length,

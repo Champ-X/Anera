@@ -159,6 +159,33 @@ describe('Arena-style workspace search tools', () => {
     expect(bounded.truncated).toBe(true)
   }, 30_000)
 
+  it('stops the Workspace walk at result caps instead of precollecting the full tree', async () => {
+    const root = await workspace()
+    await mkdir(resolve(root, 'a-matches'))
+    await mkdir(resolve(root, 'z-late'))
+    await Promise.all([
+      ...Array.from({ length: GLOB_MAX_FILES + 1 }, (_, index) =>
+        writeFile(resolve(root, `a-matches/match-${String(index).padStart(3, '0')}.txt`), 'match\n')),
+      ...Array.from({ length: 250 }, (_, index) =>
+        writeFile(resolve(root, `z-late/unrelated-${String(index).padStart(3, '0')}.log`), 'late\n')),
+    ])
+
+    const controller = new AbortController()
+    let traversalChecks = 0
+    Object.defineProperty(controller.signal, 'throwIfAborted', {
+      configurable: true,
+      value: () => {
+        traversalChecks += 1
+        if (traversalChecks > 350) throw new DOMException('walk exceeded incremental budget', 'AbortError')
+      },
+    })
+
+    const result = await globWorkspace(root, { pattern: '**/*.txt' }, controller.signal)
+    expect(result.paths).toHaveLength(GLOB_MAX_FILES)
+    expect(result.truncated).toBe(true)
+    expect(traversalChecks).toBeLessThanOrEqual(350)
+  })
+
   it('rejects unsafe or invalid search arguments and observes cancellation', async () => {
     const root = await workspace()
     await writeFile(resolve(root, 'a.txt'), 'hello\n')
