@@ -21,6 +21,6 @@
     }
   ],
   "rewrites": [
-    { "source": "/((?!assets/|showcase/).*)", "destination": "/index.html" }
+    { "source": "/((?!assets/|showcase/).*)", "destination": "/" }
   ]
 }
