@@ -1,14 +1,12 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { ANERA_DEV_PROXY } from './src/shared/dev-proxy'
 
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
   server: {
     port: 5173,
-    proxy: {
-      '/api': 'http://127.0.0.1:4174',
-      '/workspace': 'http://127.0.0.1:4174',
-    },
+    proxy: ANERA_DEV_PROXY,
   },
   build: {
     // The read-only Showcase is a separate deployable. Building it must not

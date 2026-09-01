@@ -78,7 +78,7 @@ cp .env.example .env
 npm run dev
 ```
 
-打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)。开发模式下，Vite 会把 `/api` 与 `/workspace` 代理到本地 Agent Server `http://127.0.0.1:4174`。
+打开 [http://localhost:5173](http://localhost:5173)。开发模式下，Vite 会把 `/api`、`/nextjs-api` 与 `/workspace` 代理到本地 Agent Server `http://127.0.0.1:4174`。
 
 用下面的任务可以一次覆盖研究、文件生成、Website Preview、Browser 和视觉检查主链：
 

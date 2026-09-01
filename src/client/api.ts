@@ -28,7 +28,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers: { 'content-type': 'application/json', ...(options?.headers ?? {}) },
   })
   const body = await response.json().catch(() => ({})) as { error?: string }
-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`)
+  const method = options?.method?.toUpperCase() || 'GET'
+  if (!response.ok) throw new Error(body.error || `${method} ${path} failed (${response.status})`)
   return body as T
 }
 

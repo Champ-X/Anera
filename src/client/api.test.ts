@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { ANERA_DEV_PROXY, ANERA_DEV_PROXY_TARGET } from '../shared/dev-proxy'
 import { api, generateUuidV7, type AgentMessageAttachment } from './api'
 
 afterEach(() => {
@@ -21,7 +22,24 @@ function captureRequests() {
   return requests
 }
 
+describe('Vite development proxy', () => {
+  it('forwards every backend-owned route family to the Agent server', () => {
+    expect(ANERA_DEV_PROXY).toEqual({
+      '/api': { target: ANERA_DEV_PROXY_TARGET, changeOrigin: false },
+      '/nextjs-api': { target: ANERA_DEV_PROXY_TARGET, changeOrigin: false },
+      '/workspace': { target: ANERA_DEV_PROXY_TARGET, changeOrigin: false },
+    })
+  })
+})
+
 describe('Arena-shaped desktop message transport', () => {
+  it('identifies the failed method and route when a proxy returns no JSON error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 404 })))
+
+    await expect(api.createAgentChat('Diagnose routing.', [], 'deepseek-chat', []))
+      .rejects.toThrow('POST /nextjs-api/stream/create-chat failed (404)')
+  })
+
   it('uses Arena current create-chat envelope for an atomic first submission', async () => {
     const requests = captureRequests()
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
