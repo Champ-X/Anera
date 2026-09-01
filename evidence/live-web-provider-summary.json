@@ -2,11 +2,11 @@
   "schemaVersion": "anera-public-evidence-summary/1.0",
   "evidenceType": "live-web-provider-cache-canary",
   "sourceSchemaVersion": "anera-web-provider-cache-canary/1.2",
-  "generatedAt": "2026-08-30T20:19:19.570Z",
+  "generatedAt": "2026-08-31T23:29:19.259Z",
   "provenance": {
-    "source": "reports/real-smokes/web-provider-cache-2026-08-30T20-19-19.570Z.json",
+    "source": "reports/real-smokes/web-provider-cache-2026-08-31T23-29-19.259Z.json",
     "sourceBytes": 6313,
-    "sourceSha256": "b050c84aedbf3572f893e68a5fcee492f05726216684857dad4cc59ac32b6bce"
+    "sourceSha256": "a83eb43d186980777cdc614dd286d0b4dc3329ab5cb6b81ab86545ec3d8ef773"
   },
   "execution": {
     "description": "Live Tavily and Firecrawl through the production ToolExecutor",
@@ -21,12 +21,12 @@
     "continuationExercised": true
   },
   "metering": {
-    "webSearch": { "provider": "tavily", "providerCalls": 1, "responseBytes": 3909, "outcome": "success" },
-    "imageSearchFallback": { "provider": "tavily", "providerCalls": 1, "responseBytes": 56771, "outcome": "success" },
-    "firstFetch": { "provider": "firecrawl", "cache": "miss", "providerCalls": 1, "responseBytes": 769266, "outcome": "success" },
+    "webSearch": { "provider": "tavily", "providerCalls": 1, "responseBytes": 3919, "outcome": "success" },
+    "imageSearchFallback": { "provider": "tavily", "providerCalls": 1, "responseBytes": 58434, "outcome": "success" },
+    "firstFetch": { "provider": "firecrawl", "cache": "miss", "providerCalls": 1, "responseBytes": 769253, "outcome": "success" },
     "repeatedFetch": { "provider": "firecrawl", "cache": "hit", "providerCalls": 0, "responseBytes": 0 },
     "continuationFetch": { "provider": "firecrawl", "cache": "hit", "providerCalls": 0, "responseBytes": 0 },
-    "nextTurnFetch": { "provider": "firecrawl", "cache": "miss", "providerCalls": 1, "responseBytes": 769266, "outcome": "success" },
+    "nextTurnFetch": { "provider": "firecrawl", "cache": "miss", "providerCalls": 1, "responseBytes": 769253, "outcome": "success" },
     "providerCostUsd": null,
     "providerCostStatus": "not_available"
   },

@@ -2,26 +2,26 @@
   "schemaVersion": "anera-public-evidence-summary/1.0",
   "evidenceType": "harness-convergence",
   "sourceSchemaVersion": "anera-harness-convergence/1.1",
-  "generatedAt": "2026-08-30T20:24:27.664Z",
+  "generatedAt": "2026-08-31T14:16:55.172Z",
   "provenance": {
-    "source": "reports/real-smokes/harness-convergence-2026-08-30T20-24-27-664Z.json",
-    "sourceBytes": 27835,
-    "sourceSha256": "35f4539c95b0336e34cb1ba7b6fc3654ae3057514dd4dcc6cb751865b625be1a"
+    "source": "reports/real-smokes/harness-convergence-2026-08-31T14-16-55-172Z.json",
+    "sourceBytes": 27719,
+    "sourceSha256": "07a0ee1c6901ba47651c2b7de54b2fb65077c3cfc6b9804a8ff3b61be978ae48"
   },
   "execution": {
     "model": "real configured DeepSeek provider",
     "passed": true,
     "passedScenarios": 9,
     "scenarioCount": 9,
-    "activeDurationMs": 71395,
-    "wallMs": 74123,
+    "activeDurationMs": 82066,
+    "wallMs": 84939,
     "modelCalls": 58,
     "toolCalls": 42,
-    "promptTokens": 496034,
-    "completionTokens": 4724,
-    "cachedPromptTokens": 480768,
-    "cacheHitRatio": 0.9692238838466718,
-    "estimatedCostUsd": 0.04313908
+    "promptTokens": 519582,
+    "completionTokens": 5305,
+    "cachedPromptTokens": 509696,
+    "cacheHitRatio": 0.9809731668918477,
+    "estimatedCostUsd": 0.04431934
   },
   "activeToolCoverage": {
     "required": 19,

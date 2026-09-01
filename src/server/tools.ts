@@ -641,7 +641,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'browser',
-      description: 'Open and test the published workspace Website in a real headless browser. Snapshot returns stable element refs; use them to click, fill, select, check, or focus before a keypress. You can also scroll, resize, read console logs, and save screenshots.',
+      description: 'Open and test the published workspace Website in a real headless browser. Snapshot returns stable element refs; use them to click, fill, select, check, or focus before a keypress. You can also scroll, resize, read console logs, and save screenshots of the current viewport.',
       parameters: objectSchema(
         {
           action: { type: 'string', enum: ['open', 'snapshot', 'click', 'fill', 'select', 'check', 'press', 'scroll', 'viewport', 'console', 'screenshot'] },
@@ -654,7 +654,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           delta_y: { type: 'integer', description: 'Signed vertical pixels for scroll' },
           width: { type: 'integer' },
           height: { type: 'integer' },
-          screenshot_path: { type: 'string', description: 'Workspace-relative .png output path' },
+          screenshot_path: { type: 'string', description: 'Workspace-relative .png output path for a screenshot of the current viewport' },
         },
         ['action'],
       ),

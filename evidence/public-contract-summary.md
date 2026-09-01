@@ -2,7 +2,9 @@
 
 The unauthenticated, read-only public bundle audit passed with zero reported issues. It used public HTML and JavaScript assets without a cookie jar or `Cookie` header.
 
-Frozen Arena deployment: `dpl_A1Vbar2TqcbueSZE1rhwVjSrYyPY`.
+Audit generated: `2026-08-31T19:05:51.083Z`.
+
+Frozen Arena deployment: `dpl_GGVhypREjaK9mQC8Qik8L6iAbjnc`.
 
 The intake parsed **59 public script assets** plus **1 supplemental completed route**.
 
@@ -22,4 +24,4 @@ The active tools are `add_voice`, `ask_user`, `bash`, `compact`, `edit_file`, `f
 
 This evidence constrains public observable contracts. It does not expose Arena's private backend, server-appended context, model routing, or prove end-to-end parity.
 
-Source: `reports/arena-public-contract/latest.json`, 119,169 bytes, SHA-256 `d5f0be67aa203fca0ac4d0764ecf176bf5e411b3b80a731698936644a6816cd7`.
+Source: `reports/arena-public-contract/latest.json`, 119,169 bytes, SHA-256 `d78fcddcf47469652097573b53ee5ba3f39abd8a46344ee70285255186c542e6`.

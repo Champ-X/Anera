@@ -54,6 +54,8 @@ export interface ProcessManagerOptions {
 export class ProcessManager {
   private readonly sessions = new Map<string, Map<string, ManagedProcess>>()
   private readonly portProbe: ManagedProcessPortProbe
+  private shuttingDown = false
+  private shutdownWork?: Promise<void>
 
   constructor(
     private readonly onEvent: (sessionId: string, event: ProcessEvent, context: ProcessEventContext) => void | Promise<void>,
@@ -75,6 +77,7 @@ export class ProcessManager {
     context: ProcessEventContext = {},
     name?: string,
   ): Promise<ProcessRecord> {
+    if (this.shuttingDown) throw new Error('Process manager is shutting down')
     validateCommand(command)
     const invocation = createShellInvocation(command, workspace, 'server')
     const id = createId('proc')
@@ -327,6 +330,17 @@ export class ProcessManager {
 
   async stopEverything(): Promise<void> {
     await Promise.allSettled([...this.sessions.keys()].map((sessionId) => this.stopAll(sessionId)))
+  }
+
+  async shutdown(): Promise<void> {
+    if (!this.shutdownWork) {
+      // Flip admission before taking the process snapshot. start() registers a
+      // child synchronously before its first await, so every start that crossed
+      // this boundary is either already visible to stopEverything or rejected.
+      this.shuttingDown = true
+      this.shutdownWork = this.stopEverything()
+    }
+    await this.shutdownWork
   }
 }
 

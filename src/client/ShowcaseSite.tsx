@@ -5,26 +5,14 @@ import {
   ExternalLink,
   Github,
   Home,
-  Pause,
   Play,
-  RotateCcw,
   ShieldCheck,
-  Sparkles,
 } from 'lucide-react'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import aneraLogoUrl from '../../logo.png'
-import { App, sessionIdFromPath, sessionPath } from './App'
-import {
-  clearShowcaseReplayLimits,
-  setShowcaseReplayLimit,
-  showcaseCatalog,
-  showcaseReplayCheckpoints,
-} from './showcase-api'
-import {
-  SHOWCASE_NAVIGATION_EVENT,
-  SHOWCASE_REPLAY_EVENT,
-  normalizedShowcasePath,
-} from './showcase-mode'
+import { sessionPath } from './App'
+import { showcaseCatalog } from './showcase-catalog'
+import './showcase.css'
 
 const GITHUB_URL = 'https://github.com/Champ-X/Anera'
 const EVIDENCE_URL = `${GITHUB_URL}/tree/main/evidence`
@@ -33,13 +21,22 @@ const FULL_REPORT_URL = `${GITHUB_URL}/blob/main/REPLICATION_REPORT.md`
 
 function setPageMetadata(title: string, description: string): void {
   document.title = title
-  let meta = document.querySelector<HTMLMetaElement>('meta[name="description"]')
-  if (!meta) {
-    meta = document.createElement('meta')
-    meta.name = 'description'
-    document.head.append(meta)
+  const metadata = [
+    ['name', 'description', description],
+    ['property', 'og:title', title],
+    ['property', 'og:description', description],
+    ['name', 'twitter:title', title],
+    ['name', 'twitter:description', description],
+  ] as const
+  for (const [attribute, key, content] of metadata) {
+    let meta = document.querySelector<HTMLMetaElement>(`meta[${attribute}="${key}"]`)
+    if (!meta) {
+      meta = document.createElement('meta')
+      meta.setAttribute(attribute, key)
+      document.head.append(meta)
+    }
+    meta.content = content
   }
-  meta.content = description
 }
 
 function BrandLink() {
@@ -71,7 +68,7 @@ function ReverseWordmark() {
 const proofRows = [
   ['工具契约', '19 / 19', 'active tools 闭环'],
   ['质量任务', '18 / 18', 'critical checks 全通过'],
-  ['界面状态', '61 / 61', 'console / overflow 均为 0'],
+  ['界面状态', '62 / 62', 'console / overflow 均为 0'],
   ['录屏审计', 'P0 0 · P1 0', '主体桌面范围'],
 ]
 
@@ -96,6 +93,12 @@ export function ShowcaseLanding() {
           <p className="showcase-eyebrow"><span>Reverse engineering dossier</span><i /></p>
           <h1>把 Arena 倒过来，<br />得到 Anera。</h1>
           <p className="hero-lede">这不只是一次字母重排。Anera 从公开界面、运行轨迹、工具协议和失效分支出发，反向重建 Arena Agent Mode 的可观察行为。</p>
+          <a className="hero-attestation" href={`${EVIDENCE_FILE_URL}/html-slides-live-summary.json`} target="_blank" rel="noreferrer" aria-label="Open the latest exact-prompt machine attestation">
+            <span><i /> Latest attested build</span>
+            <strong>16 / 16 checks</strong>
+            <code>56a56ce8…d099</code>
+            <ExternalLink size={13} />
+          </a>
           <div className="hero-actions">
             <a className="primary-action" href={sessionPath(showcaseCatalog.defaultSessionId)}><Play size={15} fill="currentColor" /> 播放真实案例</a>
             <a className="secondary-action" href="/report">阅读复刻报告 <ArrowRight size={15} /></a>
@@ -166,21 +169,21 @@ const capabilityRows = [
 
 const metricRows = [
   ['Public contract', 'PASS', '19/19 active registry；3 个 prompt template 本地投影逐字节一致；diff issues=0'],
-  ['Harness convergence', '9/9', '42 tool calls；58 model calls；71.395s active；96.92% cache hit'],
-  ['Frozen quality suite', '18/18', '平均 99.44；critical/efficiency 全通过；118 tool calls，0 failed'],
-  ['Desktop UI states', '61/61', '1440×900；0 console error；0 horizontal / outer-shell vertical overflow'],
+  ['Harness convergence', '9/9', '42 tool calls；58 model calls；82.066s active；98.10% cache hit'],
+  ['Frozen quality suite', '18/18', '平均 100；critical/efficiency 全通过；115 model requests / 118 tool calls，0 failed'],
+  ['Desktop UI states', '62/62', '1440×900；0 console error；0 horizontal / outer-shell vertical overflow'],
   ['Visual build oracle', '0.96252', '1200×800 图片→可编辑网页任务；能力质量分，不冒充 Arena UI 像素分'],
   ['Recorded-video gap audit', 'P0=0 / P1=0', '补齐 research Artifact 发布门禁后的普通桌面主体范围'],
-  ['Exact-prompt canary snapshot', 'PASS', '2026-08-31 归档 run；10 model / 10 tool；78.112s；绑定当时 production bundle fingerprint'],
-  ['Automated tests', '940', '52 个 test files；公开 checkout 预期 938 pass + 2 private-corpus checks skipped'],
+  ['Latest exact-prompt attestation', 'PASS', '16/16 checks；10 model / 10 tool；80.528s；schema v3 绑定 verifier 与 51 个 runtime 文件'],
+  ['Automated tests', '963', '53 个 test files；963 项测试全部通过'],
 ]
 
 const evidenceSourceRows = [
-  ['冻结公开 deployment', '59 scripts + 1 route', '冻结 active registry、schema、prompt/UI 文案与 transport', 'dpl_A1V…；2026-08-30；未登录只读'],
+  ['冻结公开 deployment', '59 scripts + 1 route', '冻结 active registry、schema、prompt/UI 文案与 transport', 'dpl_GGV…；2026-08-31；未登录只读'],
   ['历史 Arena corpus', '9 runs · 231 events', '校准事件 schema、失败透明度和产品生命周期', 'v1.x 历史协议；v2 eligible = 0'],
   ['完整登录态录屏', '259.660s · 3452×2082', '恢复可见事件偏序、用户动作与终态面板', '原始帧与账户画面不公开'],
-  ['Anera 内部门禁', '938 pass · 2 skip + 18 tasks', '自动化回归覆盖 Harness/耐久性；独立质量任务检查结果', '私有 corpus 审计在公开 checkout 跳过；不替代 Arena paired trace'],
-  ['原提示 canary 快照', '10 model · 10 tool', '同一 episode 闭合 research、HTML、Browser、Vision 与 present', '绑定 c365…9f8 构建；非当前 tree attestation'],
+  ['Anera 内部门禁', '963 tests + 18 tasks', '自动化回归覆盖 Harness/耐久性；独立质量任务检查结果', 'Anera 自测；不替代 Arena paired trace'],
+  ['原提示 latest attestation', '16 / 16 checks', '同一 episode 闭合 research、HTML、Browser、Vision 与 present', '绑定 68ed…45c3 被测构建；不是 Arena 基线'],
   ['静态公开回放', '4 redacted Sessions', '让访问者审阅已提交的脱敏事件、用量字段与 Artifact 投影', '原始 runtime 不公开；只读'],
 ]
 
@@ -188,7 +191,7 @@ const falsificationRows = [
   ['冻结 Public contract 投影通过', 'registry、schema、prompt/UI/transport diff issues = 0', '任一冻结字段 drift 或负向 mutation 未被拒绝', 'VERIFIED'],
   ['主体工具能力闭环', '19/19 active tools 被 9/9 通过的 Harness 场景覆盖', '任一 active tool 缺少成功场景，或场景自身失败', 'VERIFIED'],
   ['内部任务质量通过', '18/18 task oracle；critical violations = 0', '任一关键约束失败，或 Final 自述替代产物检查', 'VERIFIED'],
-  ['桌面 UI 回归通过', '61/61 states；console / horizontal / outer-shell vertical overflow = 0', '缺失状态、异常日志、横向或外层纵向溢出', 'VERIFIED'],
+  ['桌面 UI 回归通过', '62/62 states；console / horizontal / outer-shell vertical overflow = 0', '缺失状态、异常日志、横向或外层纵向溢出', 'VERIFIED'],
   ['与 Arena exact parity', '同版本、同题、同 viewport 的成对 trace + DOM/PNG + usage', '当前没有合格 pairs，因此不得给出 parity 分数', 'N/A'],
 ]
 
@@ -225,8 +228,41 @@ function ReportSection(props: { id: string; index: string; title: string; childr
 }
 
 export function ReplicationReport() {
+  const [activeSection, setActiveSection] = useState('verdict')
+  const [readingProgress, setReadingProgress] = useState(0)
+
   useEffect(() => {
     setPageMetadata('复刻报告 — Anera', 'Arena → Anera：Arena Agent Mode 桌面可观察契约的逆向复刻方法、指标、证据边界与静态运行回放。')
+  }, [])
+
+  useEffect(() => {
+    const scroller = document.querySelector<HTMLElement>('.report-page')
+    if (!scroller) return
+    let frame: number | undefined
+    const update = () => {
+      frame = undefined
+      const marker = scroller.getBoundingClientRect().top + Math.min(220, scroller.clientHeight * 0.3)
+      let nextSection = 'verdict'
+      for (const [, , href] of reportSectionLinks) {
+        const section = document.getElementById(href.slice(1))
+        if (section && section.getBoundingClientRect().top <= marker) nextSection = href.slice(1)
+      }
+      const scrollable = scroller.scrollHeight - scroller.clientHeight
+      const nextProgress = scrollable > 0 ? Math.min(100, Math.round((scroller.scrollTop / scrollable) * 100)) : 0
+      setActiveSection((current) => current === nextSection ? current : nextSection)
+      setReadingProgress((current) => current === nextProgress ? current : nextProgress)
+    }
+    const scheduleUpdate = () => {
+      if (frame === undefined) frame = window.requestAnimationFrame(update)
+    }
+    scroller.addEventListener('scroll', scheduleUpdate, { passive: true })
+    window.addEventListener('resize', scheduleUpdate)
+    scheduleUpdate()
+    return () => {
+      scroller.removeEventListener('scroll', scheduleUpdate)
+      window.removeEventListener('resize', scheduleUpdate)
+      if (frame !== undefined) window.cancelAnimationFrame(frame)
+    }
   }, [])
 
   return <div className="showcase-site report-page">
@@ -237,20 +273,26 @@ export function ReplicationReport() {
 
     <div className="report-layout">
       <aside className="report-toc">
-        <span>Replication report</span>
+        <div className="report-toc-heading"><span>Replication report</span><b>{readingProgress}%</b></div>
+        <div className="report-progress" aria-label={`Report reading progress: ${readingProgress}%`}><i style={{ width: `${readingProgress}%` }} /></div>
         <nav aria-label="Report contents">
-          {reportSectionLinks.map(([index, label, href]) => <a href={href} key={href}>{index} / {label}</a>)}
+          {reportSectionLinks.map(([index, label, href]) => {
+            const sectionId = href.slice(1)
+            const active = sectionId === activeSection
+            return <a href={href} className={active ? 'active' : undefined} aria-current={active ? 'location' : undefined} key={href}><span>{index}</span><strong>{label}</strong></a>
+          })}
         </nav>
+        <a className="toc-attestation" href={`${EVIDENCE_FILE_URL}/html-slides-live-summary.json`} target="_blank" rel="noreferrer"><span><i /> Latest machine attestation</span><strong>16 / 16 checks</strong><code>56a56ce8…d099</code></a>
         <a className="toc-home" href="/"><Home size={13} /> 返回项目首页</a>
       </aside>
 
       <main className="report-main">
         <section className="report-hero" id="verdict">
-          <p className="showcase-eyebrow"><span>Technical replication report · 2026-08-31</span><i /></p>
+          <p className="showcase-eyebrow"><span>Technical replication report · 2026-09-01</span><i /></p>
           <h1>Arena → Anera<br /><em>一次字面与技术上的逆向。</em></h1>
           <div className="report-verdict">
             <span>Scope-bound verdict</span>
-            <p><strong>在桌面端普通 Agent Mode 的声明范围内，Anera 已实现公开工具契约、核心交互结构、执行生命周期和主要任务能力的基本复刻。</strong>公开契约审计、19/19 active-tool 覆盖、18/18 独立质量任务和 61/61 桌面 UI 状态分别通过各自门禁。</p>
+            <p><strong>在桌面端普通 Agent Mode 的声明范围内，Anera 已实现公开工具契约、核心交互结构、执行生命周期和主要任务能力的基本复刻。</strong>公开契约审计、19/19 active-tool 覆盖、18/18 独立质量任务和 62/62 桌面 UI 状态分别通过各自门禁。</p>
             <p>“主体复刻成立”是项目内部、范围受限的分层结论，不等同于“一模一样”，也不是 Arena 或独立第三方认证。严格 paired trace / pixel parity 仍为 N/A。</p>
           </div>
           <div className="report-hero-actions"><a href={EVIDENCE_URL} target="_blank" rel="noreferrer">查看机器证据 <ExternalLink size={13} /></a><a href={`${GITHUB_URL}/actions`} target="_blank" rel="noreferrer">查看 CI 记录 <ExternalLink size={13} /></a></div>
@@ -316,17 +358,17 @@ export function ReplicationReport() {
           </div>
           <p className="report-disclosure"><ShieldCheck size={16} /><span>公开证据只保留脱敏统计、hash 与相对路径；该 Arena 录屏的原始帧、账户画面、原会话正文和主机路径不进入 Git 或展示站。<a href={`${EVIDENCE_FILE_URL}/arena-video-audit-summary.md`} target="_blank" rel="noreferrer">查看脱敏时间线 <ExternalLink size={12} /></a></span></p>
           <article className="same-prompt-proof">
-            <div className="same-prompt-heading"><span>Archived live evidence · exact recording prompt</span><h3>一个绑定实现指纹的 production build，跑通了完整闭环。</h3><p>这条 2026-08-31 归档 canary 使用录屏中的原始中文提示和当时的 production bundle，在同一 episode 内完成研究、HTML、预览、交互、截图、Vision 检查与呈现。它证明 fingerprint <code>c365…9f8</code> 对应构建的门禁可执行；不冒充当前 working tree 的 fresh attestation，也不作为 Arena 基线。</p></div>
+            <div className="same-prompt-heading"><span>Latest live attestation · exact recording prompt</span><h3>最近一次被指纹绑定的 production build，已跑通完整闭环。</h3><p>最新归档 canary 使用录屏中的原始中文提示和被测 production bundle，在同一 episode 内完成研究、HTML、预览、交互、截图、Vision 检查与呈现。它以 schema v3 fingerprint <code>68ed…45c3</code> 自绑定 verifier，并覆盖 51 个 production runtime 文件，通过 16/16 checks；这是 Anera 的构建级 attestation，不作为 Arena trace、成本或像素基线。</p></div>
             <dl className="same-prompt-metrics">
-              <div><dt>Execution</dt><dd>78.112 s</dd><small>10 model · 10 tool</small></div>
+              <div><dt>Execution</dt><dd>80.528 s</dd><small>10 model · 10 tool</small></div>
               <div><dt>Providers</dt><dd>LIVE</dd><small>DeepSeek text + Vision</small></div>
-              <div><dt>Artifact</dt><dd>19,172 B</dd><small>10 个可见来源链接</small></div>
-              <div><dt>Checks</dt><dd>ALL PASS</dd><small>one Final · no tool failure</small></div>
+              <div><dt>Artifact</dt><dd>19,331 B</dd><small>13 个可见来源链接</small></div>
+              <div><dt>Checks</dt><dd>16 / 16</dd><small>one Final · no tool failure</small></div>
             </dl>
             <div className="same-prompt-chain" aria-label="Exact prompt canary sequence">
               {['Web research', 'HTML artifact', 'Preview', 'Browser navigation', 'Screenshot', 'Vision: no defects', 'Present + Final'].map((step, index) => <span key={step}><b>{String(index + 1).padStart(2, '0')}</b>{step}</span>)}
             </div>
-            <div className="same-prompt-provenance"><code>artifact 792011d6…f26b</code><code>screenshot 3efd319b…16ed</code><code>implementation c3654670…9f8</code><a href={`${EVIDENCE_FILE_URL}/html-slides-live-summary.json`} target="_blank" rel="noreferrer">打开机器报告 <ExternalLink size={13} /></a></div>
+            <div className="same-prompt-provenance"><code>artifact e09054a4…2f09</code><code>screenshot 29767ce9…4891</code><code>implementation 56a56ce8…d099</code><a href={`${EVIDENCE_FILE_URL}/html-slides-live-summary.json`} target="_blank" rel="noreferrer">打开机器报告 <ExternalLink size={13} /></a></div>
           </article>
         </ReportSection>
 
@@ -392,14 +434,14 @@ export function ReplicationReport() {
         </ReportSection>
 
         <ReportSection id="reproduce" index="08" title="任何人都可以从公开仓库重新检查">
-          <p>公开验证路径不依赖私有 API key，也不需要相信这张网页上的文字。先执行 <code>npm ci</code>，再运行类型、确定性测试与展示站构建；这些命令不运行 live-provider canary，公开 checkout 中 2 个私有 corpus 审计会 skip。<code>dev:showcase</code> 只用于人工查看。</p>
+          <p>公开验证路径不依赖私有 API key，也不需要相信这张网页上的文字。先执行 <code>npm ci</code>，再运行类型、确定性测试与展示站构建；这些命令不运行 live-provider canary。<code>dev:showcase</code> 只用于人工查看。</p>
           <div className="verification-shell" aria-label="Public verification commands">
             <div className="shell-title"><span /><span /><span /><b>public verification · CI target: Node.js 22</b></div>
             <pre><code>{'npm ci\nnpm run typecheck\nnpm test\nnpm run build:showcase'}</code></pre>
           </div>
           <div className="verification-grid">
             <article><span>01</span><strong>Type surface</strong><code>npm run typecheck</code><p>客户端与服务端 TypeScript 均须零错误。</p></article>
-            <article><span>02</span><strong>Deterministic suite</strong><code>npm test</code><p>发现 940 项；公开 checkout 预期 938 pass、2 项私有 corpus 审计 skip。</p></article>
+            <article><span>02</span><strong>Deterministic suite</strong><code>npm test</code><p>53 个 test files、963 项测试全部通过；不调用真实外部 Provider。</p></article>
             <article><span>03</span><strong>Static build</strong><code>npm run build:showcase</code><p>生成只读 Vite 产物，深链接由部署 rewrite 回到同一入口。</p></article>
             <article><span>04</span><strong>Manual review</strong><code>npm run dev:showcase</code><p>可选人工检查：<code>/</code>、<code>/report</code> 与四条 <code>/agent/:id</code> 回放。</p></article>
           </div>
@@ -428,84 +470,4 @@ export function ReplicationReport() {
       </main>
     </div>
   </div>
-}
-
-export function StaticDemoFrame() {
-  const [sessionId, setSessionId] = useState(() => sessionIdFromPath(window.location.pathname))
-  const [playing, setPlaying] = useState(false)
-  const [progress, setProgress] = useState<{ current: number; total: number } | null>(null)
-  const timer = useRef<number | undefined>(undefined)
-
-  const stopTimer = () => {
-    window.clearInterval(timer.current)
-    timer.current = undefined
-    setPlaying(false)
-  }
-
-  const showFullTrace = () => {
-    stopTimer()
-    if (sessionId) setShowcaseReplayLimit(sessionId, null)
-    setProgress(null)
-    window.dispatchEvent(new Event(SHOWCASE_REPLAY_EVENT))
-  }
-
-  const play = () => {
-    const activeSessionId = sessionIdFromPath(window.location.pathname)
-    if (!activeSessionId) return
-    const checkpoints = showcaseReplayCheckpoints(activeSessionId)
-    if (checkpoints.length === 0) return
-    stopTimer()
-    setSessionId(activeSessionId)
-    let index = 0
-    setShowcaseReplayLimit(activeSessionId, checkpoints[index])
-    setProgress({ current: 1, total: checkpoints.length })
-    setPlaying(true)
-    window.dispatchEvent(new Event(SHOWCASE_REPLAY_EVENT))
-    timer.current = window.setInterval(() => {
-      index += 1
-      if (index >= checkpoints.length) {
-        stopTimer()
-        setProgress({ current: checkpoints.length, total: checkpoints.length })
-        return
-      }
-      setShowcaseReplayLimit(activeSessionId, checkpoints[index])
-      setProgress({ current: index + 1, total: checkpoints.length })
-      window.dispatchEvent(new Event(SHOWCASE_REPLAY_EVENT))
-    }, 520)
-  }
-
-  useEffect(() => {
-    const onNavigate = () => {
-      stopTimer()
-      clearShowcaseReplayLimits()
-      setProgress(null)
-      setSessionId(sessionIdFromPath(window.location.pathname))
-      window.dispatchEvent(new Event(SHOWCASE_REPLAY_EVENT))
-    }
-    window.addEventListener(SHOWCASE_NAVIGATION_EVENT, onNavigate)
-    window.addEventListener('popstate', onNavigate)
-    return () => {
-      stopTimer()
-      window.removeEventListener(SHOWCASE_NAVIGATION_EVENT, onNavigate)
-      window.removeEventListener('popstate', onNavigate)
-    }
-  }, [])
-
-  return <div className="static-demo-frame">
-    <header className="static-demo-toolbar">
-      <div className="demo-toolbar-context"><span className="live-marker" /><strong>Static replay</strong><span>真实运行快照 · 只读</span></div>
-      {sessionId && <div className="demo-replay-controls">
-        <button onClick={playing ? stopTimer : play}>{playing ? <Pause size={13} fill="currentColor" /> : <Play size={13} fill="currentColor" />}{playing ? '暂停' : progress ? '重新播放' : '播放过程'}</button>
-        {progress && <span className="replay-progress" aria-label={`Replay step ${progress.current} of ${progress.total}`}><i style={{ width: `${(progress.current / progress.total) * 100}%` }} /></span>}
-        {progress && <button className="icon-control" aria-label="Show full trace" title="显示完整轨迹" onClick={showFullTrace}><RotateCcw size={13} /></button>}
-      </div>}
-      <nav aria-label="Exhibit"><a href="/"><Home size={13} /> 首页</a><a href="/report">复刻报告</a><a href={GITHUB_URL} target="_blank" rel="noreferrer"><Github size={14} /> <span>GitHub</span></a></nav>
-    </header>
-    <div className="static-demo-body"><App /></div>
-  </div>
-}
-
-export function normalizeShowcaseRoute(): void {
-  const path = normalizedShowcasePath(window.location.pathname)
-  if (path !== window.location.pathname) window.history.replaceState({}, '', path)
 }

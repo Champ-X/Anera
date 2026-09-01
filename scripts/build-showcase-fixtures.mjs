@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 const projectRoot = resolve(import.meta.dirname, '..')
 const runtimeRoot = join(projectRoot, '.anera', 'sessions')
 const outputJson = join(projectRoot, 'src', 'client', 'showcase-data.json')
+const catalogJson = join(projectRoot, 'src', 'client', 'showcase-catalog.json')
 const publicRoot = join(projectRoot, 'public', 'showcase', 'artifacts')
 const hiddenRuntimeDirectories = new Set(['.home', '.tmp'])
 const localUsername = basename(homedir())
@@ -188,7 +189,15 @@ const data = {
   sessions: built.map(({ summary }) => summary),
   snapshots: Object.fromEntries(built.map(({ definition, snapshot }) => [definition.id, snapshot])),
 }
+const catalog = {
+  schemaVersion: data.schemaVersion,
+  generatedAt: data.generatedAt,
+  disclosure: data.disclosure,
+  defaultSessionId: data.defaultSessionId,
+  demos: data.demos,
+}
 await writeFile(outputJson, `${JSON.stringify(data, null, 2)}\n`)
+await writeFile(catalogJson, `${JSON.stringify(catalog, null, 2)}\n`)
 
 const size = (await stat(outputJson)).size
-process.stdout.write(`Built ${built.length} showcase sessions (${size} bytes) at ${relative(projectRoot, outputJson)}\n`)
+process.stdout.write(`Built ${built.length} showcase sessions (${size} bytes) at ${relative(projectRoot, outputJson)} with ${relative(projectRoot, catalogJson)}\n`)

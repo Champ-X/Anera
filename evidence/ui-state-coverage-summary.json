@@ -3,9 +3,12 @@
   "evidenceType": "desktop-ui-state-coverage",
   "sourceSchemaVersion": "anera-ui-contract/1.0",
   "provenance": {
-    "source": "reports/ui-execution-log-v25/capture-summary.json",
-    "sourceBytes": 10218,
-    "sourceSha256": "238d91e1838730b39273757eb9f2b85264679c02f7ca8351b52898752255514b"
+    "source": "reports/ui-execution-log-v28/capture-summary.json",
+    "sourceBytes": 31256,
+    "sourceSha256": "57af141018b3c85905cee18e55b9ddf37ab99d1fea2e6320ab053eedfcee6b5b",
+    "implementationFingerprintSchemaVersion": 3,
+    "implementationFingerprintSha256": "95e149089133f133fb46b1a95907780f41dcfe22d74c5aa8db4859dfbba8d1bc",
+    "implementationFingerprintFileCount": 55
   },
   "result": {
     "passed": true,
@@ -16,6 +19,10 @@
     "outerShellVerticalOverflowCount": 0,
     "taskReviewInteractionCount": 5,
     "taskCompletionInteractionCount": 3
+  },
+  "screenshotEvidence": {
+    "count": 62,
+    "bytesAndSha256Verified": true
   },
   "coveredSurfaces": [
     "direct /agent draft",

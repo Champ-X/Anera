@@ -8,7 +8,7 @@
 
 | Gate | 命令 | 当前证据 | 当前结论 |
 |---|---|---|---|
-| Pexels + 图片 + 语音 + 账单 | `npm run canary:media-providers` | `reports/production-canaries/media-providers-2026-08-29T15-52-42.835Z.json` | `blocked_configuration` |
+| Pexels + 图片 + 语音 + 账单 | `npm run canary:media-providers` | `reports/production-canaries/media-providers-2026-08-31T19-11-12.148Z.json` | `blocked_configuration` |
 | GitHub App + 私库 | `npm run canary:github-private` | `reports/production-canaries/github-private-repository-2026-08-29T15-56-59.887Z.json` | `blocked_configuration` |
 | GitHub 专用私库 writeback | `npm run canary:github-writeback` | `reports/production-canaries/github-writeback-2026-08-30T14-44-59.152Z.json` | `blocked_configuration` |
 | Linux + Bubblewrap | `npm run canary:linux-bubblewrap` | `reports/production-canaries/linux-bubblewrap-2026-08-29T15-56-59.897Z.json` | `blocked_host`（当前为 macOS） |

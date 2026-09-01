@@ -49,6 +49,32 @@ export function resolveModelTemperature(value: string): number {
   return Number.isFinite(parsed) && parsed >= 0 && parsed <= 2 ? parsed : 0
 }
 
+export function resolveTestLoopbackDeepSeekProvider(input: {
+  enabled: boolean
+  nodeEnv: string
+  apiKey: string
+  baseUrl: string
+}): boolean {
+  if (!input.enabled) return false
+  if (input.nodeEnv !== 'test') {
+    throw new Error('ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER requires NODE_ENV=test')
+  }
+  if (!input.apiKey.startsWith('synthetic-')) {
+    throw new Error('ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER requires a synthetic DeepSeek API key')
+  }
+  let url: URL
+  try {
+    url = new URL(input.baseUrl)
+  } catch {
+    throw new Error('ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER requires a valid provider URL')
+  }
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (url.protocol !== 'http:' || !url.port || !['127.0.0.1', '::1'].includes(hostname) || url.username || url.password) {
+    throw new Error('ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER requires an uncredentialed HTTP loopback URL with an explicit port')
+  }
+  return true
+}
+
 function positiveInt(name: string, fallback: number): number {
   const parsed = Number.parseInt(env(name), 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
@@ -128,6 +154,8 @@ function configuredList(value: string): string[] {
   return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))]
 }
 
+const deepseekApiKey = env('DEEPSEEK_API_KEY')
+const deepseekBaseUrl = env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
 const primaryModel = env('DEEPSEEK_MODEL', 'deepseek-chat')
 const speechModel = env('ANERA_SPEECH_MODEL', 'gpt-4o-mini-tts')
 const imageModel = env('ANERA_IMAGE_MODEL', 'gpt-image-1')
@@ -138,6 +166,12 @@ const contextCompactionThresholdTokens = positiveInt(
   Math.floor(contextWindowTokens * 0.8),
 )
 const deepSeekVisionPricing = resolveDeepSeekVisionPricing(env)
+const testLoopbackDeepSeekProvider = resolveTestLoopbackDeepSeekProvider({
+  enabled: booleanFlag('ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER', false),
+  nodeEnv: process.env.NODE_ENV?.trim() || '',
+  apiKey: deepseekApiKey,
+  baseUrl: deepseekBaseUrl,
+})
 if (contextCompactionThresholdTokens >= contextWindowTokens) {
   throw new Error(`ANERA_CONTEXT_COMPACTION_TOKENS (${contextCompactionThresholdTokens}) must be below ANERA_CONTEXT_WINDOW_TOKENS (${contextWindowTokens})`)
 }
@@ -147,8 +181,9 @@ export const config = {
   dataRoot: resolve(projectRoot, env('ANERA_DATA_DIR', '.anera')),
   port: positiveInt('ANERA_PORT', 4174),
   publicBaseUrl: env('ANERA_PUBLIC_BASE_URL').replace(/\/+$/, ''),
-  deepseekApiKey: env('DEEPSEEK_API_KEY'),
-  deepseekBaseUrl: env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
+  deepseekApiKey,
+  deepseekBaseUrl,
+  testLoopbackDeepSeekProvider,
   // Keep the historical TAVILY_API_KRY spelling working for existing local
   // environments while preferring the provider's standard variable name.
   tavilyApiKey: resolveTavilyApiKey(env),
@@ -179,7 +214,10 @@ export const config = {
   runTimeoutMs: positiveInt('ANERA_RUN_TIMEOUT_MS', 30 * 60 * 1000),
   websiteIdleSleepMs: positiveInt('ANERA_WEBSITE_IDLE_SLEEP_MS', 5 * 60 * 1000),
   maxOutputTokens: positiveInt('ANERA_MAX_OUTPUT_TOKENS', 8192),
-  modelFirstEventTimeoutMs: positiveInt('ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS', 60_000),
+  // A stall before the first SSE frame is safe to retry because no content or
+  // tool call has been emitted. Two bounded retries should not turn a brief
+  // provider stall into a multi-minute Agent run.
+  modelFirstEventTimeoutMs: positiveInt('ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS', 20_000),
   maxLengthContinuations: positiveInt('ANERA_MAX_LENGTH_CONTINUATIONS', 2),
   sessionTokenLimit: positiveInt('ANERA_SESSION_TOKEN_LIMIT', 1_000_000),
   dailyFreeCredits: positiveInt('ANERA_DAILY_FREE_CREDITS', 2_500),

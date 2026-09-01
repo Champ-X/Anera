@@ -57,6 +57,8 @@ const productionEnvironment = {
   ANERA_PORT: String(agentPort),
   ANERA_RUN_TIMEOUT_MS: '120000',
   ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS: '120000',
+  NODE_ENV: 'test',
+  ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER: 'true',
   DEEPSEEK_API_KEY: 'synthetic-graceful-shutdown-key',
   DEEPSEEK_BASE_URL: `http://127.0.0.1:${providerAddress.port}`,
   DEEPSEEK_MODEL: model,

@@ -1,5 +1,6 @@
 node_modules/
 dist-client/
+dist-showcase/
 dist-server/
 
 # Local runtime state, generated evaluation workspaces, and credentials.

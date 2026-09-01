@@ -47,6 +47,8 @@ import {
   spreadsheetCellDisplay,
   startProcessTimelineLabel,
   StreamingToolCallRow,
+  submitApprovalDecision,
+  submitWebsiteRestart,
   toolLabel,
   validHistorySearchReturnPath,
   websiteStatusLabel,
@@ -380,7 +382,7 @@ describe('desktop Workspace ownership', () => {
     expect(workspaceFileUsageLabel(500, { truncated: true })).toBe('500/10K files')
   })
 
-  it('surfaces continuation failures with both retry and full refresh actions', () => {
+  it('surfaces continuation failures and releases Website restart loading after failure', async () => {
     const snapshot = fixture([])
     const inventory = {
       ...workspaceInventoryFromSnapshot(snapshot),
@@ -403,6 +405,14 @@ describe('desktop Workspace ownership', () => {
     expect(html).toContain('The inventory changed while paging.')
     expect(html).toContain('>Retry<')
     expect(html).toContain('>Refresh<')
+
+    const failure = new Error('restart transport unavailable')
+    const states: boolean[] = []
+    await expect(submitWebsiteRestart(
+      async () => { throw failure },
+      (restarting) => states.push(restarting),
+    )).rejects.toBe(failure)
+    expect(states).toEqual([true, false])
   })
 })
 
@@ -829,8 +839,8 @@ describe('tool labels', () => {
   it('uses Arena web protocol labels while retaining legacy trace playback', () => {
     expect(toolLabel('web_search', { query: 'HTTP 103 Early Hints', depth: '2' })).toBe('Searched the web')
     expect(toolLabel('search_web', { query: 'legacy trace' })).toBe('Searched the web')
-    expect(toolLabel('web_search', { query: 'current state' }, 'running')).toBe('Searching the web...')
-    expect(toolLabel('web_search', {}, 'running')).toBe('Searching the web...')
+    expect(toolLabel('web_search', { query: 'current state' }, 'running')).toBe('Searching…')
+    expect(toolLabel('web_search', {}, 'running')).toBe('Searching…')
     expect(toolLabel('web_search', { query: 'current state' }, 'failed')).toBe('Search failed')
     expect(toolLabel('web_search', { query: 'current state' }, 'timed_out')).toBe('Search stopped')
     expect(toolLabel('web_fetch', { url: 'https://www.rfc-editor.org/rfc/rfc8297.html', format: 'markdown' })).toBe('Read www.rfc-editor.org/rfc/rfc8297.html')
@@ -911,7 +921,7 @@ describe('client timeline projection', () => {
     expect(projectTimeline(terminal).some((item) => item.kind === 'activity')).toBe(false)
   })
 
-  it('preserves operation-specific approval risk copy for the desktop card', () => {
+  it('preserves operation-specific approval copy and unlocks a failed decision for retry', async () => {
     const call = {
       id: 'call_pr_close',
       name: 'bash',
@@ -940,6 +950,32 @@ describe('client timeline projection', () => {
     const markup = renderToStaticMarkup(<ApprovalCard item={approval} onDecision={async () => {}} />)
     expect(markup).toContain('Approve pull request closure?')
     expect(markup).toContain('This closes the pull request for the fixed session branch in the connected repository.')
+
+    const failure = new Error('approval transport unavailable')
+    const failedStates: boolean[] = []
+    await expect(submitApprovalDecision(
+      async (approvalId, approved) => {
+        expect(approvalId).toBe('approval_retry')
+        expect(approved).toBe(true)
+        throw failure
+      },
+      'approval_retry',
+      true,
+      (submitting) => failedStates.push(submitting),
+    )).rejects.toBe(failure)
+    expect(failedStates).toEqual([true, false])
+
+    const successfulStates: boolean[] = []
+    await submitApprovalDecision(
+      async (approvalId, approved) => {
+        expect(approvalId).toBe('approval_success')
+        expect(approved).toBe(false)
+      },
+      'approval_success',
+      false,
+      (submitting) => successfulStates.push(submitting),
+    )
+    expect(successfulStates).toEqual([true])
   })
 
   it('replays structured HITL requests through resolved and expired states without showing duplicate tool rows', () => {

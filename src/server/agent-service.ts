@@ -274,8 +274,8 @@ export function systemPromptForTools(
         instructions.push(`- Anera closed-session exception: the only exception to the preceding closed-session guidance is the exact approval-gated \`gh pr reopen\` command for this session branch \`${options.coding.arenaBranch}\`, optionally with \`--comment\`. The Harness fixes the repository and pull-request head, acquires no credential before approval, and restores the session to \`pr_open\` only after the command succeeds. Until then, and for every other remote GitHub command, the session remains closed. A merged pull request can never use this exception.`)
       }
     }
-    instructions.push('- For non-trivial calculations, create at most one short helper script and put both the calculation and its assertions in that script. Run it once; after a successful run, do not create an inline or second cross-check and do not reread the full script. Edit and rerun only when the tool result exposes a concrete defect. When the request requires every source category or group, including groups whose included value is zero, seed the helper aggregation from the complete distinct source dimension before applying status or eligibility filters; emit and assert every zero-valued group instead of deriving group keys only from included records. When writing a human-readable report from asserted helper output, copy every computed subgroup value exactly and make the displayed subgroup totals reconcile to the displayed global totals; never silently omit or recompute one helper result during transcription.')
-    instructions.push('- When a task identifies an existing public test command and says hidden tests are external, run only that public command. Once it passes, stop testing and complete the requested note or deliverable. Do not create extra tests or diagnostics, use /tmp, node -e, heredocs, inline test scripts, deletion, or filesystem probes to imitate hidden coverage unless the public test itself exposes a concrete defect.')
+    instructions.push('- For non-trivial calculations, create at most one short helper script and put both the calculation and its assertions in that script. For exploratory analysis where the user did not provide expected numeric answers, do not hardcode guessed result totals in assertions. Assert derived invariants instead: the global amount equals the independently accumulated subgroup sums, counts equal included rows, excluded records contribute zero, and parallel groupings reconcile to the same global total. Hardcode an expected result only when the user supplied it or you independently derived it from the exact current rows while writing the script; never paste a remembered value, stale example, or unverified guess. For a small tabular input, explicitly reconcile the included row contributions, subgroup sums, and global sum while writing the helper. Run it once; after a successful run, do not create an inline or second cross-check and do not reread the full script. Edit and rerun only when the tool result exposes a concrete defect. When the request requires every source category or group, including groups whose included value is zero, seed the helper aggregation from the complete distinct source dimension before applying status or eligibility filters; emit and assert every zero-valued group instead of deriving group keys only from included records. When writing a human-readable report from asserted helper output, copy every computed subgroup value exactly and make the displayed subgroup totals reconcile to the displayed global totals; never silently omit or recompute one helper result during transcription.')
+    instructions.push('- For implementation tasks, translate every explicit prose constraint into a code-level invariant before writing. Public tests are only a lower bound on the requested contract: do not weaken an exact type, unit, range, immutability, rounding, or error requirement merely because the visible examples omit its boundary case. In JavaScript/TypeScript, a field requested as an integer—including integer cents—must be checked with Number.isInteger on that exact field in addition to finiteness and range checks; apply the same literal discipline to every other explicitly named field. Then run only the existing public test command. Once it passes, stop testing and complete the requested note or deliverable. Do not create extra tests or diagnostics, use /tmp, node -e, heredocs, inline test scripts, deletion, or filesystem probes to imitate hidden coverage unless the public test itself exposes a concrete defect.')
   }
   if (options.includeHarnessConvergence && names.has('write_file')) {
     instructions.push('- For each requested deliverable, choose one canonical path and create it once unless the user asked for variants. After a successful write, continue from that file; do not restart the task, create competing versions, or rewrite it without a concrete defect found by verification.')
@@ -303,17 +303,18 @@ export function systemPromptForTools(
   }
   if (names.has('inspect_image')) {
     instructions.push('- Use inspect_image for uploaded images or visual browser evidence. Make one comprehensive inspection per source image unless a concrete unanswered visual question remains. For a rendered defect check, ask for `NO DEFECTS` or at most three concise concrete defects; do not request or repeat a full-scene narration.')
+    instructions.push('- When recreating a reference image as editable HTML or another structured artifact, the first inspect_image prompt must explicitly request an exact transcription of every visible heading, label, metric, identifier, table/list row, and control state in addition to layout and styling. Do not invent text that Vision omitted: if a requested visible region was not transcribed, ask one focused follow-up about only that unresolved region before building. Preserve the returned strings verbatim in the artifact.')
     if (options.includeHarnessConvergence) {
       instructions.push('- Vision OCR is approximate. For a browser screenshot, use inspect_image to judge layout, color, spacing, clipping, and overlap; the browser snapshot or action result is authoritative for exact rendered text, control state, and element refs. Never reread source or run a text probe merely because visual OCR disagrees with exact browser evidence.')
     }
   }
   if (names.has('install_npm_packages')) {
     instructions.push('- Use install_npm_packages for explicitly requested npm registry dependencies or when a modern Office deliverable requires a workspace library. Pass exact package specs when the task pins versions. This runtime does not preinstall openpyxl, python-docx, python-pptx, or expose pip package-network access: do not probe or try those paths. For .xlsx/.docx/.pptx creation use one suitable npm library (for example exceljs/docx/pptxgenjs) and one short generation script. Every filesystem path inside that script must be workspace-relative: /home/user is only the public tool-argument namespace, not a source-code runtime path on every host. An ENOENT mentioning /home/user means to edit the script to the relative path immediately, not probe the filesystem. With ExcelJS, formula values omit the leading =, autofilter may be assigned as a direct range string such as A1:F5, and range styling uses cell loops rather than a nonexistent worksheet.getRange. With PptxGenJS, pass each table row as an array of cells. A pie or doughnut chart uses one series containing the full labels and values arrays; separate one-point series can silently drop every category after the first. Derive total and cross-sheet references from the actual column/row coordinates instead of maintaining conflicting copies. Every cross-sheet formula must target the cell that actually contains the requested source label/value/formula, never an unrelated empty cell that happens to share the same cached value. When the request says to sum a formula column, the total cell must aggregate that column range rather than recompute an equivalent value from other total cells. Keep the requested ordered document/sheet/slide structure, labels, formulas, values, notes, and other business facts in one explicit specification inside the generator and assert that specification before writing. For XLSX, also reopen the written workbook with the same library and assert the requested sheet order, labels, formulas, and cached values. The common docx and pptxgenjs libraries are writers, not reliable OOXML readers: do not invent a reopen step for DOCX/PPTX or compensate with ZIP/XML/shell probes. After the script prints one compact verification result, call extract_attachment on the generated Office file as the independent post-write parser and compare its parsed item order, labels, formula targets, values, notes, and narratives with the user request before present_file. The ideal path extracts once; only after a concrete parsed defect may you regenerate and extract again, with at most three generator executions and three extraction calls total. Fix and re-verify any mismatch, and never present an item order or formula target that differs from an explicit request or the actual source cell. Do not add fragile assertions about library-internal style objects; the independent OOXML parser is the authority for post-write structure. Use only bounded generator reruns after a concrete assertion or parsed-preview defect instead of adding separate Python, ZIP/XML, or shell probes. Then present the verified requested file. Lifecycle scripts, audit, and funding calls are disabled. Use Bash without network only to inspect files, run generators, builds, or tests after installation—never replace this tool with npm, curl, or another network path. Once the explicitly requested build or test passes after a successful exact install, stop verification: do not run node -e import/version probes, inspect process.env, list/cat node_modules, or add redundant package-resolution diagnostics unless the test exposed a concrete dependency error.')
-    instructions.push('- PDF generator discipline: when the requested deliverable is a PDF, use a real PDF library such as pdf-lib and one short Node .mjs generator. Import writeFile from node:fs/promises in the first version; never use Deno, rename HTML, rasterize whole pages, embed full-page screenshots, or hand-build/Base64 a PDF byte blob. Produce selectable text and vector shapes directly. Keep ordered page content and metadata in one explicit specification and assert it before writing. With pdf-lib, embed StandardFonts once from the PDFDocument—such as const font = await doc.embedFont(StandardFonts.Helvetica) and const bold = await doc.embedFont(StandardFonts.HelveticaBold)—then pass those fonts into every page render function. PDFPage has no public page.doc.getFont API: never use page.doc, page.node, or getFont to recover fonts. Create each page once, then put page-specific drawing inside one render function per page whose local page parameter is defined; do not place generic page.draw calls at module scope or copy one page block into another. For a requested minimum margin M, use SAFE larger than M and route all text through one safe-text helper that asserts x >= SAFE, y >= SAFE, y + fontSize <= pageHeight - SAFE, and x + font.widthOfTextAtSize(text, fontSize) <= pageWidth - SAFE before drawing. Decorative fills may bleed; text may not. Set header text y to pageHeight - SAFE - headerSize, not relative to the top of a bleeding band. In pdf-lib drawText, y is the baseline: assert footer y >= SAFE, not y - fontSize >= SAFE, and place the footer baseline at SAFE when requested. Declare every non-bleed table/panel column-width array once and numerically sum it in the initial source before creating the PDFDocument; assert each sum is at most pageWidth - 2 * SAFE with deliberate headroom. For Letter width 612 and SAFE 48, the hard maximum is 516—not 540 or 660. Preserve every requested string—wrap or reduce font size rather than truncating it. After write_file, run the generator before any edit; repair only a concrete generator or parsed-output defect. When Bash reports an exact failing source line for a generator you just wrote, edit that exact line from the retained write/error context and rerun; do not read_file the generator. Then call extract_attachment on the generated PDF, compare every parsed page and required fact with the request, and present only the verified PDF.')
-    instructions.push('- PDF first-pass completeness and bounded repair: every helper for required visible content—including footers and page numbers—must be called exactly once inside each applicable page renderer; defining a helper does not render it. Before PDFDocument.create, assert that every required per-page string is present in the specification and that each repeated element has the requested count. For sequential horizontal bars or panels, precompute every cumulative x position and assert the final x plus width is at most pageWidth - SAFE; sizing each item to the safe width independently and then accumulating it is invalid. If Bash reports a safe-text assertion, use the deepest render-stack source line plus the retained write content to edit that layout block; do not read_file the generator you just wrote. After extraction, a missing required string is a concrete defect: edit immediately, regenerate, and extract the changed PDF. Never extract an unchanged PDF twice because parsing it again cannot repair it.')
+    instructions.push('- PDF generator discipline: when the requested deliverable is a PDF, use a real PDF library such as pdf-lib and one short Node .mjs generator. Import writeFile from node:fs/promises in the first version; never use Deno, rename HTML, rasterize whole pages, embed full-page screenshots, or hand-build/Base64 a PDF byte blob. Produce selectable text and vector shapes directly. Keep ordered page content and metadata in one explicit specification and assert it before writing. With pdf-lib, embed StandardFonts once from the PDFDocument—such as const font = await doc.embedFont(StandardFonts.Helvetica) and const bold = await doc.embedFont(StandardFonts.HelveticaBold)—then pass those fonts into every page render function. PDFPage has no public page.doc.getFont API: never use page.doc, page.node, or getFont to recover fonts. Create each page once, then put page-specific drawing inside one render function per page whose local page parameter is defined; do not place generic page.draw calls at module scope or copy one page block into another. For a requested minimum margin M, use SAFE larger than M and route all text through one safe-text helper that asserts x >= SAFE, y >= SAFE, y + fontSize <= pageHeight - SAFE, and x + font.widthOfTextAtSize(text, fontSize) <= pageWidth - SAFE before drawing. Decorative fills may bleed; text may not. Set header text y to pageHeight - SAFE - headerSize, not relative to the top of a bleeding band. Never reuse that header baseline for a larger title: before the first run, compute each title baseline as pageHeight - SAFE - titleSize (or lower), and arithmetically verify y + size <= pageHeight - SAFE for every top-edge text call. In pdf-lib drawText, y is the baseline: assert footer y >= SAFE, not y - fontSize >= SAFE, and place the footer baseline at SAFE when requested. Declare every non-bleed table/panel column-width array once and numerically sum it in the initial source before creating the PDFDocument; assert each sum is at most pageWidth - 2 * SAFE with deliberate headroom. For Letter width 612 and SAFE 48, the hard maximum is 516—not 540 or 660. Preserve every requested string—wrap or reduce font size rather than truncating it. After write_file, run the generator before any edit; repair only a concrete generator or parsed-output defect. When Bash reports an exact failing source line for a generator you just wrote, edit that exact line from the retained write/error context and rerun; do not read_file the generator. Then call extract_attachment on the generated PDF, compare every parsed page and required fact with the request, and present only the verified PDF.')
+    instructions.push('- PDF first-pass completeness and bounded repair: every helper for required visible content—including footers and page numbers—must be called exactly once inside each applicable page renderer; defining a helper does not render it. Every named section title is separate visible content: explicitly draw the specification field for that section title before its table or chart; column headers do not substitute for a section title. Specification presence is not render coverage. Have the safe-text helper record every string it actually draws in a per-page Set, derive the required visible strings from that same page specification without duplicating literals, and assert after rendering that every required field was actually drawn on its assigned page before saving. Every page renderer must also draw at least one meaningful non-bleed vector shape inside the safe page bounds, such as a header rule, table border, or panel fill; a pure-text page or only a full-page bleeding background does not satisfy the vector-content requirement. Before PDFDocument.create, assert that every required per-page string is present in the specification and that each repeated element has the requested count. For sequential horizontal bars or panels, precompute every cumulative x position and assert the final x plus width is at most pageWidth - SAFE; sizing each item to the safe width independently and then accumulating it is invalid. If Bash reports a safe-text assertion, use the deepest render-stack source line plus the retained write content to edit that layout block; do not read_file the generator. After extraction, a missing required string is a concrete defect: if the exact current generator bytes are no longer retained in context, read that one generator once before editing; never guess edit_file.old_text. Then make one targeted edit, regenerate, and extract the changed PDF. Never extract an unchanged PDF twice because parsing it again cannot repair it.')
     instructions.push('- PDF specification single-source rule: define every user-visible string exactly once under its target page in the specification, including section titles, table headers, chart labels, footers, and page numbers. Renderers must read those specification fields and must not hardcode a requested visible string. Assert the exact fields, row counts, and column counts directly; do not create a separate requiredStrings array or stringify-and-search copy of the specification, because that duplicates content and can make the verifier disagree with the renderer. If the just-written generator reports one exact missing specification field or string, use the retained source to make one edit covering both its specification field and renderer reference, then rerun; do not read_file first.')
-    instructions.push('- PptxGenJS chart hard rule and table hard rule: every addTable rows argument is an array of row arrays. Build data rows as data.map(row => row.map(cell => ({ text: String(cell), options: {} }))) and pass [headerRow, ...dataRows]; never wrap a whole row as { text: cells } or { text: [...] }. If the library reports invalid cell text, fix the actual rows passed to addTable, not the specification. For a three-category pie/doughnut chart use exactly one data series such as [{ name: "Readiness", labels: ["Ready", "At Risk", "Blocked"], values: [2, 1, 1] }]. Do not turn categories into separate one-point series.')
-    instructions.push('- ExcelJS formula and currency hard rule: the formula field contains only the expression, never the destination cell and never a leading equals sign. For example, when writing E2 use { formula: "C2-D2", result: 9000 }; for E5 use { formula: "SUM(E2:E4)", result: 6000 }; and when writing summary cell B3 use { formula: "\'Department Data\'!C5", result: 540000 }. A formula such as "E2=C2-D2", "E5=SUM(E2:E4)", or "B3=\'Department Data\'!C5" is invalid. When visible USD formatting is requested, use a number format containing a literal dollar sign, such as $#,##0.00; plain #,##0 or #,##0.00 is not currency formatting. Put each labeled summary metric on one row, such as label A3 and linked formula/value B3, never label A3 and value B4. Create worksheets by calling addWorksheet in the exact requested order before populating either one; a formula may reference a sheet created later. For an Executive Summary then Department Data request, start with const summary = wb.addWorksheet("Executive Summary"); const data = wb.addWorksheet("Department Data"); never create data first and never assign wb.worksheets. After reopening with ExcelJS, read a formula expression from cell.formula and its cached numeric result from cell.result; cell.value is the formula object, not the cached number. When comparing a reopened row with expected numeric data, use cell.result for formula cells and cell.value for ordinary cells, and assert cell.formula separately; never deep-compare the formula object to a number.')
+    instructions.push('- PptxGenJS chart hard rule and table hard rule: every addTable rows argument is an array of row arrays. Match the renderer to the specification shape before the first run. For array rows, assert every row with Array.isArray(row) before using row.map. For object records, never call row.map: declare the ordered field keys once beside the header (for example const columns = ["risk", "severity", "owner", "mitigation"]) and build dataRows with data.map(record => columns.map(key => ({ text: String(record[key]), options: {} }))). Apply the same object-to-column projection to every table in the generator, including later conditions/owners tables, and assert that every projected value is defined. Pass [headerRow, ...dataRows]; never wrap a whole row as { text: cells } or { text: [...] }. If the library reports invalid cell text, fix the actual rows passed to addTable, not the specification. The second argument to every addChart call must be an array of series objects and must never be a raw number array such as chart.values. For a three-category pie/doughnut chart, define and pass exactly one series such as const chartData = [{ name: "Readiness", labels: ["Ready", "At Risk", "Blocked"], values: [2, 1, 1] }], then assert before rendering that chartData has one object whose labels and values are arrays of equal length. Do not turn categories into separate one-point series and do not call addChart(type, SPEC.chart.values, options).')
+    instructions.push('- ExcelJS formula and currency hard rule: the formula field contains only the expression, never the destination cell and never a leading equals sign. For example, when writing E2 use { formula: "C2-D2", result: 9000 }; for E5 use { formula: "SUM(E2:E4)", result: 6000 }; and when writing summary cell B3 use { formula: "\'Department Data\'!C5", result: 540000 }. A formula such as "E2=C2-D2", "E5=SUM(E2:E4)", or "B3=\'Department Data\'!C5" is invalid. When visible USD formatting is requested, use a number format containing a literal dollar sign, such as $#,##0.00; plain #,##0 or #,##0.00 is not currency formatting. Put each labeled summary metric on one row. For three metrics beginning at row 3, use const row = 3 + index exactly, write the label to A[row] and its linked formula/value to B[row] in the same loop, and reopen-assert the A3/B3, A4/B4, and A5/B5 pairs. Never use index * 2, separate labelRow/valueRow variables, or label A3 with value B4. Create worksheets by calling addWorksheet in the exact requested order before populating either one; a formula may reference a sheet created later. For an Executive Summary then Department Data request, start with const summary = wb.addWorksheet("Executive Summary"); const data = wb.addWorksheet("Department Data"); never create data first and never assign wb.worksheets. After reopening with ExcelJS, read a formula expression from cell.formula and its cached numeric result from cell.result; cell.value is the formula object, not the cached number. When comparing a reopened row with expected numeric data, use cell.result for formula cells and cell.value for ordinary cells, and assert cell.formula separately; never deep-compare the formula object to a number. If present_file returns verification_required for a generated workbook and the exact current generator bytes are no longer retained in context, read that one generator exactly once before a targeted edit; never guess edit_file.old_text.')
     instructions.push('- DOCX semantic hard rule: when a Title style is requested, create the title paragraph with heading: HeadingLevel.TITLE; bold text alone is not a Title paragraph. In the initial generator, put that Title paragraph and the requested subtitle into the document children before appending named content sections; never leave them only in the specification. Import Header and Footer from docx and construct sections[0].headers.default as new Header({ children: [...] }) and footers.default as new Footer({ children: [...] }); a plain { children: [...] } object is invalid. If an error mentions header.options.children or footer.options.children, make that direct public-API correction without inspecting node_modules. Use heading: HeadingLevel.HEADING_1 for requested Heading 1 sections and numbering for real numbered-list semantics. For a dynamic page number, import PageNumber and use a field run such as new TextRun({ children: [PageNumber.CURRENT] }); the literal string "PAGE" is not a field. A page break is layout on the following section, not a second content section. Bad: [{ pageBreakBefore: true, heading: "Risk Register" }, { heading: "Risk Register", table }]. Good: [{ pageBreakBefore: true, heading: "Risk Register", table }]. Keep exactly one specification object and one rendered heading for each requested section, and place one PageBreak immediately before that section. Prefer named section keys or references; if using an ordered section array, derive each section by heading rather than maintaining fragile numeric indexes in assertions and builders. Case-normalize prose assertions when the required wording is case-insensitive. Set border, shading, spacing, and other formatting in the Paragraph/TableCell constructor; never read or mutate docx internal fields such as .options after construction. Do not add a table header row unless the request asks for one; preserve each requested row as its own array of cells.')
     instructions.push('- Office generator discipline: after write_file, run the canonical generator before editing it. Never guess at a typo or add a preflight read/probe. If the run returns a concrete error, edit from the content you just wrote or the returned closest excerpt, then rerun the same generator; use at most three generator executions and no read_file, grep, ZIP/XML, or extra Bash probe.')
     instructions.push('- Office post-write verification is a hard gate. Read every extract_attachment line, including Document structure, every DOCX table shape and row, and Chart data. For DOCX, compare requested Title/Heading styles, numbering, page breaks, table count, exact dimensions, and row-to-cell mapping—not just the visible words. If the parse contains OFFICE VERIFICATION FAILED or omits or structurally misplaces any requested document section, table row/cell, slide, sheet, chart category/value, formula target/value, or note, edit the generator, regenerate, and extract again. Never call present_file or claim completion while such a mismatch remains.')
@@ -321,7 +322,7 @@ export function systemPromptForTools(
   }
   if (names.has('browser')) {
     instructions.push(options.includeHarnessConvergence
-      ? '- Use browser open/snapshot and stable element refs with click/fill/select/check/press, plus scroll/viewport/console as needed, to test the published Website and requested interactions. Pass width and height to open when the acceptance viewport is known. Verify each required state once with the shortest useful action sequence; when one interaction changes durable page state, verify any requested controls that must remain usable in that resulting state instead of testing only isolated happy paths. Every action result already includes a fresh snapshot. Save a screenshot only when the user requested one or a visual question remains. Browser screenshot_path is always a workspace-relative path such as dashboard.png; never pass /home/user, ~, or another absolute path. Do not read that screenshot back when the browser snapshot already proves the state. For a visual Web task, take and inspect at most one post-build screenshot unless that inspection reports a concrete visual defect. Once the screenshot has passed, do not capture or inspect another one. When an action result proves the requested state, do not restore the prior state, query the console, or reread source unless the user explicitly requires it or the result exposes a concrete failure.'
+      ? '- Use browser open/snapshot and stable element refs with click/fill/select/check/press, plus scroll/viewport/console as needed, to test the published Website and requested interactions. Pass width and height to open when the acceptance viewport is known. For a fixed desktop acceptance viewport, make the initial page fit that viewport without document-level horizontal or vertical overflow: budget every header, gap, panel, table, footer, and padding before writing, and normally use html/body width:100%; height:100%; overflow:hidden with an explicitly bounded main layout. Do not rely on scrolling or a full-page capture to hide clipped content. Verify each required state once with the shortest useful action sequence; when one interaction changes durable page state, verify any requested controls that must remain usable in that resulting state instead of testing only isolated happy paths. Every action result already includes a fresh snapshot. Save a screenshot only when the user requested one or a visual question remains. Browser screenshots capture the current viewport, and screenshot_path is always a workspace-relative path such as dashboard.png; never pass /home/user, ~, or another absolute path. Do not read that screenshot back when the browser snapshot already proves the state. For a visual Web task, take and inspect at most one post-build screenshot unless that inspection reports a concrete visual defect. Once the screenshot has passed, do not capture or inspect another one. When an action result proves the requested state, do not restore the prior state, query the console, or reread source unless the user explicitly requires it or the result exposes a concrete failure.'
       : '- Use browser open/snapshot and stable element refs with click/fill/select/check/press, plus scroll/viewport/console as needed, to test the published Website and requested interactions. Save a screenshot when visual evidence is useful; snapshots already verify deterministic text and controls.')
   }
   if (options.includeHarnessConvergence && names.has('web_search')) {
@@ -842,6 +843,10 @@ export class AgentService {
     this.connectorTools = Object.fromEntries(Object.entries(options.connectorTools ?? {}).map(([slug, definitions]) => [slug.trim().toLowerCase(), definitions]))
     this.connectorAvailability = Object.fromEntries(Object.entries(options.connectorAvailability ?? {}).map(([slug, available]) => [slug.trim().toLowerCase(), available]))
     this.completionPublicationGate = options.completionPublicationGate
+    // Production provider traffic always uses the pinned public-network path.
+    // A guarded test-only seam permits deterministic local DeepSeek fixtures;
+    // it is scoped to these provider clients and never reaches Web/HTTP tools.
+    const deepSeekProviderFetch = config.testLoopbackDeepSeekProvider ? fetch : fetchPublicUrl
     this.vision = options.vision ?? new DeepSeekVisionClient({
       apiKey: config.deepseekApiKey,
       baseUrl: config.deepseekBaseUrl,
@@ -849,7 +854,7 @@ export class AgentService {
       maxImageBytes: config.maxVisionImageBytes,
       maxOutputTokens: config.maxVisionOutputTokens,
       pricing: config.deepSeekVisionPricing,
-      fetch: fetchPublicUrl,
+      fetch: deepSeekProviderFetch,
     })
     this.tools = options.tools ?? new ToolExecutor(
       store,
@@ -873,7 +878,7 @@ export class AgentService {
       maxOutputTokens: config.maxOutputTokens,
       firstEventTimeoutMs: config.modelFirstEventTimeoutMs,
       maxLengthContinuations: config.maxLengthContinuations,
-      fetch: fetchPublicUrl,
+      fetch: deepSeekProviderFetch,
     })
     this.runTimeoutMs = options.runTimeoutMs ?? config.runTimeoutMs
     this.toolTimeoutMs = options.toolTimeoutMs ?? config.toolTimeoutMs
@@ -1652,6 +1657,7 @@ export class AgentService {
     let incompleteAssistantPersisted = false
     let singleArtifactCanonicalPath: string | undefined
     let explicitDeliverableRecoveryCount = 0
+    let singleArtifactPresentationRecoveryActive = false
     let webCitationRecoveryCount = 0
     let visualWebArtifactRecoveryCount = 0
     let admittedToolCalls = 0
@@ -1689,21 +1695,56 @@ export class AgentService {
         const sourceRepairPhase = singleArtifactCanonicalPath
           ? researchArtifactSourceRepairPhase(state.messages, singleArtifactCanonicalPath)
           : undefined
-        const visualRepairPhase = singleArtifactCanonicalPath
+        // Only the strict visual-presentation workflow requires an exact
+        // `NO DEFECTS` inspection verdict. A generic single-page task may ask
+        // Vision a descriptive question; treating that prose as a failed
+        // defect audit incorrectly locks the next tool surface to read/edit.
+        const visualRepairPhase = singleArtifactWebTask && singleArtifactCanonicalPath
           ? visualArtifactDefectRepairPhase(state.messages, singleArtifactCanonicalPath)
           : undefined
         const canonicalDiagnosticRead = Boolean(singleArtifactCanonicalPath) && (
-          canonicalArtifactDiagnosticReadRequired(state.messages)
-          || sourceRepairPhase === 'read'
+          sourceRepairPhase === 'read'
           || visualRepairPhase === 'read'
+          || (
+            sourceRepairPhase !== 'edit'
+            && visualRepairPhase !== 'edit'
+            && canonicalArtifactDiagnosticReadRequired(state.messages)
+          )
         )
         const canonicalTargetedEdit = Boolean(singleArtifactCanonicalPath)
           && !canonicalDiagnosticRead
           && (sourceRepairPhase === 'edit' || visualRepairPhase === 'edit')
+        const canonicalPresentationGap = singleArtifactWebTask
+          && !visualWebArtifactTask
+          && singleArtifactCanonicalPath
+          ? singleArtifactPresentationCompletionGap(state.messages, singleArtifactCanonicalPath)
+          : undefined
+        if (singleArtifactPresentationRecoveryActive && !canonicalPresentationGap) {
+          singleArtifactPresentationRecoveryActive = false
+        }
+        const canonicalPresentationOnly = singleArtifactPresentationRecoveryActive
+          && Boolean(canonicalPresentationGap)
+          && sourceRepairPhase === undefined
+          && visualRepairPhase === undefined
         const visualRequiredToolNames = visualWebWorkflowGap
           ? visualWebArtifactRequiredToolNames(visualWebWorkflowGap)
           : undefined
         activeToolDefinitions = selectAgentToolDefinitions(state, activeToolDefinitions, this.connectorTools)
+        // The phase gate is derived from successful durable tool results. It
+        // is therefore authoritative even if the Artifact projection used by
+        // general extension routing is briefly absent or stale after a
+        // screenshot commit. Add only the extension required by the current
+        // phase before applying the exact phase whitelist; this cannot expose
+        // unrelated extension tools or let a failed screenshot unlock Vision.
+        if (visualRequiredToolNames) {
+          const selectedNames = new Set(activeToolDefinitions.map((tool) => tool.function.name))
+          for (const requiredName of visualRequiredToolNames) {
+            if (selectedNames.has(requiredName)) continue
+            if (!(EXTENSION_TOOL_NAMES as readonly string[]).includes(requiredName)) continue
+            activeToolDefinitions.push(EXTENSION_TOOL_DEFINITIONS[requiredName as ExtensionToolName])
+            selectedNames.add(requiredName)
+          }
+        }
         if (directSingleArtifactMode) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name !== 'propose_plan')
         }
@@ -1716,7 +1757,9 @@ export class AgentService {
               && (tool.function.name !== 'read_file' || canonicalDiagnosticRead)
           ))
         }
-        if (canonicalDiagnosticRead) {
+        if (canonicalPresentationOnly) {
+          activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name === 'present_file')
+        } else if (canonicalDiagnosticRead) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name === 'read_file')
         } else if (canonicalTargetedEdit) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name === 'edit_file')
@@ -1753,8 +1796,10 @@ export class AgentService {
           : ''
         const activeSystemPrompt = visualWebWorkflowComplete
           ? `${baseSystemPrompt}\n\nHarness durable completion: the canonical visual HTML presentation has already passed research grounding, live Website preview, Browser navigation, screenshot inspection containing NO DEFECTS, and present_file. All required durable boundaries are complete. Give the concise user-facing Final now. Do not request, repeat, or describe any further tool action.`
+          : canonicalPresentationOnly
+            ? `${baseSystemPrompt}\n\nHarness presentation recovery: the requested canonical HTML deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)} and all remaining work is to publish that exact current file. present_file is the only available tool; call it now, then give the concise Final. Do not rewrite, reread, inspect, or create a competing artifact.`
           : singleArtifactCanonicalPath
-          ? `${baseSystemPrompt}\n\nHarness durable progress: the canonical self-contained Web deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)}. ${canonicalDiagnosticRead ? 'A targeted correction requires exact current bytes. read_file is the only tool available for this one diagnostic step; read the canonical file now, then retry only the necessary targeted edit on the next step.' : 'Continue from it without rereading or listing the file you just created.'} Start the preview and verify it now; use edit_file only for a concrete correction observed in the browser. Historical mutation records under _historicalMutation are metadata, not file content; never use their hashes or fields as edit_file.old_text. Do not create or overwrite another full-file variant. start_process is only for the long-running preview server; never use it for finite cat, sed, grep, wc, or other inspection commands. For this bounded artifact, use browser open once at the requested viewport and test each specifically requested interaction state once; if an interaction changes durable page state, test dependent controls in that resulting state rather than only as isolated happy paths. Every action already returns a fresh snapshot. Exact browser text and control state override approximate screenshot OCR. If a genuine visual question remains, save and inspect one screenshot; if that inspection reports no concrete defect, do not capture or inspect another screenshot. Do not restore an earlier control state, query the console, or reread source after the requested action result passes unless the user explicitly requires it. Do not run generic markup checks unless an observed failure requires diagnosis. When the requested states pass, present the canonical HTML and finish.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
+          ? `${baseSystemPrompt}\n\nHarness durable progress: the canonical self-contained Web deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)}. ${canonicalDiagnosticRead ? 'A targeted correction requires exact current bytes. read_file is the only tool available for this one diagnostic step; read the canonical file now, then retry only the necessary targeted edit on the next step.' : canonicalTargetedEdit ? 'The exact current bytes are already available from the completed diagnostic read. edit_file is the only tool available for this correction step; make one coherent targeted replacement that fixes the reported defect, using exact current text rather than guessing selectors or fragments.' : 'Continue from it without rereading or listing the file you just created.'} Start the preview and verify it now; use edit_file only for a concrete correction observed in the browser. Historical mutation records under _historicalMutation are metadata, not file content; never use their hashes or fields as edit_file.old_text. Do not create or overwrite another full-file variant. start_process is only for the long-running preview server; never use it for finite cat, sed, grep, wc, or other inspection commands. For this bounded artifact, use browser open once at the requested viewport and test each specifically requested interaction state once; if an interaction changes durable page state, test dependent controls in that resulting state rather than only as isolated happy paths. Every action already returns a fresh snapshot. Exact browser text and control state override approximate screenshot OCR. If a genuine visual question remains, save and inspect one screenshot; if that inspection reports no concrete defect, do not capture or inspect another screenshot. Do not restore an earlier control state, query the console, or reread source after the requested action result passes unless the user explicitly requires it. Do not run generic markup checks unless an observed failure requires diagnosis. When the requested states pass, present the canonical HTML and finish.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
           : directSingleArtifactMode
             ? `${baseSystemPrompt}\n\nHarness bounded single-artifact mode: the user supplied explicit requirements and acceptance criteria for one self-contained Web artifact, with no unresolved product choice. Build the complete HTML directly. Do not create or propose a plan.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
             : `${baseSystemPrompt}${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
@@ -2141,16 +2186,23 @@ export class AgentService {
             }, { turnId, stepId })
             continue
           }
-          const completionGap = explicitDeliverableCompletionGap(
+          const explicitCompletionGap = explicitDeliverableCompletionGap(
             completionState.messages,
             completionState.artifacts,
             result.content,
           )
+          const completionCanonicalPresentationGap = singleArtifactWebMode
+            && !visualWebArtifactMode
+            && singleArtifactCanonicalPath
+            ? singleArtifactPresentationCompletionGap(completionState.messages, singleArtifactCanonicalPath)
+            : undefined
+          const completionGap = explicitCompletionGap ?? completionCanonicalPresentationGap
           if (completionGap) {
             if (explicitDeliverableRecoveryCount >= MAX_EXPLICIT_DELIVERABLE_RECOVERIES) {
               throw new Error(`Model stopped before completing the explicitly requested deliverable${completionGap.missingPaths.length === 1 ? '' : 's'}: ${completionGap.missingPaths.join(', ') || 'unfinished file action'}. Continue the run to retry from the persisted context.`)
             }
             explicitDeliverableRecoveryCount += 1
+            singleArtifactPresentationRecoveryActive = Boolean(completionCanonicalPresentationGap)
             const recoveryMessage: ModelMessage = {
               role: 'user',
               content: explicitDeliverableRecoveryPrompt(completionGap),
@@ -2244,11 +2296,22 @@ export class AgentService {
           }, { turnId, stepId })
         }
 
-        const calls = result.toolCalls.map((rawCall): ToolCallRecord => normalizeAneraRuntimeToolCall({
-            id: rawCall.id,
-            name: rawCall.function.name,
-            arguments: parseArguments(rawCall.function.arguments),
-        }))
+        const calls = result.toolCalls.map((rawCall): ToolCallRecord => {
+          const call = normalizeAneraRuntimeToolCall({
+              id: rawCall.id,
+              name: rawCall.function.name,
+              arguments: parseArguments(rawCall.function.arguments),
+          })
+          if (
+            visualWebArtifactTask
+            && call.name === 'inspect_image'
+            && typeof call.arguments.prompt === 'string'
+            && /\bNO\s+DEFECTS\b/iu.test(call.arguments.prompt)
+          ) {
+            call.arguments.prompt = `${call.arguments.prompt}\nJudge only visible layout, contrast, clipping, overlap, spacing, and readability. Browser snapshots are authoritative for exact text and control state; do not infer semantic mismatches between pagination dots, counters, labels, or OCR.`
+          }
+          return call
+        })
         const callIndexByCall = new Map(calls.map((call, index) => [call, index]))
         const enabledToolNames = new Set(activeToolDefinitions.map((tool) => tool.function.name))
         const remainingRunToolBudget = Math.max(0, this.maxToolCallsPerRun - admittedToolCalls)
@@ -2278,18 +2341,39 @@ export class AgentService {
                 && Boolean(singleArtifactCanonicalPath)
               && !canonicalDiagnosticRead
               && canonicalArtifactInspectionTargets(call, singleArtifactCanonicalPath as string)
-              const verificationMessages = call.name === 'present_file' && typeof call.arguments.path === 'string'
+              const needsVerificationMessages = (
+                call.name === 'present_file' && typeof call.arguments.path === 'string'
+              ) || (
+                visualWebArtifactTask
+                && visualWebResearchRequired
+                && !singleArtifactCanonicalPath
+                && call.name === 'write_file'
+                && typeof call.arguments.path === 'string'
+                && typeof call.arguments.content === 'string'
+                && /\.html?$/iu.test(call.arguments.path)
+              )
+              const verificationMessages = needsVerificationMessages
                 ? (await this.store.get(sessionId)).messages
                 : undefined
-              const deliveryVerificationGap = verificationMessages && typeof call.arguments.path === 'string'
-                ? officePresentVerificationGap(verificationMessages, call.arguments.path)
-                  ?? durableAttachmentPresentVerificationGap(await this.store.events(sessionId), turnId, call.arguments.path)
-                  ?? await webResearchArtifactPresentVerificationGap(
-                    this.store.workspaceDir(sessionId),
-                    verificationMessages,
-                    call.arguments.path,
-                  )
+              const initialResearchHtmlWriteGap = verificationMessages
+                && call.name === 'write_file'
+                && typeof call.arguments.content === 'string'
+                ? visualResearchHtmlWriteVerificationGap(verificationMessages, call.arguments.content)
                 : undefined
+              const deliveryVerificationGap = initialResearchHtmlWriteGap ?? (
+                verificationMessages
+                && call.name === 'present_file'
+                && typeof call.arguments.path === 'string'
+                  ? officePresentVerificationGap(verificationMessages, call.arguments.path)
+                    ?? pdfPresentVerificationGap(verificationMessages, call.arguments.path)
+                    ?? durableAttachmentPresentVerificationGap(await this.store.events(sessionId), turnId, call.arguments.path)
+                    ?? await webResearchArtifactPresentVerificationGap(
+                      this.store.workspaceDir(sessionId),
+                      verificationMessages,
+                      call.arguments.path,
+                    )
+                  : undefined
+              )
               const toolNotEnabled = !canonicalWriteBlocked && !canonicalInspectionSkipped && !deliveryVerificationGap && !enabledToolNames.has(call.name)
               const toolBudgetExceeded = !admittedCalls.has(call)
               const priorApprovalDenied = !toolNotEnabled
@@ -2586,14 +2670,14 @@ export class AgentService {
     // while shutdown waited for its pre-dispatch work. No new reservations can
     // appear after shuttingDown=true, so this second pass closes that race.
     this.abortActiveForShutdown()
-    await this.processes.stopEverything()
+    await this.processes.shutdown()
     // Per-session deactivation waits for BrowserContext.close(). If Chromium's
     // context teardown stalls after a terminal outcome has already published,
     // waiting for ActiveRun.settled before closing the shared browser creates a
     // shutdown deadlock: deactivate needs the transport close that shutdown has
     // not reached yet. Close the browser transport first so every pending
     // per-session close is released, then wait for the runs to settle.
-    await this.browser.closeEverything()
+    await this.browser.shutdown()
     await Promise.allSettled([...this.active.values()].map((active) => active.settled))
     // A cancelled/timed-out run may publish its terminal state before an
     // abort-ignoring provider tool returns metering. Once that response has
@@ -4146,7 +4230,19 @@ export function explicitDeliverableCompletionGap(
     `(?:创建|写入|编写|生成|保存|准备|制作)(?:一个|一份|名为|到|至|为)?\\s*[\\x60"']?([A-Za-z0-9][A-Za-z0-9._/-]*\\.${EXPLICIT_DELIVERABLE_EXTENSION})`,
     'giu',
   )
-  const requestedPaths = [...taskText.matchAll(english), ...taskText.matchAll(chinese)]
+  // Follow-up imperative clauses often refer back to the requested artifact
+  // with a pronoun: "Build one page. Save it once as dashboard.html". Keep
+  // this separate from the broad direct-path matcher so incidental filenames
+  // in explanatory prose still do not become completion contracts.
+  const englishReferential = new RegExp(
+    `\\b(?:save|write|create|generate|prepare|produce|export|deliver)\\b\\s+(?:(?:it|this|that|the\\s+(?:file|artifact|document|page|output|result))\\s+)?(?:(?:exactly\\s+)?once\\s+)?(?:as|to|at|in|named|called)\\s+[\\x60"']?([A-Za-z0-9][A-Za-z0-9._/-]*\\.${EXPLICIT_DELIVERABLE_EXTENSION})`,
+    'giu',
+  )
+  const requestedPaths = [
+    ...taskText.matchAll(english),
+    ...taskText.matchAll(englishReferential),
+    ...taskText.matchAll(chinese),
+  ]
     .map((match) => normalizeExplicitDeliverablePath(match[1]))
     .filter((path, index, all) => path.length > 0 && all.indexOf(path) === index)
   if (requestedPaths.length === 0) return undefined
@@ -4188,6 +4284,47 @@ export function explicitDeliverableCompletionGap(
   return missingPaths.length > 0 || unpresentedPaths.length > 0 || futureAction
     ? { requestedPaths, missingPaths, unpresentedPaths, futureAction }
     : undefined
+}
+
+/**
+ * Preserve a presentation request that identifies the single Web artifact by
+ * role ("the main HTML deliverable") instead of by filename. The canonical
+ * path is learned only from a successful complete HTML write, and a
+ * presentation counts only after the latest successful mutation so an edit
+ * cannot leave the viewer pointing at an older revision.
+ */
+export function singleArtifactPresentationCompletionGap(
+  messages: readonly ModelMessage[],
+  canonicalPath: string,
+): { requestedPaths: string[]; missingPaths: string[]; unpresentedPaths: string[]; futureAction: boolean } | undefined {
+  const path = normalizeExplicitDeliverablePath(canonicalPath)
+  if (!path) return undefined
+  const taskText = activeTaskMessageSlice(messages)
+    .filter((message) => {
+      if (message.role !== 'user' || isArenaCustomFeedbackMessage(message)) return false
+      return !arenaUserAuthoredText(message).startsWith('[Harness operator action: Continue]')
+    })
+    .map(arenaUserAuthoredText)
+    .join('\n')
+  if (!/\b(?:present|open)\b|呈现|展示|打开/iu.test(taskText)) return undefined
+
+  const occurrences = successfulTaskToolOccurrences(messages)
+  const mutations = occurrences.filter(({ call }) => (
+    ['write_file', 'edit_file', 'apply_patch'].includes(call.name)
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === path
+  ))
+  const latestMutation = mutations.at(-1)
+  if (!latestMutation) return undefined
+  const presentedCurrentRevision = occurrences.some(({ call, resultMessageIndex }) => (
+    resultMessageIndex > latestMutation.resultMessageIndex
+    && call.name === 'present_file'
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === path
+  ))
+  return presentedCurrentRevision
+    ? undefined
+    : { requestedPaths: [path], missingPaths: [], unpresentedPaths: [path], futureAction: false }
 }
 
 function normalizeExplicitDeliverablePath(path: string): string {
@@ -4303,6 +4440,59 @@ export function officePresentVerificationGap(
   if (requestsExplicitPageBreak && Number(structure[5]) + Number(structure[6]) < 1) missing.push('the requested explicit pagination (both page-break counts are 0)')
   return missing.length > 0
     ? `The independent DOCX parse for ${path} is missing ${missing.join(', ')}. Fix the canonical generator, regenerate, and extract again before presenting.`
+    : undefined
+}
+
+/**
+ * Require a generated PDF to be independently parsed after its latest
+ * mutation, and fail closed when explicit quoted text assigned to a visible
+ * page or section is absent. Metadata-only strings are excluded because they
+ * need not appear in the page content stream.
+ */
+export function pdfPresentVerificationGap(
+  messages: readonly ModelMessage[],
+  rawPath: string,
+): string | undefined {
+  const path = normalizeExplicitDeliverablePath(rawPath)
+  if (!/\.pdf$/i.test(path)) return undefined
+  const taskMessages = activeTaskMessageSlice(messages)
+  const taskText = taskMessages
+    .filter((message) => message.role === 'user' && !arenaUserAuthoredText(message).startsWith('[Harness operator action: Continue]'))
+    .map(arenaUserAuthoredText)
+    .join('\n')
+  const pdfCreation = /\b(?:create|generate|build|prepare|produce|make|export|deliver)\b|创建|生成|制作|编制|导出|交付/iu.test(taskText)
+  if (!pdfCreation) return undefined
+
+  const occurrences = successfulTaskToolOccurrences(messages)
+  const latestMutation = occurrences.filter(({ call }) => (
+    ['write_file', 'edit_file', 'apply_patch', 'bash'].includes(call.name)
+    && (call.name === 'bash' || (
+      typeof call.arguments.path === 'string'
+      && arenaWorkspacePathForVision(call.arguments.path) === path
+    ))
+  )).at(-1)
+  const extraction = occurrences.filter(({ call, resultMessageIndex }) => (
+    call.name === 'extract_attachment'
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === path
+    && resultMessageIndex > (latestMutation?.resultMessageIndex ?? Number.NEGATIVE_INFINITY)
+  )).at(-1)
+  if (!extraction || typeof extraction.result.content !== 'string') {
+    return `PDF verification is required before presenting ${path}. Run extract_attachment on that exact generated file after its latest mutation, read the complete parsed result, repair any mismatch, and only then present it.`
+  }
+
+  const visibleQuotedStrings = taskText
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .filter((sentence) => (
+      !/\bmetadata\b/iu.test(sentence)
+      && /\b(?:page\s*\d+|both pages?|header|title|subtitle|decision|section|visible|exact text|footer|page numbers?|must contain|must be titled)\b|页眉|标题|副标题|决策|章节|可见|精确文本|页脚|页码/iu.test(sentence)
+    ))
+    .flatMap((sentence) => [...sentence.matchAll(/["“]([^"”\n]{1,200})["”]/gu)].map((match) => match[1].trim()))
+    .filter((value, index, all) => value.length > 0 && all.indexOf(value) === index)
+  const normalizedExtraction = extraction.result.content.replace(/\s+/gu, ' ').trim()
+  const missing = visibleQuotedStrings.filter((value) => !normalizedExtraction.includes(value.replace(/\s+/gu, ' ').trim()))
+  return missing.length > 0
+    ? `The independent PDF parse for ${path} is missing explicitly requested visible text: ${missing.map((value) => JSON.stringify(value)).join(', ')}. Repair the canonical generator, regenerate ${path}, and run extract_attachment again before presenting.`
     : undefined
 }
 
@@ -4587,12 +4777,28 @@ function retrievedResearchSourceUrls(
   return url ? [url] : []
 }
 
-function visualInspectionPassed(result: ModelMessage): boolean {
+function visualInspectionSection(result: ModelMessage): string {
   const content = typeof result.content === 'string' ? result.content : ''
-  const section = content.match(
+  return content.match(
     /(?:^|\n\n)Visual inspection:\s*\r?\n([\s\S]*?)(?=\r?\n\r?\nEvidence note:|$)/iu,
-  )?.[1]
-  return section?.trim().toUpperCase() === 'NO DEFECTS'
+  )?.[1]?.trim() ?? ''
+}
+
+function visualInspectionPassed(result: ModelMessage): boolean {
+  return visualInspectionSection(result).toUpperCase() === 'NO DEFECTS'
+}
+
+function isConcreteVisualDefectInspection(
+  occurrence: SuccessfulTaskToolOccurrence,
+): boolean {
+  if (occurrence.call.name !== 'inspect_image') return false
+  const prompt = typeof occurrence.call.arguments.prompt === 'string'
+    ? occurrence.call.arguments.prompt
+    : ''
+  if (!/\bNO\s+DEFECTS\b/iu.test(prompt) || !/\bdefects?\b|缺陷|问题/iu.test(prompt)) return false
+  const section = visualInspectionSection(occurrence.result)
+  if (!section || visualInspectionPassed(occurrence.result)) return false
+  return /\b(?:clip(?:s|ped|ping)?|cut\s+off|overlap(?:s|ped|ping)?|overflow(?:s|ed|ing)?|misalign(?:s|ed|ment)?|wrong|broken|unreadable|obscur(?:es|ed|ing)|crowded|outside|edge|spacing|missing|defects?|issues?|problems?)\b|截断|裁切|遮挡|重叠|溢出|错位|不对齐|错误|缺失|不可读|对比度|拥挤|间距|缺陷|问题/iu.test(section)
 }
 
 function toolResultProvesExecutedSuccess(message: ModelMessage): boolean {
@@ -4675,6 +4881,28 @@ interface VisualWebArtifactCompletionOptions {
   canonicalPath?: string
 }
 
+function naturalLanguageResearchIntentSurface(value: string): string {
+  // Hyphen/underscore-delimited identifiers such as PRESSURE-CURRENT-593,
+  // CURRENT_STATE, filenames, and synthetic sentinels are task data rather
+  // than requests for fresh Web evidence. Remove the complete identifier
+  // before looking for temporal language; ordinary prose remains unchanged.
+  return value.replace(/\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b/g, ' ')
+}
+
+/**
+ * Citation language also appears in attachment-only analysis, incident
+ * handoffs, code review, and local audits. An explicit local-evidence
+ * boundary is authoritative and must not be inverted into a Web-retrieval
+ * requirement merely because the user asks for filenames, pages, or sources.
+ */
+function explicitlyLocalOnlyEvidenceTask(value: string): boolean {
+  const normalized = value.replace(/[—–]/g, '-')
+  return /\b(?:do\s+not|don't|never|must\s+not|without)\b[^.!?\n]{0,80}\b(?:browse|search|use|access|consult)\b[^.!?\n]{0,40}\b(?:the\s+)?(?:web|internet|online\s+sources?)\b/i.test(normalized)
+    || /\b(?:use|rely\s+on|ground(?:ed)?\s+in)\s+only\b[^.!?\n]{0,100}\b(?:attachments?|uploads?|local\s+files?|workspace\s+files?|provided\s+(?:files?|documents?)|documents?|pdfs?)\b/i.test(normalized)
+    || /(?:不要|不得|禁止|无需).{0,30}(?:联网|上网|网络搜索|网页搜索|互联网)/u.test(normalized)
+    || /(?:仅|只).{0,20}(?:使用|依据|基于).{0,20}(?:附件|上传文件|本地文件|工作区文件|所给文档)/u.test(normalized)
+}
+
 function visualWebTaskRequiresResearch(messages: readonly ModelMessage[]): boolean {
   const taskText = [
     activeTaskMessageSlice(messages)
@@ -4683,7 +4911,8 @@ function visualWebTaskRequiresResearch(messages: readonly ModelMessage[]): boole
       .join('\n'),
     trustedArenaCompactionTaskContext(messages),
   ].filter(Boolean).join('\n')
-  return /\b(?:today|this\s+week|weekly|latest|current|recent|news|trends?|hot\s+topics?)\b|(?:今天|本日|本周|这周|每周|最新|当前|近期|新闻|趋势|热点)/iu.test(taskText)
+  const intentSurface = naturalLanguageResearchIntentSurface(taskText)
+  return /\b(?:today|this\s+week|weekly|latest|current|recent|news|trends?|hot\s+topics?)\b|(?:今天|本日|本周|这周|每周|最新|当前|近期|新闻|趋势|热点)/iu.test(intentSurface)
 }
 
 /**
@@ -4761,23 +4990,32 @@ export function visualWebArtifactCompletionGap(
   const isBrowserAction = (occurrence: SuccessfulTaskToolOccurrence, action: string): boolean => (
     occurrence.call.name === 'browser' && occurrence.call.arguments.action === action
   )
-  const browserResultWorkspacePath = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => {
-    const rawUrl = structuredToolResult(occurrence.result)?.url
+  const browserUrlWorkspacePath = (rawUrl: unknown): string | undefined => {
     if (typeof rawUrl !== 'string') return undefined
     try {
       const pathname = decodeURIComponent(new URL(rawUrl).pathname)
       const previewMarker = '/preview/'
       const markerIndex = pathname.lastIndexOf(previewMarker)
-      if (markerIndex < 0) return undefined
-      return arenaWorkspacePathForVision(pathname.slice(markerIndex + previewMarker.length))
+      const workspacePath = markerIndex >= 0
+        ? pathname.slice(markerIndex + previewMarker.length)
+        : pathname.replace(/^\/+/, '')
+      const normalized = arenaWorkspacePathForVision(workspacePath)
+      return normalized || undefined
     } catch {
       return undefined
     }
   }
+  const browserResultWorkspacePath = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => (
+    browserUrlWorkspacePath(structuredToolResult(occurrence.result)?.url)
+  )
+  const browserOpenArgumentWorkspacePath = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => {
+    const rawPath = occurrence.call.arguments.path
+    if (typeof rawPath !== 'string') return undefined
+    return browserUrlWorkspacePath(rawPath) ?? arenaWorkspacePathForVision(rawPath)
+  }
   const browserOpenTargetsCanonical = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
     isBrowserAction(occurrence, 'open')
-    && typeof occurrence.call.arguments.path === 'string'
-    && arenaWorkspacePathForVision(occurrence.call.arguments.path) === canonicalPath
+    && browserOpenArgumentWorkspacePath(occurrence) === canonicalPath
     && browserResultWorkspacePath(occurrence) === canonicalPath
   )
   const browserNavigationTargetsCanonical = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
@@ -4804,8 +5042,10 @@ export function visualWebArtifactCompletionGap(
         || occurrence.call.arguments.key === ' '
     }
     if (action !== 'click') return false
-    return typeof occurrence.call.arguments.ref === 'string'
-      && occurrence.call.arguments.ref.trim().length > 0
+    return ['ref', 'text'].some((field) => (
+      typeof occurrence.call.arguments[field] === 'string'
+      && String(occurrence.call.arguments[field]).trim().length > 0
+    ))
   }
   const isBrowserNavigationAttempt = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
     occurrence.call.name === 'browser'
@@ -5070,7 +5310,7 @@ function researchArtifactSourceRepairPhase(
   return currentReadCompleted ? 'edit' : 'read'
 }
 
-function visualArtifactDefectRepairPhase(
+export function visualArtifactDefectRepairPhase(
   messages: readonly ModelMessage[],
   canonicalPath: string,
 ): CanonicalArtifactRepairPhase | undefined {
@@ -5081,10 +5321,30 @@ function visualArtifactDefectRepairPhase(
     && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
   )).at(-1)
   const boundary = latestMutation?.resultMessageIndex ?? Number.NEGATIVE_INFINITY
-  const inspection = occurrences.filter(({ call, resultMessageIndex }) => (
-    call.name === 'inspect_image' && resultMessageIndex > boundary
+  const inspection = occurrences.filter((occurrence) => (
+    occurrence.resultMessageIndex > boundary
+    && isConcreteVisualDefectInspection(occurrence)
   )).at(-1)
-  if (!inspection || visualInspectionPassed(inspection.result)) return undefined
+  if (!inspection) return undefined
+  const inspectedPath = arenaWorkspacePathForVision(String(inspection.call.arguments.path || ''))
+  if (!inspectedPath || inspectedPath.startsWith('uploads/')) return undefined
+  const screenshot = occurrences.filter(({ call, resultMessageIndex }) => (
+    call.name === 'browser'
+    && call.arguments.action === 'screenshot'
+    && resultMessageIndex > boundary
+    && resultMessageIndex < inspection.resultMessageIndex
+    && arenaWorkspacePathForVision(String(
+      call.arguments.screenshot_path || call.arguments.path || 'browser-screenshot.png',
+    )) === inspectedPath
+  )).at(-1)
+  if (!screenshot) return undefined
+  const latestBrowserOpen = occurrences.filter(({ call, resultMessageIndex }) => (
+    call.name === 'browser'
+    && call.arguments.action === 'open'
+    && resultMessageIndex > boundary
+    && resultMessageIndex < screenshot.resultMessageIndex
+  )).at(-1)
+  if (!latestBrowserOpen || !browserOpenOccurrenceTargetsCanonical(latestBrowserOpen, canonicalPath)) return undefined
   const currentReadCompleted = occurrences.some(({ call, resultMessageIndex }) => (
     call.name === 'read_file'
     && typeof call.arguments.path === 'string'
@@ -5092,6 +5352,30 @@ function visualArtifactDefectRepairPhase(
     && resultMessageIndex > inspection.resultMessageIndex
   ))
   return currentReadCompleted ? 'edit' : 'read'
+}
+
+function browserOpenOccurrenceTargetsCanonical(
+  occurrence: SuccessfulTaskToolOccurrence,
+  canonicalPath: string,
+): boolean {
+  if (occurrence.call.name !== 'browser' || occurrence.call.arguments.action !== 'open') return false
+  const workspacePathFromUrl = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined
+    try {
+      const pathname = decodeURIComponent(new URL(value).pathname)
+      const previewMarker = '/preview/'
+      const markerIndex = pathname.lastIndexOf(previewMarker)
+      const path = markerIndex >= 0
+        ? pathname.slice(markerIndex + previewMarker.length)
+        : pathname.replace(/^\/+/, '')
+      return arenaWorkspacePathForVision(path) || undefined
+    } catch {
+      return arenaWorkspacePathForVision(value) || undefined
+    }
+  }
+  const argumentPath = workspacePathFromUrl(occurrence.call.arguments.path)
+  const resultPath = workspacePathFromUrl(structuredToolResult(occurrence.result)?.url)
+  return argumentPath === canonicalPath && resultPath === canonicalPath
 }
 
 function canonicalArtifactDiagnosticReadRequired(messages: readonly ModelMessage[]): boolean {
@@ -5790,11 +6074,13 @@ function webResearchCitationEvidence(messages: ModelMessage[]): WebResearchCitat
   const taskMessages = currentTaskMessages(messages)
   const taskRequest = taskMessages.find((message) => message.role === 'user' && typeof message.content === 'string')
   const taskText = taskRequest?.content ? arenaUserAuthoredText(taskRequest) : ''
+  if (explicitlyLocalOnlyEvidenceTask(taskText)) return undefined
   const explicitResearchIntent = /\b(?:research|investigate|fact[- ]?check|look\s+up|web\s+search|browse\s+the\s+web|cite|citation|source[- ]backed)\b/i.test(taskText)
     || /\b(?:find|provide|include|list|compare)\s+(?:reliable\s+|primary\s+|authoritative\s+)?sources?\b/i.test(taskText)
     || /(?:研究|调研|检索|联网|事实核查|引用来源|标注来源|查找来源|提供来源|来源支撑)/u.test(taskText)
-  const timeSensitiveResearchIntent = /\b(?:latest|current|recent|today|this\s+week|news|trends?|hot\s+topics?)\b/i.test(taskText)
-      && /\b(?:find|summari[sz]e|report|brief|compare|explain|tell\s+me|show\s+me|what(?:'s|\s+is|\s+are))\b/i.test(taskText)
+  const intentSurface = naturalLanguageResearchIntentSurface(taskText)
+  const timeSensitiveResearchIntent = /\b(?:latest|current|recent|today|this\s+week|news|trends?|hot\s+topics?)\b/i.test(intentSurface)
+      && /\b(?:find|summari[sz]e|report|brief|compare|explain|tell\s+me|show\s+me|what(?:'s|\s+is|\s+are))\b/i.test(intentSurface)
     || /(?:最新|当前|近期|今天|本周|这周|新闻|趋势|热点).{0,40}(?:查找|了解|看看|总结|汇总|报告|对比|介绍)|(?:查找|了解|看看|总结|汇总|报告|对比|介绍).{0,40}(?:最新|当前|近期|今天|本周|这周|新闻|趋势|热点)/u.test(taskText)
   const citationBearingResearchIntent = explicitResearchIntent || timeSensitiveResearchIntent
   if (!citationBearingResearchIntent) return undefined
@@ -5855,6 +6141,24 @@ export function webResearchArtifactCitationGap(
   const evidence = webResearchCitationEvidence(messages)
   if (!evidence) return undefined
   return citationGapForText(evidence, artifactText)
+}
+
+/**
+ * A strict time-sensitive visual Web artifact must not establish its durable
+ * canonical path without any source URL at all. Rejecting that first write is
+ * cheaper and safer than locking an ungrounded file and repairing it after a
+ * full Browser/Vision cycle. Unsupported URLs are still handled by the
+ * existing targeted source-repair lane so that this guard stays narrow.
+ */
+export function visualResearchHtmlWriteVerificationGap(
+  messages: ModelMessage[],
+  html: string,
+): string | undefined {
+  const evidence = webResearchCitationEvidence(messages)
+  if (!evidence || urlsInText(html).length > 0) return undefined
+  return evidence.sourceUrls.length > 0
+    ? `The canonical research HTML cannot be written yet because it contains no source URL. Include at least one exact retrieved URL as a visible source link in this same complete HTML write. Retrieved source URLs: ${evidence.sourceUrls.join(', ')}`
+    : 'The canonical research HTML cannot be written before a successful Web source is retrieved. Run the enabled research step first, then include an exact returned URL as a visible source link.'
 }
 
 function citationGapForText(

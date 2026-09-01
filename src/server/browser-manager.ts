@@ -23,8 +23,11 @@ export class BrowserManager {
   private readonly lastOpenedUrls = new Map<string, string>()
   private browser: Browser | undefined
   private browserLaunch: Promise<Browser> | undefined
+  private shuttingDown = false
+  private shutdownWork?: Promise<void>
 
   async open(sessionId: string, url: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    this.assertAcceptingWork()
     const allowedOrigin = previewOrigin(url)
     if (signal?.aborted) throw abortReason(signal)
     const current = this.sessions.get(sessionId)
@@ -112,7 +115,7 @@ export class BrowserManager {
   }
 
   async screenshot(sessionId: string, signal?: AbortSignal): Promise<Buffer> {
-    return await this.runAbortable(sessionId, signal, async (session) => await session.page.screenshot({ fullPage: true, type: 'png' }))
+    return await this.runAbortable(sessionId, signal, async (session) => await session.page.screenshot({ fullPage: false, type: 'png' }))
   }
 
   logs(sessionId: string): BrowserLog[] {
@@ -151,7 +154,38 @@ export class BrowserManager {
     }
   }
 
+  async shutdown(): Promise<void> {
+    if (!this.shutdownWork) {
+      // Flip admission before the shutdown drain snapshots pending Contexts and
+      // Browser launches. Any operation that crossed this boundary has already
+      // registered its creation promise and is therefore included in the drain.
+      this.shuttingDown = true
+      this.shutdownWork = this.drainForShutdown()
+    }
+    await this.shutdownWork
+  }
+
+  private async drainForShutdown(): Promise<void> {
+    await Promise.allSettled([...this.sessionCreations.values()])
+    const sessions = [...this.sessions.values()]
+    this.sessions.clear()
+    const launching = this.browserLaunch
+    if (launching) await launching.catch(() => undefined)
+    const browser = this.browser
+    this.browser = undefined
+    try {
+      // A stuck per-Context teardown must not prevent service shutdown. Close
+      // the shared transport first; Playwright then releases every outstanding
+      // page operation and Context close before the final per-session drain.
+      if (browser?.isConnected()) await browser.close()
+    } finally {
+      await Promise.allSettled(sessions.map(async (session) => await session.context.close()))
+      this.lastOpenedUrls.clear()
+    }
+  }
+
   private async get(sessionId: string): Promise<BrowserSession> {
+    this.assertAcceptingWork()
     const current = this.sessions.get(sessionId)
     if (current?.browser.isConnected()) return current
     if (current) {
@@ -242,6 +276,7 @@ export class BrowserManager {
     operation: (session: BrowserSession) => Promise<T>,
     options: { rehydrate?: boolean } = {},
   ): Promise<T> {
+    this.assertAcceptingWork()
     let aborted = signal?.aborted === true
     const abort = () => {
       aborted = true
@@ -267,6 +302,10 @@ export class BrowserManager {
     } finally {
       signal?.removeEventListener('abort', abort)
     }
+  }
+
+  private assertAcceptingWork(): void {
+    if (this.shuttingDown) throw new Error('Browser manager is shutting down')
   }
 
   private async rehydrate(sessionId: string, session: BrowserSession): Promise<void> {

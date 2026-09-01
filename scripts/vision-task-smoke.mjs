@@ -53,11 +53,11 @@ for (const required of ['inspect_image', 'browser']) {
   if (!toolStarts.includes(required)) throw new Error(`required tool was not started: ${required}`)
   if (!toolCompletions.includes(required)) throw new Error(`required tool did not complete: ${required}`)
 }
-if (!['create_file', 'write_file'].some((name) => toolCompletions.includes(name))) {
-  throw new Error('dashboard was not created with create_file or write_file')
+if (!toolCompletions.includes('write_file')) {
+  throw new Error('dashboard was not created with the active write_file tool')
 }
-if (!['build_and_start', 'start_process'].some((name) => toolCompletions.includes(name))) {
-  throw new Error('dashboard website was not started with build_and_start or start_process')
+if (!toolCompletions.includes('start_process')) {
+  throw new Error('dashboard website was not started with the active start_process tool')
 }
 if (!visionUsage) throw new Error('vision usage was not recorded in the unified session ledger')
 if (!artifact) throw new Error('dashboard.html artifact was not created')
@@ -108,8 +108,8 @@ const report = {
     positiveVisionTokenUsage: visionUsage.data.lastCall.totalTokens >= 1,
     requiredToolsCompleted: toolCompletions.includes('inspect_image')
       && toolCompletions.includes('browser')
-      && ['create_file', 'write_file'].some((name) => toolCompletions.includes(name))
-      && ['build_and_start', 'start_process'].some((name) => toolCompletions.includes(name)),
+      && toolCompletions.includes('write_file')
+      && toolCompletions.includes('start_process'),
     dashboardArtifactCreated: Boolean(artifact),
   },
   completedTools: toolCompletions,

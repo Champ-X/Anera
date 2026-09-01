@@ -1,10 +1,12 @@
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import type { ConsoleMessage } from 'playwright-core'
 import { chromium } from 'playwright-core'
 import { findBrowserExecutable } from '../server/browser-executable.js'
+import { fingerprintProductionImplementation } from './implementation-fingerprint.js'
 import { captureUiStateContract, type UiStateContract, type UiVisualContract } from './ui-contract.js'
 import {
   advanceVisualRunningFixture,
@@ -103,6 +105,7 @@ interface StreamingWriteInteractionCheck {
 const args = parseArgs(process.argv.slice(2))
 const outputRoot = args.values.output || args.positionals[0]
 if (!outputRoot) usage('Missing --output <directory>')
+const projectRoot = resolve(process.cwd())
 const output = resolve(outputRoot)
 const screenshotsRoot = resolve(output, 'screenshots')
 await mkdir(screenshotsRoot, { recursive: true })
@@ -545,6 +548,11 @@ try {
   await completedReviewPanel.waitFor({ state: 'detached' })
   const composerEditor = page.locator('.composer-editor')
   await composerEditor.waitFor({ state: 'visible' })
+  await page.waitForFunction(() => {
+    const editor = document.querySelector('.composer-editor')
+    return editor?.textContent?.includes('Selected element in index.html')
+      && editor.textContent.includes('All systems operational')
+  }, undefined, { timeout: 5_000 })
   const selectedElementReference = await readComposerValue(composerEditor)
   if (!selectedElementReference.startsWith('[Selected element in index.html: ')
     || !selectedElementReference.endsWith(' — “All systems operational”]')) {
@@ -1706,6 +1714,21 @@ try {
     browser: await browser.version(),
     states,
   }
+  const implementationFingerprint = await fingerprintProductionImplementation(projectRoot, {
+    verifierPaths: ['src/eval/ui-visual-capture-cli.ts'],
+    sourceEntrypoints: [
+      'src/client/AgentLeaderboard.tsx',
+      'src/client/App.tsx',
+      'src/client/main.tsx',
+      'src/client/styles.css',
+      'src/eval/ui-contract.ts',
+      'src/eval/ui-visual-fixture.ts',
+      'src/server/app.ts',
+      'src/server/config.ts',
+      'src/server/github-connector.ts',
+      'src/server/session-store.ts',
+    ],
+  })
   await writeFile(resolve(output, 'ui-contract.json'), `${JSON.stringify(contract, null, 2)}\n`, 'utf8')
   const errors = states.flatMap((state) => state.console
     .filter((message) => ['error', 'warning', 'requestfailed'].includes(message.level))
@@ -1718,6 +1741,14 @@ try {
   const verticalOverflows = states
     .filter((state) => state.document.verticalOverflowPx > 0 || state.document.windowScrollY !== 0)
     .map((state) => ({ state: state.name, pixels: state.document.verticalOverflowPx, windowScrollY: state.document.windowScrollY }))
+  const screenshotAttestations = await Promise.all(states.map(async (state) => {
+    const screenshot = await readFile(resolve(output, state.screenshot))
+    return {
+      path: state.screenshot,
+      bytes: screenshot.byteLength,
+      sha256: createHash('sha256').update(screenshot).digest('hex'),
+    }
+  }))
   const passed = errors.length === 0
     && overflows.length === 0
     && verticalOverflows.length === 0
@@ -1734,8 +1765,10 @@ try {
     && hitlInteractionsPassed
   await writeFile(resolve(output, 'capture-summary.json'), `${JSON.stringify({
     schemaVersion: contract.schemaVersion,
+    implementationFingerprint,
     stateCount: states.length,
     screenshots: states.map((state) => state.screenshot),
+    screenshotAttestations,
     consoleErrors: errors,
     horizontalOverflows: overflows,
     verticalOverflows,

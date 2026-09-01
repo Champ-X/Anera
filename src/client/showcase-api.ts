@@ -7,14 +7,9 @@ import type {
   WorkspaceEntry,
 } from '../shared/types'
 import rawShowcaseData from './showcase-data.json'
+import { showcaseCatalog, type ShowcaseDemoDefinition } from './showcase-catalog'
 
-export interface ShowcaseDemoDefinition {
-  id: string
-  title: string
-  eyebrow: string
-  note: string
-  metrics: UsageTotals
-}
+export { showcaseCatalog, type ShowcaseDemoDefinition }
 
 interface ShowcaseData {
   schemaVersion: string
@@ -28,14 +23,6 @@ interface ShowcaseData {
 
 const data = rawShowcaseData as unknown as ShowcaseData
 const replayLimits = new Map<string, number | null>()
-
-export const showcaseCatalog = {
-  schemaVersion: data.schemaVersion,
-  generatedAt: data.generatedAt,
-  disclosure: data.disclosure,
-  defaultSessionId: data.defaultSessionId,
-  demos: data.demos,
-}
 
 export function showcaseReplayCheckpoints(sessionId: string): number[] {
   const snapshot = data.snapshots[sessionId]

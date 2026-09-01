@@ -1791,7 +1791,7 @@ export function App() {
                   onApproval={async (approvalId, approved) => {
                     if (!activeId) return
                     try { await api.resolveApproval(activeId, approvalId, approved) }
-                    catch (reason) { setError(messageOf(reason)) }
+                    catch (reason) { setError(messageOf(reason)); throw reason }
                   }}
                   onHitl={async (hitlId, response) => {
                     if (!activeId) return
@@ -2146,7 +2146,7 @@ export function App() {
           }}
           onRestart={async () => {
             try { await api.restartWebsite(activeId); await refreshSnapshot(activeId) }
-            catch (reason) { setError(messageOf(reason)) }
+            catch (reason) { setError(messageOf(reason)); throw reason }
           }}
         />
       )}
@@ -3721,12 +3721,27 @@ export function ApprovalCard({ item, onDecision }: {
       </div>
       {item.decision === 'pending' && (
         <div className="approval-actions">
-          <button disabled={submitting} onClick={async () => { setSubmitting(true); await onDecision(item.approvalId, false) }}>Deny</button>
-          <button className="approve" disabled={submitting} onClick={async () => { setSubmitting(true); await onDecision(item.approvalId, true) }}>Approve</button>
+          <button disabled={submitting} onClick={() => void submitApprovalDecision(onDecision, item.approvalId, false, setSubmitting).catch(() => undefined)}>Deny</button>
+          <button className="approve" disabled={submitting} onClick={() => void submitApprovalDecision(onDecision, item.approvalId, true, setSubmitting).catch(() => undefined)}>Approve</button>
         </div>
       )}
     </div>
   )
+}
+
+export async function submitApprovalDecision(
+  onDecision: (approvalId: string, approved: boolean) => Promise<void>,
+  approvalId: string,
+  approved: boolean,
+  setSubmitting: (submitting: boolean) => void,
+): Promise<void> {
+  setSubmitting(true)
+  try {
+    await onDecision(approvalId, approved)
+  } catch (reason) {
+    setSubmitting(false)
+    throw reason
+  }
 }
 
 function HitlCard({ item, sessionId, onResponse }: {
@@ -4204,6 +4219,7 @@ export function WorkspacePanel(props: {
   onPreview: () => void
   onRestart: () => Promise<void>
 }) {
+  const [websiteRestarting, setWebsiteRestarting] = useState(false)
   const snapshot = props.snapshot
   const website = snapshot?.website
   const deployment = snapshot?.deployment
@@ -4293,11 +4309,12 @@ export function WorkspacePanel(props: {
           </button>
           <button
             className="workspace-resource-action"
-            disabled={STATIC_SHOWCASE || (!website?.entryPath && !website?.processId)}
-            onClick={() => void props.onRestart()}
+            disabled={STATIC_SHOWCASE || websiteRestarting || (!website?.entryPath && !website?.processId)}
+            onClick={() => void submitWebsiteRestart(props.onRestart, setWebsiteRestarting).catch(() => undefined)}
+            aria-busy={websiteRestarting || undefined}
             aria-label="Restart Website"
             title={STATIC_SHOWCASE ? 'Website restart is disabled in the static replay' : 'Restart'}
-          ><RotateCcw size={14} /></button>
+          >{websiteRestarting ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}</button>
           {website?.entryPath
             ? <span className="website-path">{website.entryPath}</span>
             : website?.port
@@ -4369,6 +4386,18 @@ export function WorkspacePanel(props: {
       </div>
     </aside>
   )
+}
+
+export async function submitWebsiteRestart(
+  onRestart: () => Promise<void>,
+  setRestarting: (restarting: boolean) => void,
+): Promise<void> {
+  setRestarting(true)
+  try {
+    await onRestart()
+  } finally {
+    setRestarting(false)
+  }
 }
 
 function ProcessItem({ process }: { process: ProcessRecord }) {
@@ -4965,7 +4994,7 @@ export function toolLabel(
   if (name === 'deploy_project') return 'Deployed project'
   if (name === 'package_install') return `Installed ${String(args.manager || 'package')} dependencies`
   if (name === 'web_search' || name === 'search_web') {
-    if (status === 'running') return 'Searching the web...'
+    if (status === 'running') return 'Searching…'
     if (status === 'failed') return 'Search failed'
     if (status === 'timed_out') return 'Search stopped'
     return 'Searched the web'

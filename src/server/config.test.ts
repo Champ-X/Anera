@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { resolveDeepSeekVisionPricing, resolveModelTemperature, resolveTavilyApiKey } from './config.js'
+import { resolveDeepSeekVisionPricing, resolveModelTemperature, resolveTavilyApiKey, resolveTestLoopbackDeepSeekProvider } from './config.js'
 
 describe('provider configuration', () => {
   it('prefers TAVILY_API_KEY and accepts the existing TAVILY_API_KRY spelling', () => {
@@ -18,6 +18,37 @@ describe('provider configuration', () => {
     expect(resolveModelTemperature('-0.1')).toBe(0)
     expect(resolveModelTemperature('2.1')).toBe(0)
     expect(resolveModelTemperature('not-a-number')).toBe(0)
+  })
+
+  it('keeps the loopback DeepSeek fixture seam test-only, synthetic, and provider-scoped', () => {
+    expect(resolveTestLoopbackDeepSeekProvider({
+      enabled: false,
+      nodeEnv: 'production',
+      apiKey: 'real-key-shape-is-irrelevant-while-disabled',
+      baseUrl: 'https://api.deepseek.com',
+    })).toBe(false)
+    expect(resolveTestLoopbackDeepSeekProvider({
+      enabled: true,
+      nodeEnv: 'test',
+      apiKey: 'synthetic-provider-key',
+      baseUrl: 'http://127.0.0.1:43123',
+    })).toBe(true)
+    expect(resolveTestLoopbackDeepSeekProvider({
+      enabled: true,
+      nodeEnv: 'test',
+      apiKey: 'synthetic-provider-key',
+      baseUrl: 'http://[::1]:43123/v1',
+    })).toBe(true)
+
+    for (const invalid of [
+      { nodeEnv: 'production', apiKey: 'synthetic-provider-key', baseUrl: 'http://127.0.0.1:43123' },
+      { nodeEnv: 'test', apiKey: 'provider-key', baseUrl: 'http://127.0.0.1:43123' },
+      { nodeEnv: 'test', apiKey: 'synthetic-provider-key', baseUrl: 'http://127.0.0.1' },
+      { nodeEnv: 'test', apiKey: 'synthetic-provider-key', baseUrl: 'http://192.168.1.2:43123' },
+      { nodeEnv: 'test', apiKey: 'synthetic-provider-key', baseUrl: 'https://127.0.0.1:43123' },
+    ]) {
+      expect(() => resolveTestLoopbackDeepSeekProvider({ enabled: true, ...invalid })).toThrow()
+    }
   })
 
   it('uses six independent official Vision defaults and never borrows the text cache rate', () => {

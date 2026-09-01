@@ -96,6 +96,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   const agentCasRoot = resolve(dataRoot, 'agent-cas')
   await mkdir(agentCasRoot, { recursive: true })
   const signedAgentUploads = new Map<string, SignedAgentUpload>()
+  const websiteRestartRequests = new Map<string, Promise<StoredSession['website']>>()
   const credits = new DailyCreditStore(dataRoot, {
     dailyFreeCredits: options.dailyFreeCredits ?? config.dailyFreeCredits,
     creditsPerUsd: options.creditsPerUsd ?? config.creditsPerUsd,
@@ -826,54 +827,64 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
 
   app.post('/api/sessions/:id/website/restart', async (request, response) => {
     const id = request.params.id
-    const state = await store.get(id)
-    const anchor = [...await store.events(id)].reverse().find((event) => (
-      event.type === 'website.updated' || event.type === 'assistant.final'
-    ))
-    const eventContext = anchor
-      ? { turnId: anchor.turnId, stepId: anchor.stepId, callId: anchor.callId }
-      : {}
-    const starting = { ...state.website, status: 'starting' as const, updatedAt: new Date().toISOString() }
-    await store.recordWebsiteUpdate(id, starting, { action: 'restart' }, eventContext)
-    if (state.website.processId) {
-      try {
-        const durableProcess = state.processes.find((process) => process.id === state.website.processId)
-        if (!durableProcess) throw new Error('Managed Website process record not found')
-        const process = await agent.processes.restartFromRecord(id, store.workspaceDir(id), durableProcess, eventContext)
-        if (!process.port || process.status !== 'running') throw new Error('Restarted process did not report a live port')
-        const running = {
-          status: 'running' as const,
-          processId: process.id,
-          port: process.port,
-          previewUrl: `http://127.0.0.1:${process.port}`,
-          restartCount: state.website.restartCount + 1,
-          updatedAt: new Date().toISOString(),
+    let restart = websiteRestartRequests.get(id)
+    if (!restart) {
+      restart = (async () => {
+        const state = await store.get(id)
+        const anchor = [...await store.events(id)].reverse().find((event) => (
+          event.type === 'website.updated' || event.type === 'assistant.final'
+        ))
+        const eventContext = anchor
+          ? { turnId: anchor.turnId, stepId: anchor.stepId, callId: anchor.callId }
+          : {}
+        const starting = { ...state.website, status: 'starting' as const, updatedAt: new Date().toISOString() }
+        await store.recordWebsiteUpdate(id, starting, { action: 'restart' }, eventContext)
+        try {
+          if (state.website.processId) {
+            const durableProcess = state.processes.find((process) => process.id === state.website.processId)
+            if (!durableProcess) throw new Error('Managed Website process record not found')
+            const process = await agent.processes.restartFromRecord(id, store.workspaceDir(id), durableProcess, eventContext)
+            if (!process.port || process.status !== 'running') throw new Error('Restarted process did not report a live port')
+            const running = {
+              status: 'running' as const,
+              processId: process.id,
+              port: process.port,
+              previewUrl: `http://127.0.0.1:${process.port}`,
+              restartCount: state.website.restartCount + 1,
+              updatedAt: new Date().toISOString(),
+            }
+            await store.recordWebsiteUpdate(id, running, { action: 'restarted', previousProcessId: state.website.processId }, eventContext)
+            await agent.scheduleWebsiteSleep(id)
+            return running
+          }
+          const entryPath = state.website.entryPath || await findWebsiteEntry(store.workspaceDir(id))
+          if (!entryPath) throw new Error('No website entry file found')
+          const entryTarget = resolveWorkspacePath(store.workspaceDir(id), entryPath)
+          await assertNoSymlinkTraversal(store.workspaceDir(id), entryTarget)
+          if (!(await stat(entryTarget)).isFile()) throw new Error('Website entry is not a file')
+          const running = {
+            ...starting,
+            status: 'running' as const,
+            entryPath,
+            previewUrl: `/workspace/${id}/preview/${encodeWorkspaceUrlPath(entryPath)}`,
+            restartCount: state.website.restartCount + 1,
+            updatedAt: new Date().toISOString(),
+          }
+          await store.recordWebsiteUpdate(id, running, { action: 'restarted' }, eventContext)
+          return running
+        } catch (error) {
+          const failed = { ...starting, status: 'failed' as const, updatedAt: new Date().toISOString() }
+          await store.recordWebsiteUpdate(id, failed, { action: 'restart_failed', message: error instanceof Error ? error.message : String(error) }, eventContext)
+          throw error
         }
-        await store.recordWebsiteUpdate(id, running, { action: 'restarted', previousProcessId: state.website.processId }, eventContext)
-        await agent.scheduleWebsiteSleep(id)
-        response.json({ website: running })
-        return
-      } catch (error) {
-        const failed = { ...starting, status: 'failed' as const, updatedAt: new Date().toISOString() }
-        await store.recordWebsiteUpdate(id, failed, { action: 'restart_failed', message: error instanceof Error ? error.message : String(error) }, eventContext)
-        throw error
-      }
+      })()
+      websiteRestartRequests.set(id, restart)
     }
-    const entryPath = state.website.entryPath || await findWebsiteEntry(store.workspaceDir(id))
-    if (!entryPath) throw new Error('No website entry file found')
-    const entryTarget = resolveWorkspacePath(store.workspaceDir(id), entryPath)
-    await assertNoSymlinkTraversal(store.workspaceDir(id), entryTarget)
-    if (!(await stat(entryTarget)).isFile()) throw new Error('Website entry is not a file')
-    const running = {
-      ...starting,
-      status: 'running' as const,
-      entryPath,
-      previewUrl: `/workspace/${id}/preview/${encodeWorkspaceUrlPath(entryPath)}`,
-      restartCount: state.website.restartCount + 1,
-      updatedAt: new Date().toISOString(),
+    try {
+      response.json({ website: await restart })
+    } finally {
+      if (websiteRestartRequests.get(id) === restart) websiteRestartRequests.delete(id)
     }
-    await store.recordWebsiteUpdate(id, running, { action: 'restarted' }, eventContext)
-    response.json({ website: running })
   })
 
   app.get('/workspace/:id/file', async (request, response) => {

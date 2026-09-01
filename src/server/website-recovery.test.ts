@@ -2,7 +2,7 @@ import { createServer } from 'node:http'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentService } from './agent-service.js'
 import { createApp } from './app.js'
 import { SessionStore } from './session-store.js'
@@ -169,7 +169,7 @@ describe('managed Website recovery', () => {
     }
   })
 
-  it('restarts a recovered Website from its durable process command when no live record exists', async () => {
+  it('coalesces concurrent restarts of a recovered Website onto one durable process command', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-website-durable-restart-'))
     roots.push(root)
     const port = await reservePort()
@@ -219,9 +219,18 @@ describe('managed Website recovery', () => {
       await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
       const address = server.address()
       if (!address || typeof address === 'string') throw new Error('Test API server did not bind')
-      const response = await fetch(`http://127.0.0.1:${address.port}/api/sessions/${session.summary.id}/website/restart`, { method: 'POST' })
+      const endpoint = `http://127.0.0.1:${address.port}/api/sessions/${session.summary.id}/website/restart`
+      const [response, duplicateResponse] = await Promise.all([
+        fetch(endpoint, { method: 'POST' }),
+        fetch(endpoint, { method: 'POST' }),
+      ])
       expect(response.status).toBe(200)
-      const body = await response.json() as { website: { status: string; processId: string; port: number; previewUrl: string; restartCount: number } }
+      expect(duplicateResponse.status).toBe(200)
+      const [body, duplicateBody] = await Promise.all([
+        response.json(),
+        duplicateResponse.json(),
+      ]) as Array<{ website: { status: string; processId: string; port: number; previewUrl: string; restartCount: number } }>
+      expect(duplicateBody.website).toEqual(body.website)
       expect(body.website).toMatchObject({
         status: 'running',
         processId: expect.stringMatching(/^proc_/),
@@ -238,6 +247,8 @@ describe('managed Website recovery', () => {
         expect.objectContaining({ id: body.website.processId, status: 'running', portHint: port }),
       ]))
       const events = await created.store.events(session.summary.id)
+      expect(events.filter((event) => event.type === 'website.updated' && event.data?.action === 'restart')).toHaveLength(1)
+      expect(events.filter((event) => event.type === 'website.updated' && event.data?.action === 'restarted')).toHaveLength(1)
       expect(events.findLast((event) => event.type === 'website.updated')).toMatchObject({
         turnId: context.turnId,
         stepId: context.stepId,
@@ -248,7 +259,127 @@ describe('managed Website recovery', () => {
           website: { status: 'running', processId: body.website.processId, restartCount: 1 },
         },
       })
+
+      const staticSession = await created.store.create()
+      await created.store.update(staticSession.summary.id, (state) => {
+        state.website = {
+          status: 'asleep',
+          entryPath: 'missing.html',
+          previewUrl: `/workspace/${staticSession.summary.id}/preview/missing.html`,
+          updatedAt: new Date().toISOString(),
+          restartCount: 2,
+        }
+      })
+      const staticEndpoint = `http://127.0.0.1:${address.port}/api/sessions/${staticSession.summary.id}/website/restart`
+      const staticResponse = await fetch(staticEndpoint, { method: 'POST' })
+      expect(staticResponse.status).toBe(500)
+      await staticResponse.text()
+
+      const staticState = await created.store.get(staticSession.summary.id)
+      expect(staticState.website).toMatchObject({
+        status: 'failed',
+        entryPath: 'missing.html',
+        restartCount: 2,
+      })
+      const staticEvents = await created.store.events(staticSession.summary.id)
+      expect(staticEvents.filter((event) => event.type === 'website.updated' && event.data?.action === 'restart')).toHaveLength(1)
+      expect(staticEvents.filter((event) => event.type === 'website.updated' && event.data?.action === 'restart_failed')).toHaveLength(1)
+      expect(staticEvents.filter((event) => event.type === 'website.updated' && event.data?.action === 'restarted')).toHaveLength(0)
+      expect(staticEvents.findLast((event) => event.type === 'website.updated')).toMatchObject({
+        data: {
+          action: 'restart_failed',
+          message: expect.stringContaining('missing.html'),
+          website: { status: 'failed', entryPath: 'missing.html', restartCount: 2 },
+        },
+      })
     } finally {
+      await created.agent.shutdown()
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    }
+  })
+
+  it('rejects a late Website process start after Agent shutdown has crossed the resource barrier', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-website-restart-shutdown-'))
+    roots.push(root)
+    const port = await reservePort()
+    const initial = new SessionStore(root, 'test-model')
+    await initial.initialize()
+    const session = await initial.create()
+    await writeFile(resolve(initial.workspaceDir(session.summary.id), 'late-server.mjs'), `import { createServer } from 'node:http'\ncreateServer((_request, response) => response.end('LATE')).listen(${port}, '127.0.0.1')\n`, 'utf8')
+    const interruptedRecord = {
+      id: 'proc_restartshutdown001',
+      command: 'node late-server.mjs',
+      pid: 999_999_993,
+      port,
+      portHint: port,
+      status: 'interrupted' as const,
+      startedAt: new Date(Date.now() - 1_000).toISOString(),
+      completedAt: new Date().toISOString(),
+      signal: 'SERVER_RESTART',
+      stdout: '',
+      stderr: '',
+    }
+    await initial.update(session.summary.id, (state) => {
+      state.processes = [interruptedRecord]
+      state.website = {
+        status: 'asleep',
+        processId: interruptedRecord.id,
+        port,
+        previewUrl: `http://127.0.0.1:${port}`,
+        updatedAt: new Date().toISOString(),
+        restartCount: 0,
+      }
+    })
+
+    const created = await createApp({ dataRoot: root, model: 'test-model' })
+    const originalRestart = created.agent.processes.restartFromRecord.bind(created.agent.processes)
+    let signalEntered!: () => void
+    const entered = new Promise<void>((resolveEntered) => { signalEntered = resolveEntered })
+    let releaseRestart!: () => void
+    const restartGate = new Promise<void>((resolveRestart) => { releaseRestart = resolveRestart })
+    vi.spyOn(created.agent.processes, 'restartFromRecord').mockImplementation(async (...args) => {
+      signalEntered()
+      await restartGate
+      return await originalRestart(...args)
+    })
+    const server = createServer(created.app)
+    try {
+      await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test API server did not bind')
+      const endpoint = `http://127.0.0.1:${address.port}/api/sessions/${session.summary.id}/website/restart`
+      const baselineProcessStartedCount = (await created.store.events(session.summary.id))
+        .filter((event) => event.type === 'process.started').length
+      const responseWork = fetch(endpoint, { method: 'POST' })
+      await entered
+
+      await created.agent.shutdown()
+      releaseRestart()
+      const response = await responseWork
+      expect(response.status).toBe(500)
+      await response.text()
+
+      const state = await created.store.get(session.summary.id)
+      expect(state.website).toMatchObject({
+        status: 'failed',
+        processId: interruptedRecord.id,
+        restartCount: 0,
+      })
+      expect(created.agent.processes.list(session.summary.id)).toHaveLength(0)
+      const events = await created.store.events(session.summary.id)
+      expect(events.filter((event) => event.type === 'process.started')).toHaveLength(baselineProcessStartedCount)
+      expect(events.filter((event) => event.type === 'website.updated' && event.data?.action === 'restart')).toHaveLength(1)
+      expect(events.filter((event) => event.type === 'website.updated' && event.data?.action === 'restart_failed')).toHaveLength(1)
+      expect(events.findLast((event) => event.type === 'website.updated')).toMatchObject({
+        data: {
+          action: 'restart_failed',
+          message: 'Process manager is shutting down',
+          website: { status: 'failed', processId: interruptedRecord.id, restartCount: 0 },
+        },
+      })
+      await expect(fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(250) })).rejects.toThrow()
+    } finally {
+      releaseRestart()
       await created.agent.shutdown()
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
     }

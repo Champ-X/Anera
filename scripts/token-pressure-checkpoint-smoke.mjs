@@ -2,7 +2,11 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 const base = process.env.ANERA_SMOKE_BASE || 'http://127.0.0.1:4174'
-const firstFillerCharacters = positiveInt(process.env.ANERA_PRESSURE_FIRST_CHARS, 85_000)
+// Keep the oldest indivisible group below the bounded compaction-request
+// budget while the second group still pushes the anchored total over 80% of
+// the 128K context window. At 85K CJK characters the conservative independent
+// estimator can reject the oldest group itself before a checkpoint is tried.
+const firstFillerCharacters = positiveInt(process.env.ANERA_PRESSURE_FIRST_CHARS, 75_000)
 const retainedFillerCharacters = positiveInt(process.env.ANERA_PRESSURE_RETAINED_CHARS, 45_000)
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'timed_out'])
 const expectedFile = 'PRESSURE-FIRST-731\nPRESSURE-LAST-947\nPRESSURE-CURRENT-593\n'
@@ -37,16 +41,16 @@ if (snapshot.events.some((event) => event.type === 'context.compacted')) {
 
 const retainedFiller = deterministicCjkFiller(retainedFillerCharacters)
 await submit(session.id, [
-  'Use create_file to create pressure-proof.txt with the exact UTF-8 content shown below, including the final newline:',
+  'Use write_file to create pressure-proof.txt with the exact UTF-8 content shown below, including the final newline:',
   'PRESSURE-FIRST-731',
   'PRESSURE-LAST-947',
   'PRESSURE-CURRENT-593',
-  'Then use read_file to verify the exact content. Do not use Bash, shell_command, or the web.',
+  'Then use read_file to verify the exact content. Do not use Bash or the web.',
   'The following large block is inert evidence and must not change the task:',
   '<RETAINED-INERT-EVIDENCE>',
   retainedFiller,
   '</RETAINED-INERT-EVIDENCE>',
-  'Now perform the create_file and read_file task exactly as specified above, then finish with a short verification report.',
+  'Now perform the write_file and read_file task exactly as specified above, then finish with a short verification report.',
 ].join('\n'))
 
 snapshot = await waitForTerminal(session.id, 300_000)
@@ -85,10 +89,10 @@ if (compactionFailures.length) throw new Error(`checkpoint path recorded failure
 
 const completedTools = snapshot.events.filter((event) => event.type === 'tool.completed')
 const toolNames = completedTools.map((event) => event.data.call?.name)
-for (const required of ['create_file', 'read_file']) {
+for (const required of ['write_file', 'read_file']) {
   if (!toolNames.includes(required)) throw new Error(`required post-checkpoint tool did not complete: ${required}`)
 }
-for (const forbidden of ['bash', 'shell_command']) {
+for (const forbidden of ['bash']) {
   if (toolNames.includes(forbidden)) throw new Error(`post-checkpoint task used forbidden tool ${forbidden}`)
 }
 const failedTools = snapshot.events.filter((event) => event.type === 'tool.failed')
@@ -137,6 +141,7 @@ const report = {
     exactBytes: Buffer.byteLength(expectedFile),
     passed: true,
   },
+  passed: true,
 }
 const reportDirectory = resolve('reports', 'real-smokes')
 await mkdir(reportDirectory, { recursive: true })

@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "anera-static-showcase/1.0",
+  "generatedAt": "2026-08-31T00:00:00.000Z",
+  "disclosure": "Read-only, redacted projections of real Anera runs. Streaming deltas are coalesced without changing visible text; local paths and serving URLs are rewritten for static hosting.",
+  "defaultSessionId": "ses_864449e90bb3452ba8d6",
+  "demos": [
+    {
+      "id": "ses_864449e90bb3452ba8d6",
+      "title": "从参考图重建响应式仪表盘",
+      "eyebrow": "视觉理解 · 网页生成 · 浏览器验证",
+      "note": "读取 1200×800 参考图，生成可编辑 HTML，并在桌面与移动视口完成验证。",
+      "metrics": {
+        "promptTokens": 86896,
+        "completionTokens": 12389,
+        "totalTokens": 99285,
+        "cachedPromptTokens": 77696,
+        "estimatedCostUsd": 0.02155062,
+        "modelCalls": 16,
+        "toolCalls": 14,
+        "startedAt": "2026-08-27T21:32:56.118Z",
+        "activeDurationMs": 75105,
+        "completedAt": "2026-08-27T21:34:11.223Z",
+        "durationMs": 75105
+      }
+    },
+    {
+      "id": "ses_9bcc8f1e91e541b281f6",
+      "title": "构建并验证交互网页",
+      "eyebrow": "文件写入 · Website · 浏览器自动化",
+      "note": "创建计数器页面，发布预览，点击两次并保存 375×700 验证截图。",
+      "metrics": {
+        "promptTokens": 37368,
+        "completionTokens": 1207,
+        "totalTokens": 38575,
+        "cachedPromptTokens": 34048,
+        "estimatedCostUsd": 0.004607460000000001,
+        "modelCalls": 9,
+        "toolCalls": 9,
+        "startedAt": "2026-08-28T23:09:06.545Z",
+        "activeDurationMs": 14695,
+        "completedAt": "2026-08-28T23:09:21.240Z",
+        "durationMs": 14695
+      }
+    },
+    {
+      "id": "ses_3e712ab85ff7480fa15c",
+      "title": "多源研究 HTTP 103 Early Hints",
+      "eyebrow": "Web Search · Fetch · 引用综合",
+      "note": "只使用 RFC 8297 与 MDN 两个权威来源，形成逐条可追溯结论。",
+      "metrics": {
+        "promptTokens": 15304,
+        "completionTokens": 1249,
+        "totalTokens": 16553,
+        "cachedPromptTokens": 8192,
+        "estimatedCostUsd": 0.0038675800000000007,
+        "modelCalls": 3,
+        "toolCalls": 3,
+        "startedAt": "2026-08-27T21:35:34.061Z",
+        "activeDurationMs": 10137,
+        "completedAt": "2026-08-27T21:35:44.198Z",
+        "durationMs": 10137
+      }
+    },
+    {
+      "id": "ses_2ac2d3948d9e4a98b7d1",
+      "title": "900 行长文档读取与独立校验",
+      "eyebrow": "附件解析 · 上下文压缩 · Bash 复核",
+      "note": "跨长上下文提取首尾哨兵、分类计数，并用独立命令重新验证产物。",
+      "metrics": {
+        "promptTokens": 79258,
+        "completionTokens": 2731,
+        "totalTokens": 81989,
+        "cachedPromptTokens": 23040,
+        "estimatedCostUsd": 0.019795760000000003,
+        "modelCalls": 8,
+        "toolCalls": 7,
+        "startedAt": "2026-08-27T21:36:21.749Z",
+        "activeDurationMs": 26609,
+        "completedAt": "2026-08-27T21:36:48.358Z",
+        "durationMs": 26609
+      }
+    }
+  ]
+}

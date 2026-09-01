@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { execFile as execFileCallback } from 'node:child_process'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -36,12 +36,13 @@ let judgePricing
 let comparePngFiles
 let base = ''
 try {
-  const [{ createApp }, { findBrowserExecutable }, { DeepSeekClient }, { config }, visualDiff] = await Promise.all([
+  const [{ createApp }, { findBrowserExecutable }, { DeepSeekClient }, { config }, visualDiff, { fingerprintProductionImplementation }] = await Promise.all([
     import(pathToFileURL(resolve(projectRoot, 'dist-server/server/app.js')).href),
     import(pathToFileURL(resolve(projectRoot, 'dist-server/server/browser-executable.js')).href),
     import(pathToFileURL(resolve(projectRoot, 'dist-server/server/deepseek.js')).href),
     import(pathToFileURL(resolve(projectRoot, 'dist-server/server/config.js')).href),
     import(pathToFileURL(resolve(projectRoot, 'dist-server/eval/visual-diff.js')).href),
+    import(pathToFileURL(resolve(projectRoot, 'dist-server/eval/implementation-fingerprint.js')).href),
   ])
   comparePngFiles = visualDiff.comparePngFiles
   judgePricing = config
@@ -100,6 +101,7 @@ try {
 
   const totals = tasks.reduce((sum, task) => ({
     activeDurationMs: sum.activeDurationMs + task.usage.activeDurationMs,
+    modelRequests: sum.modelRequests + task.usage.modelRequests,
     modelCalls: sum.modelCalls + task.usage.modelCalls,
     toolCalls: sum.toolCalls + task.usage.toolCalls,
     promptTokens: sum.promptTokens + task.usage.promptTokens,
@@ -108,6 +110,7 @@ try {
     estimatedCostUsd: sum.estimatedCostUsd + task.usage.estimatedCostUsd,
   }), {
     activeDurationMs: 0,
+    modelRequests: 0,
     modelCalls: 0,
     toolCalls: 0,
     promptTokens: 0,
@@ -116,7 +119,18 @@ try {
     estimatedCostUsd: 0,
   })
   const qualityScore = tasks.reduce((sum, task) => sum + task.qualityScore, 0) / tasks.length
-  const implementationFingerprint = await fingerprintCurrentImplementation(projectRoot)
+  const implementationFingerprint = await fingerprintProductionImplementation(projectRoot, {
+    verifierPaths: ['scripts/harness-quality-benchmark.mjs'],
+    sourceEntrypoints: [
+      'src/client/App.tsx',
+      'src/client/styles.css',
+      'src/server/agent-service.ts',
+      'src/server/app.ts',
+      'src/server/config.ts',
+      'src/server/deepseek.ts',
+      'src/server/tools.ts',
+    ],
+  })
   const evaluationUsage = tasks.reduce((sum, task) => {
     const usage = task.semanticJudge?.usage
     if (!usage) return sum
@@ -168,6 +182,7 @@ try {
       criticalChecksPassed: tasks.every((task) => task.criticalChecksPassed),
       efficiencyBudgetsPassed: tasks.every((task) => task.efficiency.passed),
       activeDurationMs: totals.activeDurationMs,
+      modelRequests: totals.modelRequests,
       modelCalls: totals.modelCalls,
       toolCalls: totals.toolCalls,
       promptTokens: totals.promptTokens,
@@ -2341,6 +2356,7 @@ async function workspaceText(sessionId, path) {
 function sessionUsage(current) {
   return {
     activeDurationMs: current.session.usage.activeDurationMs ?? current.session.usage.durationMs ?? 0,
+    modelRequests: current.session.usage.modelRequests ?? current.session.usage.modelCalls,
     modelCalls: current.session.usage.modelCalls,
     toolCalls: current.session.usage.toolCalls,
     promptTokens: current.session.usage.promptTokens,
@@ -2357,6 +2373,7 @@ function taskResult(name, current, startedAt, checks, budget, extra = {}) {
   const usage = sessionUsage(current)
   const failedTools = toolNames(current, 'tool.failed')
   const efficiencyChecks = [
+    { metric: 'modelRequests', actual: usage.modelRequests, maximum: budget.modelCalls, passed: usage.modelRequests <= budget.modelCalls },
     { metric: 'modelCalls', actual: usage.modelCalls, maximum: budget.modelCalls, passed: usage.modelCalls <= budget.modelCalls },
     { metric: 'toolCalls', actual: usage.toolCalls, maximum: budget.toolCalls, passed: usage.toolCalls <= budget.toolCalls },
     { metric: 'activeDurationMs', actual: usage.activeDurationMs, maximum: budget.activeDurationMs, passed: usage.activeDurationMs <= budget.activeDurationMs },
@@ -2765,33 +2782,6 @@ function compactToolTraceEvent(event) {
     result,
     isError: event.data.isError,
   }
-}
-
-async function fingerprintCurrentImplementation(root) {
-  const fixed = [
-    'package.json',
-    'package-lock.json',
-    'src/server/agent-service.ts',
-    'src/server/tools.ts',
-    'src/server/deepseek.ts',
-    'src/client/App.tsx',
-    'src/client/styles.css',
-    'dist-server/server/agent-service.js',
-    'dist-server/server/tools.js',
-    'dist-server/server/deepseek.js',
-    'dist-client/index.html',
-  ]
-  const clientAssets = (await readdir(resolve(root, 'dist-client/assets')))
-    .filter((name) => /\.(?:css|js|png)$/i.test(name))
-    .sort()
-    .map((name) => `dist-client/assets/${name}`)
-  const files = {}
-  for (const relativePath of [...fixed, ...clientAssets]) {
-    const content = await readFile(resolve(root, relativePath))
-    files[relativePath] = { bytes: content.byteLength, sha256: sha256(content) }
-  }
-  const aggregateSha256 = sha256(JSON.stringify(Object.entries(files)))
-  return { schemaVersion: 1, aggregateSha256, files }
 }
 
 function sha256(value) {

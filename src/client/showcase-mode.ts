@@ -17,6 +17,11 @@ export function normalizedShowcasePath(pathname: string): string {
     : pathname
 }
 
+export function normalizeShowcaseRoute(): void {
+  const path = normalizedShowcasePath(window.location.pathname)
+  if (path !== window.location.pathname) window.history.replaceState({}, '', path)
+}
+
 export function showcaseAssetUrl(sessionId: string, path: string): string {
   if (!/^ses_[a-z0-9]{20}$/.test(sessionId)) throw new Error('Invalid showcase session id')
   const parts = path.split('/')

@@ -14,7 +14,7 @@
 |---|---|---|
 | Public contract | **Verified** | 在冻结的 Arena 公开 deployment 上，19 个 active tools、参数 schema/描述、公开 prompt 投影、关键 UI 文案、上传与新对话 transport 无审计 drift。 |
 | Harness capability | **Verified** | 9/9 能力场景通过，19/19 active tools 被覆盖，共 42 次 tool calls。 |
-| Internal task quality | **Verified** | 18/18 内部任务通过，平均质量分 99.44，critical/效率门禁全通过，0 个失败工具。 |
+| Internal task quality | **Verified** | 单一指纹化完整批次 18/18 通过，平均质量分 100，critical/效率门禁全通过，0 个失败工具。 |
 | Anera UI state coverage | **Verified** | 62/62 桌面状态回归通过，0 console error，0 水平溢出，0 outer-shell 垂直溢出。 |
 | Exact paired trace | **N/A** | 尚无符合当前版本规则的 Arena reference / Anera candidate 配对。 |
 | Same-viewport pixel parity | **N/A** | 尚无同 viewport、字体、缩放与人工动作脚本下的 DOM/PNG 配对。 |
@@ -42,7 +42,7 @@
 
 ### 1. 冻结公开契约
 
-公开契约审计只读取未登录的 Arena HTML/JavaScript 资产，不使用 Cookie 或 cookie jar。审计绑定到 deployment `dpl_A1Vbar2TqcbueSZE1rhwVjSrYyPY`，解析 59 个 script assets 和 1 个 supplemental completed route，并对该冻结 route 的 active registry 做快照。
+公开契约审计只读取未登录的 Arena HTML/JavaScript 资产，不使用 Cookie 或 cookie jar。最新审计绑定到 deployment `dpl_GGVhypREjaK9mQC8Qik8L6iAbjnc`，解析 59 个 script assets 和 1 个 supplemental completed route，并对该冻结 route 的 active registry 做快照。
 
 当时的 19 个 active tools 为：
 
@@ -97,13 +97,13 @@ Anera 没有把“终端显示 success”当成任务正确性。每一层证据
 |---|---:|---|---|
 | 公开契约审计 | PASS；19/19 active tools | 未登录公开 bundle 快照 | 不代表 Arena 私有后端完全相同。 |
 | Harness convergence | 9/9 场景；19/19 工具；42 calls | 真实 DeepSeek 规划 + 确定性外部 fixture | 不代表所有外部 provider 都在该次运行中真实调用。 |
-| 内部质量基准 | 18/18；99.44；0 failed tools | 真实 DeepSeek + deterministic outcome oracles | 该报告明确记录 `arenaParityEvidence: false`，不是 Arena parity 分数。 |
+| 内部质量基准 | 18/18；平均 100；115 physical/metered model calls；118 tools；0 failed tools | 真实 DeepSeek + deterministic outcome oracles | 该报告明确记录 `arenaParityEvidence: false`，不是 Arena parity 分数。 |
 | UI 状态回归 | 62/62；0 console / horizontal / outer-shell vertical overflow | Anera 桌面端自身截图与交互回归 | 不是 Arena 同 viewport PNG diff。 |
 | Web provider canary | PASS | Tavily / Firecrawl 生产 ToolExecutor 真实路径 | 该证据不能用于证明 Arena 使用同一 provider。 |
 | Vision task smoke | PASS；`liveProvider: true` | DeepSeek Vision 真实路径，inspect → build → browser → inspect → present | 不是下文原始 HTML Slides prompt 的同 episode 实证。 |
-| 原提示 HTML Slides canary 快照 | PASS；10 model / 10 tool；78.112 s；`$0.03741436` | 真实 DeepSeek 文本/视觉路径；报告绑定当时 production bundle fingerprint | 不是当前 working tree 的 fresh attestation，也不是 Arena trace、成本或像素 parity。 |
+| 原提示 HTML Slides latest attestation | PASS；16/16 checks；10 model / 10 tool；80.528 s；`$0.04182607` | 真实 DeepSeek 文本/视觉路径；schema v3 绑定 verifier 与 51 个 production runtime 文件 | 不是 Arena trace、成本或像素 parity。 |
 
-这些数值必须保持分层。`19/19`、`9/9`、`18/18`、`99.44` 和 `62/62` 不能被算术合并成“99% Arena parity”。
+这些数值必须保持分层。`19/19`、`9/9`、`18/18`、内部质量 `100` 和 `62/62` 不能被算术合并成“100% Arena parity”。
 
 ## 代表性任务：AI 热点 HTML Slides
 
@@ -114,14 +114,14 @@ Anera 没有把“终端显示 success”当成任务正确性。每一层证据
 | 阶段 | Arena 录屏中的可观察行为 | Anera 当前实现 | 证据状态 |
 |---|---|---|---|
 | 路由与研究 | 多轮 Web 搜索，然后规划页面结构与风格。 | `isVisualWebArtifactTask` 覆盖原中文提示及中英文变体；原提示也进入 `isSingleArtifactWebTask`。时效性任务要求在最终 artifact mutation 之前有 Web research。 | 确定性路由/门禁已有单测。 |
-| 生成 | 持续 Writing，完成后出现 HTML artifact 和内联 Preview。 | 第一份完整 HTML 固定 canonical path，后续定向编辑，避免产生竞争的整文件变体。 | 原提示 live E2E 已生成并呈现 19,172 B canonical HTML。 |
+| 生成 | 持续 Writing，完成后出现 HTML artifact 和内联 Preview。 | 第一份完整 HTML 固定 canonical path，后续定向编辑，避免产生竞争的整文件变体。 | 最新原提示 live E2E 已生成并呈现 20,905 B canonical HTML。 |
 | 功能验收 | Arena 本次环境的 browser 探测失败，主要使用 parser/Node 检查，最后由用户翻页。 | 完成门禁要求 Website preview → Browser open → click/press 导航 → 导航后 screenshot。 | 原提示 live E2E 的完整顺序检查通过。 |
 | 视觉验收 | 录屏没有证明 Arena 模型看过页面截图。 | 必须用 `inspect_image` 检查上一步的确切截图；有缺陷则修复并重验，直到获得 `NO DEFECTS`。 | 原提示导航后截图已由真实 Vision 检查通过。 |
 | 交付 | Artifact、Preview、Workspace upload、Final 和 Review 依次出现。 | 验收后必须对 canonical HTML 执行 `present_file`，之后才能 Final。 | 原提示仅发布一个 Final，且 `present_file` 位于其前。 |
 
 相关路由与完成门禁位于 [`src/server/agent-service.ts`](src/server/agent-service.ts)，原提示和中英文路由、完整阶段链的定向测试位于 [`src/server/agent-service.test.ts`](src/server/agent-service.test.ts)。本报告编写时，相关定向 Vitest 为 **12/12 通过**。
 
-[`scripts/html-slides-task-smoke.mjs`](scripts/html-slides-task-smoke.mjs) 的归档 run 曾在其当时的 production bundle 上用原提示完成 live-provider 同 episode E2E。不可变报告为 [`reports/real-smokes/html-slides-2026-08-31T02-44-11-012Z/report.json`](evidence/html-slides-live-summary.json)：全部检查为 true，10 model / 10 tool、78.112 s、估算 `$0.03741436`，HTML 为 19,172 B / SHA-256 `792011d694d39b33913d91e9a3a3da008586be8481f6ba7f9ee543a0fc3ff26b`，导航后截图为 286,232 B / SHA-256 `3efd319bc00401cd6b632fc0b93d7891369c1b16d28ad2ad2b1e4ab0af6316ed`。报告记录 `deepseek-chat`、`deepseek-v4-flash-vision-exp`、`temperature=0`，并以实现聚合 fingerprint `c365467091719ed50ebaa908fde8dc10e44aa2976a91a4540a4f164c063109f8` 绑定当时的源码、依赖锁与生产 bundle；后续代码变化不会被这份旧指纹冒充为已重新验证。
+[`scripts/html-slides-task-smoke.mjs`](scripts/html-slides-task-smoke.mjs) 已在被测 production bundle 上用原提示完成 live-provider 同 episode E2E。不可变报告为 [`reports/real-smokes/html-slides-2026-08-31T22-50-17-228Z/report.json`](evidence/html-slides-live-summary.json)：16/16 checks 为 true，10 model requests/calls、10 tools、80.528 s、估算 `$0.04182607`，0 tool failure/timeout；HTML 为 20,905 B / SHA-256 `e09054a47b19233b50ce50ad8c5e273a137124792c765b4dce16e4c2e81c2f09`，10 个可见来源链接；导航后截图为 138,131 B / SHA-256 `29767ce948772cc67a5d4305a70c04178093826e6187bafa75d018feaa7c4891`。报告记录 `deepseek-chat`、`deepseek-v4-flash-vision-exp`、`temperature=0`。implementation fingerprint schema v3 聚合值 `56a56ce8379333b83081e2b85832969c4a968cfab18dbf4ce92fc0e28d5fd099` 绑定 verifier、自身算法、源码入口、依赖锁、完整 production server/shared runtime 和 client assets，共 51 个文件；后续任一运行时或 verifier 变化都必须重新运行，不能沿用该指纹。
 
 > **HTML Slides 的确定性路由、完成门禁和原提示真实 provider 同 episode E2E 已通过；Arena 同题 trace、成本与像素 parity 仍为 N/A。**
 

@@ -2,13 +2,14 @@
   "schemaVersion": "anera-public-evidence-summary/1.0",
   "evidenceType": "exact-prompt-html-slides-live-canary",
   "sourceSchemaVersion": "anera-html-slides-live-canary/1.0",
-  "generatedAt": "2026-08-31T02:44:11.012Z",
+  "generatedAt": "2026-08-31T22:50:17.228Z",
   "provenance": {
-    "source": "reports/real-smokes/html-slides-2026-08-31T02-44-11-012Z/report.json",
-    "sourceBytes": 8850,
-    "sourceSha256": "bf305cecd95a09062c153640718e81044130b5f5e3bbe120f537d845276636df",
-    "implementationFingerprintSchemaVersion": 1,
-    "implementationFingerprintSha256": "c365467091719ed50ebaa908fde8dc10e44aa2976a91a4540a4f164c063109f8"
+    "source": "reports/real-smokes/html-slides-2026-08-31T22-50-17-228Z/report.json",
+    "sourceBytes": 17257,
+    "sourceSha256": "d32c9b35bd3c60193a0923244c2db69fcbc262af4fe8260d6646ca5e13992e21",
+    "implementationFingerprintSchemaVersion": 3,
+    "implementationFingerprintSha256": "56a56ce8379333b83081e2b85832969c4a968cfab18dbf4ce92fc0e28d5fd099",
+    "implementationFingerprintFileCount": 51
   },
   "execution": {
     "description": "The exact recording prompt executed through the production Anera bundle with live DeepSeek text and vision providers",
@@ -21,17 +22,19 @@
       "visionModel": "deepseek-v4-flash-vision-exp",
       "temperature": 0
     },
-    "activeDurationMs": 78112,
+    "activeDurationMs": 80528,
     "modelRequests": 10,
     "modelCalls": 10,
     "toolCalls": 10,
-    "promptTokens": 107797,
-    "completionTokens": 9419,
-    "cachedPromptTokens": 12800,
-    "estimatedCostUsd": 0.03741436,
+    "promptTokens": 128232,
+    "completionTokens": 10007,
+    "cachedPromptTokens": 14464,
+    "estimatedCostUsd": 0.041826070000000014,
     "estimatedCostStatus": "estimated"
   },
   "checks": {
+    "completed": true,
+    "canonicalWorkflowComplete": true,
     "exactPromptPreserved": true,
     "fullToolSequence": true,
     "researchBeforeArtifact": true,
@@ -48,15 +51,15 @@
     "boundedEfficiency": true
   },
   "artifact": {
-    "path": "ai-weekly-2026.html",
-    "bytes": 19172,
-    "sha256": "792011d694d39b33913d91e9a3a3da008586be8481f6ba7f9ee543a0fc3ff26b",
+    "path": "ai-weekly-slides.html",
+    "bytes": 20905,
+    "sha256": "e09054a47b19233b50ce50ad8c5e273a137124792c765b4dce16e4c2e81c2f09",
     "sourceUrlCount": 10
   },
   "screenshot": {
-    "path": "ai-weekly-2026.png",
-    "bytes": 286232,
-    "sha256": "3efd319bc00401cd6b632fc0b93d7891369c1b16d28ad2ad2b1e4ab0af6316ed"
+    "path": "ai-weekly-slides.png",
+    "bytes": 138131,
+    "sha256": "29767ce948772cc67a5d4305a70c04178093826e6187bafa75d018feaa7c4891"
   },
   "scope": {
     "arenaParityEvidence": false,

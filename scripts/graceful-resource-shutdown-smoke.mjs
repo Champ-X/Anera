@@ -30,20 +30,23 @@ const provider = createServer((request, response) => {
   providerRequests += 1
   if (providerRequests === 1) {
     completeToolCalls(response, [
-      toolCall(0, 'call_resource_index', 'create_file', {
+      toolCall(0, 'call_resource_index', 'write_file', {
         path: 'index.html',
         content: `<!doctype html><meta charset="utf-8"><title>Resource shutdown</title><h1>${websiteMarker}</h1>\n`,
       }),
-      toolCall(1, 'call_resource_package', 'create_file', {
+      toolCall(1, 'call_resource_package', 'write_file', {
         path: 'package.json',
-        content: `${JSON.stringify({ scripts: { start: `python3 -u -m http.server ${managedPort} --bind 127.0.0.1` } }, null, 2)}\n`,
+        content: `${JSON.stringify({ scripts: { start: `python3 -u -m http.server ${managedPort} --bind 0.0.0.0` } }, null, 2)}\n`,
       }),
     ], 120, 28)
     return
   }
   if (providerRequests === 2) {
-    completeToolCalls(response, [toolCall(0, 'call_resource_start', 'build_and_start', {
-      description: 'graceful resource shutdown fixture',
+    completeToolCalls(response, [toolCall(0, 'call_resource_start', 'start_process', {
+      name: 'Website',
+      command: `python3 -u -m http.server ${managedPort} --bind 0.0.0.0`,
+      cwd: '/home/user',
+      startup_wait: 5,
     })], 180, 18)
     return
   }
@@ -78,6 +81,8 @@ const child = spawn(process.execPath, [serverEntry], {
     ANERA_RUN_TIMEOUT_MS: '120000',
     ANERA_TOOL_TIMEOUT_MS: '30000',
     ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS: '120000',
+    NODE_ENV: 'test',
+    ANERA_TEST_LOOPBACK_DEEPSEEK_PROVIDER: 'true',
     DEEPSEEK_API_KEY: 'synthetic-graceful-resource-key',
     DEEPSEEK_BASE_URL: `http://127.0.0.1:${providerAddress.port}`,
     DEEPSEEK_MODEL: model,
@@ -136,7 +141,7 @@ try {
   const events = await restarted.events(sessionId)
   const durableProcess = state.processes.find((record) => record.id === processRecord.id)
   const stoppedEvents = events.filter((event) => event.type === 'process.stopped' && event.data?.record?.id === processRecord.id)
-  const failedWebsiteEvents = events.filter((event) => (
+  const websiteStopEvents = events.filter((event) => (
     event.type === 'website.updated'
     && event.data?.action === 'process_stopped'
     && event.data?.website?.processId === processRecord.id
@@ -170,14 +175,14 @@ try {
       processSignal: durableProcess?.signal,
       websiteStatus: state.website.status,
       stoppedEventCount: stoppedEvents.length,
-      failedWebsiteEventCount: failedWebsiteEvents.length,
+      websiteStopEventCount: websiteStopEvents.length,
       interruptedErrorCount: events.filter((event) => event.type === 'error' && event.data?.interrupted === true).length,
       finalCount: events.filter((event) => event.type === 'assistant.final').length,
       reviewCount: events.filter((event) => event.type === 'review.requested').length,
     },
   }
   report.passed = report.providerRequests === 4
-    && JSON.stringify(report.toolSequence) === JSON.stringify(['create_file', 'create_file', 'build_and_start', 'browser'])
+    && JSON.stringify(report.toolSequence) === JSON.stringify(['write_file', 'write_file', 'start_process', 'browser'])
     && report.preShutdown.sessionStatus === 'running'
     && report.preShutdown.websiteStatus === 'running'
     && report.preShutdown.websitePort === managedPort
@@ -193,9 +198,9 @@ try {
     && report.previewClosed
     && report.recovered.sessionStatus === 'interrupted'
     && report.recovered.processStatus === 'stopped'
-    && report.recovered.websiteStatus === 'failed'
+    && report.recovered.websiteStatus === 'asleep'
     && report.recovered.stoppedEventCount === 1
-    && report.recovered.failedWebsiteEventCount === 1
+    && report.recovered.websiteStopEventCount === 1
     && report.recovered.interruptedErrorCount === 1
     && report.recovered.finalCount === 0
     && report.recovered.reviewCount === 0
@@ -241,6 +246,7 @@ function completeToolCalls(response, calls, promptTokens, completionTokens) {
 
 async function waitForResources(origin, sessionId) {
   const deadline = Date.now() + 30_000
+  let lastObserved
   while (Date.now() < deadline) {
     const [snapshot, health] = await Promise.all([
       requestJson(`${origin}/api/sessions/${sessionId}`),
@@ -248,6 +254,14 @@ async function waitForResources(origin, sessionId) {
     ])
     const tools = snapshot.events?.filter((event) => event.type === 'tool.completed').map((event) => event.data?.call?.name) ?? []
     const visiblePartial = snapshot.events?.some((event) => event.type === 'assistant.final.delta' && String(event.data?.delta || '').startsWith(partialUnit))
+    lastObserved = {
+      status: snapshot.session?.status,
+      websiteStatus: snapshot.website?.status,
+      processStatuses: snapshot.processes?.map((record) => record.status),
+      browser: health.browser,
+      tools,
+      visiblePartial,
+    }
     if (
       providerRequests === 4
       && snapshot.session?.status === 'running'
@@ -255,7 +269,7 @@ async function waitForResources(origin, sessionId) {
       && snapshot.processes?.some((record) => record.status === 'running')
       && health.browser?.browserInstances === 1
       && health.browser?.sessionContexts === 1
-      && tools.includes('build_and_start')
+      && tools.includes('start_process')
       && tools.includes('browser')
       && visiblePartial
     ) return { snapshot, health }
@@ -264,7 +278,7 @@ async function waitForResources(origin, sessionId) {
     }
     await delay(25)
   }
-  throw new Error(`Timed out waiting for production resources; providerRequests=${providerRequests}`)
+  throw new Error(`Timed out waiting for production resources: ${JSON.stringify({ providerRequests, lastObserved })}`)
 }
 
 async function descendantProcesses(rootPid) {

@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { fingerprintProductionImplementation } from '../dist-server/eval/implementation-fingerprint.js'
 
 const projectRoot = resolve(process.cwd())
 const dataRoot = await mkdtemp(resolve(tmpdir(), 'anera-html-slides-canary-'))
@@ -64,6 +65,7 @@ try {
   const started = snapshot.events.filter((event) => event.type === 'tool.started')
   const completed = snapshot.events.filter((event) => event.type === 'tool.completed' && event.data.notExecuted !== true)
   const failed = snapshot.events.filter((event) => event.type === 'tool.failed')
+  const timedOut = snapshot.events.filter((event) => event.type === 'tool.timed_out')
   const completedCalls = completed.map((event) => event.data.call || {})
   const completedNames = completedCalls.map((call) => call.name)
   const successfulPresent = completed.find((event) => event.data.call?.name === 'present_file')
@@ -144,7 +146,9 @@ try {
     screenshotEvidencePath = resolve(evidenceDirectory, basename(screenshotPath))
     await writeFile(screenshotEvidencePath, screenshotBytes)
   }
-  const implementationFingerprint = await fingerprintCurrentImplementation(projectRoot)
+  const implementationFingerprint = await fingerprintProductionImplementation(projectRoot, {
+    verifierPaths: ['scripts/html-slides-task-smoke.mjs'],
+  })
   const report = {
     schemaVersion: 'anera-html-slides-live-canary/1.0',
     generatedAt,
@@ -171,12 +175,27 @@ try {
     toolSequence: started.map((event) => ({
       name: event.data.call?.name,
       action: event.data.call?.arguments?.action,
+      arguments: diagnosticToolArguments(event.data.call?.arguments),
       at: event.at,
       callId: event.callId,
     })),
     verificationRequiredCalls: snapshot.events
       .filter((event) => event.type === 'tool.completed' && event.data.notExecuted === true)
       .map((event) => ({ callId: event.callId, name: event.data.call?.name, reason: event.data.reason, result: event.data.result })),
+    toolFailures: failed.map((event) => ({
+      callId: event.callId,
+      name: event.data.call?.name,
+      arguments: diagnosticToolArguments(event.data.call?.arguments),
+      notExecuted: event.data.notExecuted === true,
+      reason: event.data.reason,
+      result: event.data.result,
+    })),
+    toolTimeouts: timedOut.map((event) => ({
+      callId: event.callId,
+      name: event.data.call?.name,
+      arguments: diagnosticToolArguments(event.data.call?.arguments),
+      result: event.data.result,
+    })),
     inspectionAttempts: completed
       .filter((event) => event.data.call?.name === 'inspect_image')
       .map((event) => ({
@@ -213,42 +232,22 @@ try {
   }
   const reportPath = resolve(evidenceDirectory, 'report.json')
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
-  process.stdout.write(`${JSON.stringify({ reportPath, passed: report.passed, sessionId: report.sessionId, usage: report.usage, checks: report.checks, artifact: report.artifact, screenshot: report.screenshot }, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify({
+    reportPath,
+    passed: report.passed,
+    sessionId: report.sessionId,
+    usage: report.usage,
+    checks: report.checks,
+    toolFailures: report.toolFailures,
+    toolTimeouts: report.toolTimeouts,
+    artifact: report.artifact,
+    screenshot: report.screenshot,
+  }, null, 2)}\n`)
   if (!report.passed) process.exitCode = 1
 } finally {
   await agent?.shutdown()
   if (server) await new Promise((resolveClose) => server.close(() => resolveClose()))
   await rm(dataRoot, { recursive: true, force: true })
-}
-
-async function fingerprintCurrentImplementation(root) {
-  const fixed = [
-    'package.json',
-    'package-lock.json',
-    'src/server/agent-service.ts',
-    'src/server/tools.ts',
-    'src/server/deepseek.ts',
-    'src/client/App.tsx',
-    'src/client/styles.css',
-    'dist-server/server/agent-service.js',
-    'dist-server/server/tools.js',
-    'dist-server/server/deepseek.js',
-    'dist-client/index.html',
-  ]
-  const clientAssets = (await readdir(resolve(root, 'dist-client/assets')))
-    .filter((name) => /\.(?:css|js|png)$/i.test(name))
-    .sort()
-    .map((name) => `dist-client/assets/${name}`)
-  const files = {}
-  for (const relativePath of [...fixed, ...clientAssets]) {
-    const content = await readFile(resolve(root, relativePath))
-    files[relativePath] = { bytes: content.byteLength, sha256: sha256(content) }
-  }
-  return {
-    schemaVersion: 1,
-    aggregateSha256: sha256(JSON.stringify(Object.entries(files))),
-    files,
-  }
 }
 
 function sha256(value) {
@@ -264,4 +263,13 @@ function normalizeWorkspacePath(value) {
     .replace(/^~\/?/, '')
     .replace(/^\.\//, '')
     .replace(/^\/+/, '')
+}
+
+function diagnosticToolArguments(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const argumentsCopy = { ...value }
+  if (typeof argumentsCopy.content === 'string') {
+    argumentsCopy.content = `[omitted ${Buffer.byteLength(argumentsCopy.content, 'utf8')} bytes]`
+  }
+  return argumentsCopy
 }

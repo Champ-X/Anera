@@ -54,7 +54,14 @@
 .showcase-eyebrow i { width: 48px; height: 1px; background: currentColor; }
 .hero-copy h1 { margin: 0; font: 500 clamp(57px, 6.2vw, 104px)/.9 var(--showcase-display); letter-spacing: -.066em; }
 .hero-lede { max-width: 550px; margin: 32px 0 0; color: #3e4d56; font-size: clamp(16px, 1.25vw, 20px); line-height: 1.75; letter-spacing: .01em; }
-.hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 40px; }
+.hero-attestation { max-width: 550px; min-height: 50px; display: grid; grid-template-columns: minmax(150px, 1fr) auto auto 14px; align-items: center; gap: 14px; margin-top: 25px; padding: 0 14px; border-top: 1px solid var(--showcase-ink); border-bottom: 1px solid var(--showcase-line); background: rgb(251 253 254 / 42%); }
+.hero-attestation > span { display: inline-flex; align-items: center; gap: 7px; color: #43535c; font: 700 9px/1 var(--showcase-mono); letter-spacing: .1em; text-transform: uppercase; }
+.hero-attestation > span i, .toc-attestation span i { width: 6px; height: 6px; border-radius: 50%; background: #27765c; box-shadow: 0 0 0 3px rgb(39 118 92 / 12%); }
+.hero-attestation strong { color: var(--showcase-cobalt); font: 700 12px/1 var(--showcase-mono); white-space: nowrap; }
+.hero-attestation code { color: #76858d; font: 600 10px/1 var(--showcase-mono); white-space: nowrap; }
+.hero-attestation > svg { color: var(--showcase-cobalt); }
+.hero-attestation:hover { border-bottom-color: var(--showcase-cobalt); background: var(--showcase-white); }
+.hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
 .hero-actions a { min-height: 46px; display: inline-flex; align-items: center; justify-content: center; gap: 9px; border-radius: 4px; padding: 0 18px; font-size: 13px; font-weight: 700; }
 .primary-action { background: var(--showcase-cobalt); color: white !important; box-shadow: 0 9px 24px rgb(37 84 216 / 18%); }
 .primary-action:hover { background: var(--showcase-cobalt-dark); transform: translateY(-1px); }
@@ -126,12 +133,26 @@
 .report-page { background: #f3f6f7; }
 .report-nav { position: relative; z-index: 3; width: calc(100% - 48px); }
 .report-layout { width: calc(100% - 48px); display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: clamp(48px, 5vw, 96px); margin: 0 auto; }
-.report-toc { position: sticky; top: 0; height: calc(100vh - 1px); display: flex; flex-direction: column; align-self: start; padding: 110px 0 32px; }
-.report-toc > span { margin-bottom: 32px; color: var(--showcase-cobalt); font: 700 15px/1 var(--showcase-mono); letter-spacing: .12em; text-transform: uppercase; }
-.report-toc nav { display: grid; gap: 3px; }
-.report-toc nav a { padding: 9px 0; color: #596a73; font: 600 22px/1.25 var(--showcase-mono); letter-spacing: -.025em; }
-.report-toc nav a:hover { color: var(--showcase-cobalt); transform: translateX(3px); }
-.toc-home { display: inline-flex; align-items: center; gap: 8px; margin-top: auto; color: var(--showcase-muted) !important; font-size: 15px; font-weight: 600; }
+.report-toc { position: sticky; top: 0; height: calc(100vh - 72px); display: flex; flex-direction: column; align-self: start; padding: 110px 0 24px; }
+.report-toc-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--showcase-cobalt); }
+.report-toc-heading span { font: 700 13px/1 var(--showcase-mono); letter-spacing: .12em; text-transform: uppercase; }
+.report-toc-heading b { font: 700 11px/1 var(--showcase-mono); }
+.report-progress { height: 2px; margin: 16px 0 27px; overflow: hidden; background: #d6e0e4; }
+.report-progress i { height: 100%; display: block; background: var(--showcase-cobalt); transition: width .12s linear; }
+.report-toc nav { display: grid; gap: 2px; }
+.report-toc nav a { position: relative; min-height: 39px; display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: center; padding: 5px 8px 5px 0; color: #596a73; }
+.report-toc nav a::before { content: ""; position: absolute; left: -13px; top: 8px; bottom: 8px; width: 2px; transform: scaleY(0); transform-origin: center; background: var(--showcase-cobalt); transition: transform .16s ease; }
+.report-toc nav a span { color: #85949b; font: 700 10px/1 var(--showcase-mono); }
+.report-toc nav a strong { font: 600 20px/1.15 var(--showcase-mono); letter-spacing: -.035em; }
+.report-toc nav a:hover, .report-toc nav a.active { color: var(--showcase-cobalt); }
+.report-toc nav a:hover span, .report-toc nav a.active span { color: var(--showcase-cobalt); }
+.report-toc nav a.active::before { transform: scaleY(1); }
+.toc-attestation { display: grid; grid-template-columns: 1fr auto; gap: 7px 10px; margin-top: auto; padding: 15px 16px; border: 1px solid var(--showcase-line); background: rgb(251 253 254 / 56%); }
+.toc-attestation span { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; color: #66767e; font: 700 9px/1 var(--showcase-mono); letter-spacing: .08em; text-transform: uppercase; }
+.toc-attestation strong { color: var(--showcase-cobalt); font: 600 15px/1 var(--showcase-mono); }
+.toc-attestation code { color: #7c8b92; font: 600 8px/1 var(--showcase-mono); }
+.toc-attestation:hover { border-color: var(--showcase-cobalt); background: var(--showcase-white); }
+.toc-home { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; color: var(--showcase-muted) !important; font-size: 15px; font-weight: 600; }
 .report-main { min-width: 0; padding-bottom: 100px; }
 .report-hero { min-height: 720px; display: flex; flex-direction: column; justify-content: center; padding: 80px 0; border-bottom: 1px solid var(--showcase-ink); }
 .report-hero h1 { margin: 0; font: 500 clamp(62px, 7.6vw, 118px)/.88 var(--showcase-display); letter-spacing: -.067em; }
@@ -457,14 +478,14 @@
 @media (prefers-reduced-motion: no-preference) {
   .landing-hero .hero-copy { animation: showcase-enter .65s cubic-bezier(.2,.75,.25,1) both; }
   .reverse-wordmark { animation: showcase-enter .75s .08s cubic-bezier(.2,.75,.25,1) both; }
-  .reverse-tracks path { animation: reverse-dash 12s linear infinite; }
+  .reverse-tracks { animation: reverse-track-reveal .85s .3s cubic-bezier(.2,.75,.25,1) both; }
   .case-row, .primary-action, .secondary-action { transition: .18s ease; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .showcase-site { scroll-behavior: auto; }
-  .reverse-tracks path { animation: none; }
+  .reverse-tracks { animation: none; }
 }
 
 @keyframes showcase-enter { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
-@keyframes reverse-dash { to { stroke-dashoffset: -120; } }
+@keyframes reverse-track-reveal { from { opacity: 0; clip-path: inset(0 50% 0 50%); } to { opacity: 1; clip-path: inset(0); } }

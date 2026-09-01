@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
+
 const base = process.env.ANERA_SMOKE_BASE || 'http://127.0.0.1:4174'
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'interrupted'])
 
@@ -62,7 +65,7 @@ async function readDeployment(url) {
 const createResponse = await fetch(`${base}/api/sessions`, { method: 'POST' })
 if (!createResponse.ok) throw new Error(`create session failed: ${createResponse.status}`)
 const { session } = await createResponse.json()
-const firstPrompt = 'In the empty workspace create a dependency-free index.html whose title and visible h1 are both exactly ANERA-DEPLOY-SMOKE-V1. Use create_file, then call deploy_project exactly once with empty arguments. Wait for approval and do not use Bash, an external hosting service, GitHub, curl, or http_request. After deploy_project succeeds, finish with a concise report; the test harness will verify the deployment URL.'
+const firstPrompt = 'In the empty workspace create a dependency-free index.html whose title and visible h1 are both exactly ANERA-DEPLOY-SMOKE-V1. Use write_file, then call deploy_project exactly once with empty arguments. Wait for approval and do not use Bash, an external hosting service, GitHub, curl, or http_request. After deploy_project succeeds, finish with a concise report; the test harness will verify the deployment URL.'
 const beforeFirst = await snapshot(session.id)
 const firstTurn = await submit(session.id, firstPrompt)
 const firstDeadline = Date.now() + 180_000
@@ -80,7 +83,7 @@ if (!firstPage.body.includes('ANERA-DEPLOY-SMOKE-V1') || firstPage.body.includes
 }
 
 const beforeSecondSeq = firstSnapshot.events.at(-1)?.seq || 0
-const secondPrompt = 'In the same workspace edit only the title and visible h1 marker in index.html from ANERA-DEPLOY-SMOKE-V1 to ANERA-DEPLOY-SMOKE-V2. Use edit_file, then call deploy_project exactly once with empty arguments to update the same deployment. Wait for approval and do not use Bash, an external hosting service, GitHub, curl, or http_request. After deploy_project succeeds, finish with a concise report; the test harness will verify the URL and content.'
+const secondPrompt = 'In the same workspace use edit_file exactly twice: first replace old_text "  <title>ANERA-DEPLOY-SMOKE-V1</title>" with new_text "  <title>ANERA-DEPLOY-SMOKE-V2</title>", then replace old_text "  <h1>ANERA-DEPLOY-SMOKE-V1</h1>" with new_text "  <h1>ANERA-DEPLOY-SMOKE-V2</h1>". These exact bytes come from your prior write, so do not call read_file or write_file. Then call deploy_project exactly once with empty arguments to update the same deployment. Wait for approval and do not use Bash, an external hosting service, GitHub, curl, or http_request. After deploy_project succeeds, finish with a concise report; the test harness will verify the URL and content.'
 const secondTurn = await submit(session.id, secondPrompt)
 const secondDeadline = Date.now() + 180_000
 const secondApproval = await waitForApproval(session.id, beforeSecondSeq, secondDeadline)
@@ -107,6 +110,17 @@ if (deployStarts.length !== 2 || deploySuccesses.length !== 2 || deployFailures.
   throw new Error(`unexpected deploy tool lifecycle: ${JSON.stringify({ starts: deployStarts.length, successes: deploySuccesses.length, failures: deployFailures.length })}`)
 }
 if (deploySuccesses.some((event) => event.data?.result !== '{"status":"success"}')) throw new Error('deploy_project did not return the exact Arena success shape')
+const startedTools = secondSnapshot.events
+  .filter((event) => event.type === 'tool.started')
+  .map((event) => event.data?.call?.name)
+const failedTools = secondSnapshot.events
+  .filter((event) => ['tool.failed', 'tool.timed_out'].includes(event.type))
+  .map((event) => event.data?.call?.name)
+const expectedTools = ['write_file', 'deploy_project', 'edit_file', 'edit_file', 'deploy_project']
+if (JSON.stringify(startedTools) !== JSON.stringify(expectedTools)) {
+  throw new Error(`deploy smoke did not use the minimal active sequence: ${JSON.stringify(startedTools)}`)
+}
+if (failedTools.length !== 0) throw new Error(`deploy smoke had failed tools: ${JSON.stringify(failedTools)}`)
 const approvalRequired = secondSnapshot.events.filter((event) => event.type === 'approval.required' && event.data?.call?.name === 'deploy_project')
 const approvalResolved = secondSnapshot.events.filter((event) => event.type === 'approval.resolved' && event.data?.approved === true)
 if (approvalRequired.length !== 2 || approvalResolved.length !== 2) throw new Error('both deploy calls were not approved through the visible approval lifecycle')
@@ -123,7 +137,9 @@ for (const action of ['building', 'deploying', 'deployed', 'redeployed']) {
 }
 if (new Set(canonicalDeployment.map((event) => event.deployment?.id).filter(Boolean)).size !== 1) throw new Error('canonical deployment identity is not stable')
 
-console.log(JSON.stringify({
+const report = {
+  schemaVersion: 'anera-deploy-smoke/1.0',
+  runAt: new Date().toISOString(),
   sessionId: session.id,
   status: secondSnapshot.session.status,
   visibility: secondDeployment.visibility,
@@ -137,6 +153,8 @@ console.log(JSON.stringify({
   contentHashesChanged: firstDeployment.contentHash !== secondDeployment.contentHash,
   approvals: approvalResolved.length,
   deployToolCalls: deployStarts.length,
+  tools: startedTools,
+  failedTools,
   canonicalDeploymentEvents: canonicalDeployment.length,
   durationMs: secondSnapshot.session.usage.durationMs,
   activeDurationMs: secondSnapshot.session.usage.activeDurationMs,
@@ -145,4 +163,9 @@ console.log(JSON.stringify({
   totalTokens: secondSnapshot.session.usage.totalTokens,
   cachedPromptTokens: secondSnapshot.session.usage.cachedPromptTokens,
   estimatedCostUsd: secondSnapshot.session.usage.estimatedCostUsd,
-}, null, 2))
+  passed: true,
+}
+await mkdir(resolve('reports', 'real-smokes'), { recursive: true })
+const reportPath = resolve('reports', 'real-smokes', `deploy-${session.id}.json`)
+await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+console.log(JSON.stringify({ ...report, reportPath }, null, 2))

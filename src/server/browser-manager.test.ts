@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BrowserManager } from './browser-manager.js'
 
 const managers: BrowserManager[] = []
@@ -41,8 +41,13 @@ describe('browser manager', () => {
     expect(scrolled.scrollY).toBeGreaterThan(0)
     const resized = await manager.setViewport('session', 375, 700)
     expect(resized.viewport).toEqual({ width: 375, height: 700 })
+    const screenshot = await manager.screenshot('session')
+    expect({
+      width: screenshot.readUInt32BE(16),
+      height: screenshot.readUInt32BE(20),
+    }).toEqual({ width: 375, height: 700 })
     expect(manager.logs('session').some((entry) => entry.text === 'CLICK_OK')).toBe(true)
-  })
+  }, 15_000)
 
   it('projects visually rendered text by excluding transparent content and including CSS generated status', async () => {
     const manager = new BrowserManager()
@@ -211,6 +216,50 @@ describe('browser manager', () => {
     await waitFor(() => manager.diagnostics().browserInstances === 0 && manager.diagnostics().sessionContexts === 0)
     expect((await manager.snapshot('two')).title).toBe('Session Two')
     expect(manager.diagnostics()).toEqual({ browserInstances: 1, sessionContexts: 1, pendingSessionContexts: 0 })
+  })
+
+  it('closes the Browser transport before Context drain and rejects work throughout idempotent shutdown', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    await manager.open('existing', 'data:text/html,<title>Existing</title>')
+    const internal = manager as unknown as {
+      sessions: Map<string, { context: { close(): Promise<void> } }>
+      browser?: { close(): Promise<void> }
+    }
+    const context = internal.sessions.get('existing')?.context
+    const browser = internal.browser
+    expect(context).toBeTruthy()
+    expect(browser).toBeTruthy()
+    const originalClose = context?.close.bind(context)
+    const originalBrowserClose = browser?.close.bind(browser)
+    const closeOrder: string[] = []
+    vi.spyOn(context as { close(): Promise<void> }, 'close').mockImplementationOnce(async () => {
+      closeOrder.push('context')
+      await originalClose?.()
+    })
+    let signalBrowserCloseStarted = () => {}
+    const browserCloseStarted = new Promise<void>((resolveStarted) => { signalBrowserCloseStarted = resolveStarted })
+    let releaseBrowserClose = () => {}
+    const browserCloseGate = new Promise<void>((resolveClose) => { releaseBrowserClose = resolveClose })
+    vi.spyOn(browser as { close(): Promise<void> }, 'close').mockImplementationOnce(async () => {
+      closeOrder.push('browser')
+      signalBrowserCloseStarted()
+      await browserCloseGate
+      await originalBrowserClose?.()
+    })
+
+    const firstShutdown = manager.shutdown()
+    const secondShutdown = manager.shutdown()
+    await browserCloseStarted
+    await expect(manager.open('late', 'data:text/html,<title>Late</title>')).rejects.toThrow('Browser manager is shutting down')
+    await expect(manager.snapshot('late')).rejects.toThrow('Browser manager is shutting down')
+    expect(closeOrder).toEqual(['browser'])
+
+    releaseBrowserClose()
+    await Promise.all([firstShutdown, secondShutdown])
+    expect(closeOrder).toEqual(['browser', 'context'])
+    expect(manager.diagnostics()).toEqual({ browserInstances: 0, sessionContexts: 0, pendingSessionContexts: 0 })
+    await expect(manager.open('after', 'data:text/html,<title>After</title>')).rejects.toThrow('Browser manager is shutting down')
   })
 })
 

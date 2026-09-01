@@ -21,6 +21,7 @@ import {
   estimateSystemPromptSurfaceTokens,
   estimateToolSurfaceTokens,
   explicitDeliverableCompletionGap,
+  singleArtifactPresentationCompletionGap,
   exactAtomicFinalAlreadySatisfied,
   exactFinalOutputRequest,
   executeToolBatch,
@@ -35,6 +36,7 @@ import {
   normalizeLegacyArenaCompactionMessages,
   normalizeModelToolCallIds,
   officePresentVerificationGap,
+  pdfPresentVerificationGap,
   parseExactFinalFormatterResult,
   projectArenaCompactionCheckpoint,
   projectArenaCustomFeedbackMessageForModel,
@@ -45,6 +47,8 @@ import {
   webResearchArtifactCitationGap,
   webResearchArtifactPresentVerificationGap,
   webResearchCitationGap,
+  visualArtifactDefectRepairPhase,
+  visualResearchHtmlWriteVerificationGap,
   visualWebArtifactCompletionGap,
 } from './agent-service.js'
 import { assertArenaPublicToolResult } from './arena-tool-result.js'
@@ -99,6 +103,41 @@ describe('web research citation integrity', () => {
     },
   ]
 
+  it('does not reinterpret code-like temporal markers as a Web-research request', () => {
+    const localVerification: ModelMessage[] = [{
+      role: 'user',
+      content: [
+        'Write and verify a local file containing PRESSURE-CURRENT-593.',
+        'Do not use the Web, then finish with a short verification report.',
+      ].join('\n'),
+    }]
+    expect(webResearchCitationGap(localVerification, 'The local verification is complete.')).toBeUndefined()
+  })
+
+  it('does not impose a Web URL ledger on explicitly local attachment citations', async () => {
+    const attachmentOnlyPrompts = [
+      'Create a source-backed comparison from only the attached proposals. Cite each PDF filename and page. Do not browse the web.',
+      'State the current incident status using only the two attached sources. Cite the exact source filename. Do not use Bash or the web.',
+      '仅使用上传的两份 PDF 完成调研式对比，引用文件名和页码，不要联网搜索。',
+    ]
+    for (const content of attachmentOnlyPrompts) {
+      const messages: ModelMessage[] = [{ role: 'user', content }]
+      expect(webResearchCitationGap(messages, 'The local evidence memo is complete.')).toBeUndefined()
+      expect(webResearchArtifactCitationGap(messages, 'Sources: proposal.pdf p.1')).toBeUndefined()
+    }
+
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-local-citation-artifact-'))
+    try {
+      await writeFile(resolve(root, 'memo.md'), 'Source: proposal.pdf p.1', 'utf8')
+      await expect(webResearchArtifactPresentVerificationGap(root, [{
+        role: 'user',
+        content: 'Use only the attachments and cite exact filenames and pages. Do not browse the web.',
+      }], 'memo.md')).resolves.toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('requires one retrieved source URL and rejects citation URLs absent from the evidence ledger', () => {
     expect(webResearchCitationGap(evidenceMessages, 'The current protocol is documented in the primary source.')).toEqual({
       sourceUrls: ['https://standards.example/protocol', 'https://docs.example/guide'],
@@ -116,6 +155,21 @@ describe('web research citation integrity', () => {
     expect(webResearchCitationGap(
       evidenceMessages,
       'The protocol is current [1](https://standards.example/protocol#section).',
+    )).toBeUndefined()
+  })
+
+  it('rejects only the first strict research HTML write that contains no source URL', () => {
+    expect(visualResearchHtmlWriteVerificationGap(
+      evidenceMessages,
+      '<!doctype html><html><body><p>Sources: Primary and Secondary.</p></body></html>',
+    )).toContain('https://standards.example/protocol')
+    expect(visualResearchHtmlWriteVerificationGap(
+      evidenceMessages,
+      '<!doctype html><html><body><a href="https://standards.example/protocol">Primary</a></body></html>',
+    )).toBeUndefined()
+    expect(visualResearchHtmlWriteVerificationGap(
+      evidenceMessages,
+      '<!doctype html><html><body><a href="https://invented.example/post">Candidate</a></body></html>',
     )).toBeUndefined()
   })
 
@@ -1418,11 +1472,18 @@ describe('agent context preparation', () => {
     expect(officePrompt).toContain('With PptxGenJS, pass each table row as an array of cells')
     expect(officePrompt).toContain('one series containing the full labels and values arrays')
     expect(officePrompt).toContain('PptxGenJS chart hard rule')
+    expect(officePrompt).toContain('For object records, never call row.map')
+    expect(officePrompt).toContain('Apply the same object-to-column projection to every table')
+    expect(officePrompt).toContain('The second argument to every addChart call must be an array of series objects')
+    expect(officePrompt).toContain('must never be a raw number array such as chart.values')
+    expect(officePrompt).toContain('do not call addChart(type, SPEC.chart.values, options)')
     expect(officePrompt).toContain('ExcelJS formula and currency hard rule')
     expect(officePrompt).toContain('{ formula: "C2-D2", result: 9000 }')
     expect(officePrompt).toContain('plain #,##0 or #,##0.00 is not currency formatting')
     expect(officePrompt).toContain('cell.value is the formula object, not the cached number')
     expect(officePrompt).toContain('Put each labeled summary metric on one row')
+    expect(officePrompt).toContain('use const row = 3 + index exactly')
+    expect(officePrompt).toContain('Never use index * 2, separate labelRow/valueRow variables')
     expect(officePrompt).toContain('DOCX semantic hard rule')
     expect(officePrompt).toContain('heading: HeadingLevel.TITLE')
     expect(officePrompt).toContain('PageNumber.CURRENT')
@@ -1450,6 +1511,11 @@ describe('agent context preparation', () => {
     expect(pdfPrompt).toContain('embed StandardFonts once from the PDFDocument')
     expect(pdfPrompt).toContain('PDFPage has no public page.doc.getFont API')
     expect(pdfPrompt).toContain('defining a helper does not render it')
+    expect(pdfPrompt).toContain('Every named section title is separate visible content')
+    expect(pdfPrompt).toContain('Specification presence is not render coverage')
+    expect(pdfPrompt).toContain('record every string it actually draws in a per-page Set')
+    expect(pdfPrompt).toContain('Every page renderer must also draw at least one meaningful non-bleed vector shape')
+    expect(pdfPrompt).toContain('a pure-text page or only a full-page bleeding background does not satisfy')
     expect(pdfPrompt).toContain('precompute every cumulative x position')
     expect(pdfPrompt).toContain('assert that every required per-page string is present')
     expect(pdfPrompt).toContain('Never extract an unchanged PDF twice')
@@ -1470,6 +1536,19 @@ describe('agent context preparation', () => {
     expect(convergedPrompt).toContain('do not use Bash, list_files, glob_files, or grep_files to rediscover or inventory uploads')
     expect(convergedPrompt).toContain('hard tool-policy constraint')
     expect(systemPromptForTools(routed)).not.toContain('Attachment paths in the trusted trailing system block are authoritative')
+  })
+
+  it('projects exact calculation and implementation invariants under convergence rules', () => {
+    const routed = selectAgentToolDefinitions(routingState([{
+      role: 'user',
+      content: 'Implement integer-cent pricing and run the existing tests, then analyze the attached CSV.',
+    }]))
+    const convergedPrompt = systemPromptForTools(routed, { includeHarnessConvergence: true })
+    expect(convergedPrompt).toContain('do not hardcode guessed result totals in assertions')
+    expect(convergedPrompt).toContain('Assert derived invariants instead')
+    expect(convergedPrompt).toContain('Public tests are only a lower bound on the requested contract')
+    expect(convergedPrompt).toContain('including integer cents')
+    expect(convergedPrompt).toContain('Number.isInteger on that exact field')
   })
 
   it('reads trusted text uploads directly without Bash discovery under convergence rules', () => {
@@ -1560,6 +1639,45 @@ describe('agent context preparation', () => {
       content: 'Row 3: A3="Total Budget" | B3="540000" [formula: \'Department Data\'!C5]\nRow 4: A4="Total Actual" | B4="534000" [formula: \'Department Data\'!D5]',
     }
     expect(officePresentVerificationGap([xlsxRequest, xlsxCall, alignedRows], 'plan.xlsx')).toBeUndefined()
+  })
+
+  it('blocks PDF presentation when the latest independent parse omits requested visible text', () => {
+    const request: ModelMessage = {
+      role: 'user',
+      content: [
+        'Create and present report.pdf.',
+        'Set PDF metadata exactly: Title "Board Brief", Author "Anera Agent".',
+        'Page 1 must contain title "Board Brief" and add a "Release Conditions" section.',
+        'Both pages must contain footer "CONFIDENTIAL" and page numbers "Page 1 of 2" and "Page 2 of 2".',
+      ].join('\n'),
+    }
+    const generation: ModelMessage[] = [{
+      role: 'assistant', content: null,
+      tool_calls: [{ id: 'write_pdf_generator', type: 'function', function: { name: 'write_file', arguments: '{"path":"generate.mjs","content":"generator"}' } }],
+    }, {
+      role: 'tool', tool_call_id: 'write_pdf_generator', tool_result_status: 'succeeded', content: '{"status":"success"}',
+    }, {
+      role: 'assistant', content: null,
+      tool_calls: [{ id: 'run_pdf_generator', type: 'function', function: { name: 'bash', arguments: '{"command":"node generate.mjs"}' } }],
+    }, {
+      role: 'tool', tool_call_id: 'run_pdf_generator', tool_result_status: 'succeeded', content: '{"status":"completed","exit_code":0}',
+    }]
+    const extractCall: ModelMessage = {
+      role: 'assistant', content: null,
+      tool_calls: [{ id: 'extract_pdf', type: 'function', function: { name: 'extract_attachment', arguments: '{"path":"report.pdf"}' } }],
+    }
+    const incomplete: ModelMessage = {
+      role: 'tool', tool_call_id: 'extract_pdf', tool_result_status: 'succeeded',
+      content: '--- PDF page 1 of 2 ---\nBoard Brief\nCONFIDENTIAL\nPage 1 of 2\n\n--- PDF page 2 of 2 ---\nCONFIDENTIAL\nPage 2 of 2',
+    }
+    expect(pdfPresentVerificationGap([request, ...generation, extractCall, incomplete], 'report.pdf'))
+      .toContain('"Release Conditions"')
+    expect(pdfPresentVerificationGap([request, ...generation, extractCall, {
+      ...incomplete,
+      content: `${incomplete.content}\nRelease Conditions`,
+    }], '/home/user/report.pdf')).toBeUndefined()
+    expect(pdfPresentVerificationGap([request, ...generation], 'report.pdf')).toContain('Run extract_attachment')
+    expect(pdfPresentVerificationGap([request, ...generation, extractCall, incomplete], 'notes.md')).toBeUndefined()
   })
 
   it('blocks full-document synthesis until continuations are consumed and incorporated', () => {
@@ -1893,11 +2011,17 @@ describe('agent context preparation', () => {
     expect(visualWebArtifactCompletionGap([
       request, ...research, ...write, ...preview, ...open, ...escape, ...screenshot, ...inspect, ...present,
     ])).toMatchObject({ missingPhases: expect.arrayContaining(['navigation_check']) })
-    const clickWithoutRef = step('next-click-no-ref', 'browser', { action: 'click', text: 'Next' }, JSON.stringify({
+    const clickByText = step('next-click-by-text', 'browser', { action: 'click', text: 'Next' }, JSON.stringify({
       url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
     }))
     expect(visualWebArtifactCompletionGap([
-      request, ...research, ...write, ...preview, ...open, ...clickWithoutRef, ...screenshot, ...inspect, ...present,
+      request, ...research, ...write, ...preview, ...open, ...clickByText, ...screenshot, ...inspect, ...present,
+    ])).toBeUndefined()
+    const clickWithoutTarget = step('next-click-no-target', 'browser', { action: 'click' }, JSON.stringify({
+      url: `${canonicalBrowserUrl}#slide-2`, text: '2 / 6',
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...open, ...clickWithoutTarget, ...screenshot, ...inspect, ...present,
     ])).toMatchObject({ missingPhases: expect.arrayContaining(['navigation_check']) })
     const unchangedClick = step('next-click-unchanged', 'browser', { action: 'click', ref: 'e12' }, JSON.stringify({
       url: canonicalBrowserUrl,
@@ -1911,6 +2035,23 @@ describe('agent context preparation', () => {
     expect(visualWebArtifactCompletionGap([
       request, ...research, ...write, ...preview, ...open, ...validClick, ...screenshot, ...inspect, ...present,
     ])).toBeUndefined()
+    const directWebsiteUrl = 'http://localhost:8000/ai-week.html'
+    const directOpen = step('open-direct-website', 'browser', { action: 'open', path: directWebsiteUrl }, JSON.stringify({
+      url: directWebsiteUrl, text: '1 / 6',
+    }))
+    const directNavigate = step('next-direct-website', 'browser', { action: 'click', ref: 'e12' }, JSON.stringify({
+      url: `${directWebsiteUrl}#slide-2`, text: '2 / 6',
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...directOpen, ...directNavigate, ...screenshot, ...inspect, ...present,
+    ])).toBeUndefined()
+    const directDecoyUrl = 'http://localhost:8000/decoy.html'
+    const directDecoyOpen = step('open-direct-decoy', 'browser', { action: 'open', path: directDecoyUrl }, JSON.stringify({
+      url: directDecoyUrl, text: '1 / 6',
+    }))
+    expect(visualWebArtifactCompletionGap([
+      request, ...research, ...write, ...preview, ...directDecoyOpen, ...directNavigate, ...screenshot, ...inspect, ...present,
+    ])).toMatchObject({ missingPhases: expect.arrayContaining(browserPhases) })
     const navigationAway = step('next-away', 'browser', { action: 'click', text: 'Other deck' }, JSON.stringify({ url: decoyBrowserUrl }))
     expect(visualWebArtifactCompletionGap([
       request, ...research, ...write, ...preview, ...open, ...navigate, ...navigationAway, ...screenshot, ...inspect, ...present,
@@ -1962,6 +2103,101 @@ describe('agent context preparation', () => {
       canonicalPath: 'ai-week.html',
       missingPhases: expect.arrayContaining(['navigation_check', 'browser_screenshot', 'visual_inspection', 'present_file']),
     })
+  })
+
+  it('opens one canonical diagnostic read only for a concrete Browser screenshot defect', () => {
+    const step = (
+      id: string,
+      name: string,
+      args: Record<string, unknown>,
+      content: string,
+      status: 'succeeded' | 'failed' = 'succeeded',
+    ): ModelMessage[] => [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }],
+    }, {
+      role: 'tool',
+      tool_call_id: id,
+      tool_result_status: status,
+      content,
+    }]
+    const request: ModelMessage = {
+      role: 'user',
+      content: 'Recreate the screenshot as one self-contained HTML dashboard named recreated-dashboard.html.',
+    }
+    const write = step('write-dashboard', 'write_file', {
+      path: 'recreated-dashboard.html',
+      content: '<!doctype html><html><body><main>Dashboard</main></body></html>',
+    }, '{"status":"success"}')
+    const open = step('open-dashboard', 'browser', {
+      action: 'open', path: 'recreated-dashboard.html', width: 1200, height: 800,
+    }, JSON.stringify({
+      url: 'http://127.0.0.1:49123/workspace/ses_fixture/preview/recreated-dashboard.html',
+    }))
+    const screenshot = step('shot-dashboard', 'browser', {
+      action: 'screenshot', screenshot_path: 'dashboard-check.png',
+    }, 'Saved browser screenshot to dashboard-check.png (123 bytes).')
+    const defect = step('inspect-dashboard-defect', 'inspect_image', {
+      path: 'dashboard-check.png',
+      prompt: 'Return exactly NO DEFECTS or at most three concrete defects.',
+    }, 'Visual inspection:\nThe recent incidents section is clipped at the bottom edge.')
+    const messages = [request, ...write, ...open, ...screenshot, ...defect]
+
+    expect(visualArtifactDefectRepairPhase(messages, 'recreated-dashboard.html')).toBe('read')
+
+    const skippedRead = step('skipped-dashboard-read', 'read_file', {
+      path: 'recreated-dashboard.html',
+    }, JSON.stringify({
+      status: 'success', notExecuted: true, reason: 'canonical_artifact_already_known',
+    }))
+    expect(visualArtifactDefectRepairPhase(
+      [...messages, ...skippedRead],
+      'recreated-dashboard.html',
+    )).toBe('read')
+
+    const executedRead = step('read-dashboard', 'read_file', {
+      path: 'recreated-dashboard.html',
+    }, JSON.stringify({
+      status: 'success', kind: 'text', content: '<main>Dashboard</main>', hasMore: false,
+    }))
+    expect(visualArtifactDefectRepairPhase(
+      [...messages, ...executedRead],
+      'recreated-dashboard.html',
+    )).toBe('edit')
+
+    const failedEdit = step('failed-dashboard-edit', 'edit_file', {
+      path: 'recreated-dashboard.html', old_text: '.missing', new_text: '.fixed',
+    }, '{"status":"error","message":"Context not found. Read the file to verify the text exists."}', 'failed')
+    expect(visualArtifactDefectRepairPhase(
+      [...messages, ...executedRead, ...failedEdit],
+      'recreated-dashboard.html',
+    )).toBe('edit')
+
+    const repaired = step('edit-dashboard', 'edit_file', {
+      path: 'recreated-dashboard.html', old_text: '<main>', new_text: '<main class="repaired">',
+    }, '{"status":"success"}')
+    expect(visualArtifactDefectRepairPhase(
+      [...messages, ...executedRead, ...repaired],
+      'recreated-dashboard.html',
+    )).toBeUndefined()
+
+    const passingInspection = step('inspect-dashboard-pass', 'inspect_image', {
+      path: 'dashboard-check.png',
+      prompt: 'Return exactly NO DEFECTS or at most three concrete defects.',
+    }, 'Visual inspection:\nNO DEFECTS')
+    expect(visualArtifactDefectRepairPhase(
+      [request, ...write, ...open, ...screenshot, ...passingInspection],
+      'recreated-dashboard.html',
+    )).toBeUndefined()
+
+    const descriptiveInspection = step('inspect-dashboard-description', 'inspect_image', {
+      path: 'dashboard-check.png', prompt: 'Describe the layout and colors.',
+    }, 'Visual inspection:\nThe lower panel is clipped at the edge.')
+    expect(visualArtifactDefectRepairPhase(
+      [request, ...write, ...open, ...screenshot, ...descriptiveInspection],
+      'recreated-dashboard.html',
+    )).toBeUndefined()
   })
 
   it('closes the tool surface after a visual HTML workflow passes and forces the next response to be Final', async () => {
@@ -2023,8 +2259,8 @@ describe('agent context preparation', () => {
           expect(names).not.toContain('write_file')
           expect(names).not.toContain('present_file')
         }
-        if (['visual-read-repair', 'visual-read-source-repair'].includes(call.id)) expect(names).toEqual(['read_file'])
-        if (['visual-edit-repair', 'visual-edit-source-repair'].includes(call.id)) expect(names).toEqual(['edit_file'])
+        if (['visual-read-repair', 'visual-read-source-repair'].includes(call.id)) expect(names, call.id).toEqual(['read_file'])
+        if (['visual-edit-repair', 'visual-edit-source-repair'].includes(call.id)) expect(names, call.id).toEqual(['edit_file'])
         if (call.id === 'visual-present') expect(names).toEqual(['present_file'])
         return {
           content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
@@ -2048,6 +2284,10 @@ describe('agent context preparation', () => {
       }
     })
     const execute = vi.fn(async (call: { id: string; name: string; arguments: Record<string, unknown> }) => {
+      if (call.name === 'inspect_image') {
+        expect(call.arguments.prompt).toContain('Browser snapshots are authoritative for exact text and control state')
+        expect(call.arguments.prompt).toContain('do not infer semantic mismatches between pagination dots')
+      }
       if (call.id === 'visual-search-empty') return {
         content: JSON.stringify({ status: 'success', results: [] }),
         isError: false,
@@ -2065,19 +2305,9 @@ describe('agent context preparation', () => {
         return { content: '{"status":"success"}', isError: false }
       }
       if (call.name === 'browser' && call.arguments.action === 'screenshot') {
-        await store.update(session.summary.id, (state) => {
-          if (state.artifacts.some((artifact) => artifact.path === 'ai-week.png')) return
-          state.artifacts.push({
-            id: 'visual-shot-artifact',
-            sessionId: session.summary.id,
-            path: 'ai-week.png',
-            name: 'ai-week.png',
-            kind: 'image',
-            mime: 'image/png',
-            createdAt: '2026-08-31T00:00:00.000Z',
-            downloadUrl: `/api/sessions/${session.summary.id}/download?path=ai-week.png`,
-          })
-        })
+        // Deliberately omit the Artifact projection. The durable successful
+        // screenshot result already advances the strict visual phase and must
+        // make inspect_image available without a transient projection race.
         return { content: '{"status":"success","path":"ai-week.png"}', isError: false }
       }
       if (call.name === 'browser' && call.arguments.action === 'open') return {
@@ -2139,6 +2369,163 @@ describe('agent context preparation', () => {
     }
   }, 10_000)
 
+  it('recovers a generic visual page stop directly to presentation without entering the Slides defect-repair lane', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-generic-visual-present-'))
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const task = 'Build one self-contained desktop HTML page. Save it once as visual-convergence.html, start a live preview, open it with browser, save one screenshot to evidence/browser-visual.png, inspect that screenshot, present visual-convergence.html, and finish.'
+    const calls = [
+      { id: 'generic-write', name: 'write_file', arguments: { path: 'visual-convergence.html', content: '<!doctype html><html><head><title>Marker</title></head><body><main>Blue marker</main></body></html>' } },
+      { id: 'generic-preview', name: 'start_process', arguments: { command: 'python3 -m http.server 8000' } },
+      { id: 'generic-open', name: 'browser', arguments: { action: 'open', path: 'visual-convergence.html' } },
+      { id: 'generic-shot', name: 'browser', arguments: { action: 'screenshot', screenshot_path: 'evidence/browser-visual.png' } },
+      { id: 'generic-inspect', name: 'inspect_image', arguments: { path: 'evidence/browser-visual.png', prompt: 'Describe the marker and whether it is centered.' } },
+    ]
+    let modelCall = 0
+    let callCursor = 0
+    const stream = vi.fn(async (options: {
+      messages: ModelMessage[]
+      tools: ToolDefinition[]
+      onContent: (delta: string) => void
+    }) => {
+      modelCall += 1
+      const call = calls[callCursor]
+      if (call) {
+        callCursor += 1
+        return {
+          content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
+          toolCalls: [{
+            id: call.id,
+            type: 'function' as const,
+            function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+          }],
+          usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 0 },
+          modelCallCount: 1,
+        }
+      }
+      if (modelCall === 6) {
+        const premature = 'The inspected page is ready.'
+        options.onContent(premature)
+        return {
+          content: premature, reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+          usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13, cachedPromptTokens: 0 },
+          modelCallCount: 1,
+        }
+      }
+      if (modelCall === 7) {
+        const names = options.tools.map((tool) => tool.function.name)
+        expect(names).toContain('present_file')
+        expect(names).not.toContain('read_file')
+        expect(options.messages.some((message) => (
+          message.role === 'user'
+          && typeof message.content === 'string'
+          && message.content.includes('has not passed presentation/verification yet')
+        ))).toBe(true)
+        return {
+          content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
+          toolCalls: [{
+            id: 'generic-present',
+            type: 'function' as const,
+            function: { name: 'present_file', arguments: '{"path":"visual-convergence.html"}' },
+          }],
+          usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 0 },
+          modelCallCount: 1,
+        }
+      }
+      const final = 'The verified visual page has been presented.'
+      options.onContent(final)
+      return {
+        content: final, reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+        usage: { promptTokens: 10, completionTokens: 4, totalTokens: 14, cachedPromptTokens: 0 },
+        modelCallCount: 1,
+      }
+    })
+    const execute = vi.fn(async (call: { id: string; name: string; arguments: Record<string, unknown> }) => {
+      if (call.name === 'write_file') {
+        const path = String(call.arguments.path)
+        await writeFile(resolve(store.workspaceDir(session.summary.id), path), String(call.arguments.content), 'utf8')
+        await store.update(session.summary.id, (state) => {
+          state.artifacts.push({
+            id: 'generic-html-artifact',
+            sessionId: session.summary.id,
+            path,
+            name: path,
+            kind: 'html',
+            mime: 'text/html',
+            createdAt: '2026-08-31T00:00:00.000Z',
+            downloadUrl: `/api/sessions/${session.summary.id}/download?path=${path}`,
+          })
+        })
+        return { content: JSON.stringify({ status: 'success', path }), isError: false }
+      }
+      if (call.name === 'start_process') {
+        await store.update(session.summary.id, (state) => {
+          state.website = {
+            status: 'running',
+            entryPath: 'visual-convergence.html',
+            processId: 'proc_generic_visual',
+            port: 8000,
+            previewUrl: 'http://127.0.0.1:8000/visual-convergence.html',
+            updatedAt: '2026-08-31T00:00:00.000Z',
+            restartCount: 0,
+          }
+        })
+        return { content: '{"status":"running","port":8000}', isError: false }
+      }
+      if (call.name === 'browser' && call.arguments.action === 'open') {
+        return { content: '{"url":"http://127.0.0.1:8000/visual-convergence.html","text":"Blue marker"}', isError: false }
+      }
+      if (call.name === 'browser' && call.arguments.action === 'screenshot') {
+        await store.update(session.summary.id, (state) => {
+          state.artifacts.push({
+            id: 'generic-shot-artifact',
+            sessionId: session.summary.id,
+            path: 'evidence/browser-visual.png',
+            name: 'browser-visual.png',
+            kind: 'image',
+            mime: 'image/png',
+            createdAt: '2026-08-31T00:00:00.000Z',
+            downloadUrl: `/api/sessions/${session.summary.id}/download?path=evidence/browser-visual.png`,
+          })
+        })
+        return { content: 'Saved browser screenshot to evidence/browser-visual.png (123 bytes).', isError: false }
+      }
+      if (call.name === 'inspect_image') {
+        return {
+          content: 'Visual inspection:\nOne blue marker is centered on a white field with no unexpected visual element.',
+          isError: false,
+        }
+      }
+      return { content: '{"status":"success","path":"visual-convergence.html"}', isError: false }
+    })
+    const agent = new AgentService(store, {
+      client: { stream } as never,
+      tools: { execute } as never,
+      runTimeoutMs: 5_000,
+    })
+    try {
+      await agent.submit(session.summary.id, { content: task })
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if ((await store.get(session.summary.id)).summary.status === 'completed') break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+      const state = await store.get(session.summary.id)
+      const events = await store.events(session.summary.id)
+      expect(
+        state.summary.status,
+        JSON.stringify(events.filter((event) => ['error', 'tool.failed', 'turn.completed'].includes(event.type))),
+      ).toBe('completed')
+      expect(modelCall).toBe(8)
+      expect(events.filter((event) => event.type === 'tool.failed')).toHaveLength(0)
+      expect(events.filter((event) => event.type === 'tool.completed' && event.data.call?.name === 'present_file')).toHaveLength(1)
+      expect(events.filter((event) => event.type === 'assistant.final')).toHaveLength(1)
+    } finally {
+      await agent.shutdown()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 10_000)
+
   it('detects an explicit missing file deliverable and clears the gate only after the artifact exists', () => {
     const messages: ModelMessage[] = [{
       role: 'user',
@@ -2161,6 +2548,68 @@ describe('agent context preparation', () => {
       { role: 'tool', tool_call_id: 'present_handoff', tool_result_status: 'succeeded', content: '{"status":"success","path":"incident-handoff.md"}' },
     ]
     expect(explicitDeliverableCompletionGap(presentedMessages, [{ path: 'incident-handoff.md' }], 'The handoff is complete.')).toBeUndefined()
+  })
+
+  it('keeps a pronoun-based save-as deliverable behind its requested presentation boundary', () => {
+    const task: ModelMessage = {
+      role: 'user',
+      content: 'Build one self-contained desktop HTML page. Save it once as visual-convergence.html, verify it, present visual-convergence.html, and finish.',
+    }
+    expect(explicitDeliverableCompletionGap(
+      [task],
+      [{ path: 'visual-convergence.html' }],
+      'The verified page is ready.',
+    )).toEqual({
+      requestedPaths: ['visual-convergence.html'],
+      missingPaths: [],
+      unpresentedPaths: ['visual-convergence.html'],
+      futureAction: false,
+    })
+
+    const presentedMessages: ModelMessage[] = [
+      task,
+      { role: 'assistant', content: null, tool_calls: [{ id: 'present_visual', type: 'function', function: { name: 'present_file', arguments: '{"path":"visual-convergence.html"}' } }] },
+      { role: 'tool', tool_call_id: 'present_visual', tool_result_status: 'succeeded', content: '{"status":"success","path":"visual-convergence.html"}' },
+    ]
+    expect(explicitDeliverableCompletionGap(
+      presentedMessages,
+      [{ path: 'visual-convergence.html' }],
+      'The verified page is ready.',
+    )).toBeUndefined()
+  })
+
+  it('requires the inferred canonical HTML revision when presentation is requested without a filename', () => {
+    const task: ModelMessage = {
+      role: 'user',
+      content: 'Build one self-contained HTML dashboard, verify it, and present the main HTML deliverable.',
+    }
+    const written: ModelMessage[] = [
+      task,
+      { role: 'assistant', content: null, tool_calls: [{ id: 'write_dashboard', type: 'function', function: { name: 'write_file', arguments: '{"path":"dashboard.html","content":"<!doctype html><html><body>Ready</body></html>"}' } }] },
+      { role: 'tool', tool_call_id: 'write_dashboard', tool_result_status: 'succeeded', content: '{"status":"success"}' },
+    ]
+    expect(explicitDeliverableCompletionGap(written, [{ path: 'dashboard.html' }], 'Ready.')).toBeUndefined()
+    expect(singleArtifactPresentationCompletionGap(written, 'dashboard.html')).toEqual({
+      requestedPaths: ['dashboard.html'],
+      missingPaths: [],
+      unpresentedPaths: ['dashboard.html'],
+      futureAction: false,
+    })
+
+    const presented: ModelMessage[] = [
+      ...written,
+      { role: 'assistant', content: null, tool_calls: [{ id: 'present_dashboard', type: 'function', function: { name: 'present_file', arguments: '{"path":"dashboard.html"}' } }] },
+      { role: 'tool', tool_call_id: 'present_dashboard', tool_result_status: 'succeeded', content: '{"status":"success"}' },
+    ]
+    expect(singleArtifactPresentationCompletionGap(presented, 'dashboard.html')).toBeUndefined()
+
+    const editedAfterPresentation: ModelMessage[] = [
+      ...presented,
+      { role: 'assistant', content: null, tool_calls: [{ id: 'edit_dashboard', type: 'function', function: { name: 'edit_file', arguments: '{"path":"dashboard.html","old_text":"Ready","new_text":"Verified"}' } }] },
+      { role: 'tool', tool_call_id: 'edit_dashboard', tool_result_status: 'succeeded', content: '{"status":"success"}' },
+    ]
+    expect(singleArtifactPresentationCompletionGap(editedAfterPresentation, 'dashboard.html'))
+      .toMatchObject({ unpresentedPaths: ['dashboard.html'] })
   })
 
   it('keeps deliverable recovery narrow and traces explicit paths across a continuation', () => {
@@ -2785,6 +3234,83 @@ describe('agent context preparation', () => {
           canonicalPath: 'dashboard.html',
         },
       })
+    } finally {
+      await agent.shutdown()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a filename-free single-HTML presentation request with only present_file', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-inferred-presentation-'))
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    let modelCall = 0
+    const stream = vi.fn(async (options: {
+      messages: ModelMessage[]
+      tools: Array<{ function: { name: string } }>
+      onContent: (delta: string) => void
+    }) => {
+      modelCall += 1
+      const names = options.tools.map((tool) => tool.function.name)
+      if (modelCall === 1) {
+        return {
+          content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
+          toolCalls: [{
+            id: 'write_inferred_dashboard', type: 'function' as const,
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'dashboard.html',
+                content: '<!doctype html><html><body><h1>Ready</h1></body></html>',
+              }),
+            },
+          }],
+          usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 0 },
+        }
+      }
+      if (modelCall === 2) {
+        const premature = 'The main HTML deliverable is ready.'
+        options.onContent(premature)
+        return {
+          content: premature, reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+          usage: { promptTokens: 12, completionTokens: 4, totalTokens: 16, cachedPromptTokens: 0 },
+        }
+      }
+      if (modelCall === 3) {
+        expect(names).toEqual(['present_file'])
+        expect(options.messages[0]?.content).toContain('Harness presentation recovery')
+        expect(options.messages.findLast((message) => message.role === 'user')?.content).toContain('dashboard.html')
+        return {
+          content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
+          toolCalls: [{
+            id: 'present_inferred_dashboard', type: 'function' as const,
+            function: { name: 'present_file', arguments: '{"path":"dashboard.html"}' },
+          }],
+          usage: { promptTokens: 14, completionTokens: 2, totalTokens: 16, cachedPromptTokens: 0 },
+        }
+      }
+      options.onContent('The dashboard is complete and presented.')
+      return {
+        content: 'The dashboard is complete and presented.', reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+        usage: { promptTokens: 16, completionTokens: 5, totalTokens: 21, cachedPromptTokens: 0 },
+      }
+    })
+    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 2_000 })
+    try {
+      await agent.submit(session.summary.id, {
+        content: 'Build one self-contained HTML dashboard, verify it, and present the main HTML deliverable.',
+      })
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await store.get(session.summary.id)).summary.status === 'completed') break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+      const state = await store.get(session.summary.id)
+      const events = await store.events(session.summary.id)
+      expect(state.summary.status).toBe('completed')
+      expect(modelCall).toBe(4)
+      expect(events.filter((event) => event.type === 'tool.completed' && event.data.call?.name === 'present_file')).toHaveLength(1)
+      expect(events.filter((event) => event.type === 'assistant.final')).toHaveLength(1)
     } finally {
       await agent.shutdown()
       await rm(root, { recursive: true, force: true })
@@ -3553,10 +4079,10 @@ describe('agent context preparation', () => {
     let releaseSessionClose = () => {}
     const sessionCloseBlocked = new Promise<void>((resolveClose) => { releaseSessionClose = resolveClose })
     const close = vi.fn(async () => await sessionCloseBlocked)
-    const closeEverything = vi.fn(async () => { releaseSessionClose() })
+    const shutdown = vi.fn(async () => { releaseSessionClose() })
     Object.defineProperty(agent, 'browser', {
       configurable: true,
-      value: { close, closeEverything },
+      value: { close, shutdown },
     })
     try {
       await agent.submit(session.summary.id, { content: 'Finish, then close the browser context.' })
@@ -3573,7 +4099,7 @@ describe('agent context preparation', () => {
         new Promise<'timed_out'>((resolveTimeout) => setTimeout(() => resolveTimeout('timed_out'), 250)),
       ])
       expect(outcome).toBe('resolved')
-      expect(closeEverything).toHaveBeenCalledTimes(1)
+      expect(shutdown).toHaveBeenCalledTimes(1)
       expect(agent.isRunning(session.summary.id)).toBe(false)
     } finally {
       releaseSessionClose()
