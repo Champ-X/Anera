@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
@@ -6,19 +7,232 @@ import { resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import { createApp, WORKSPACE_CONTENT_SECURITY_POLICY } from './app.js'
+import type { ReferenceFontManifest } from './reference-fonts.js'
+import type { ReferenceFontEvidenceManifest } from './session-store.js'
 import { workspaceFileSnapshot } from './workspace.js'
 
 const execFileAsync = promisify(execFile)
+
+function testSha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function previewReferenceFontFixture(): {
+  fontCss: string
+  familyNames: string[]
+  materializationManifest: ReferenceFontManifest
+} {
+  const font = Buffer.from('wOF2anera-preview-font')
+  const fontSha256 = testSha256(font)
+  const familyNames = ['Preview Reference Sans']
+  const fontCss = `@font-face { font-family: '${familyNames[0]}'; src: url("data:font/woff2;base64,${font.toString('base64')}") format("woff2"); }`
+  const source = Buffer.from('preview reference font source', 'utf8')
+  const core = {
+    version: 1 as const,
+    stylesheets: [{
+      sha256: testSha256(source),
+      bytes: source.length,
+      materializedSha256: testSha256(fontCss),
+      materializedBytes: Buffer.byteLength(fontCss),
+      fontSha256: [fontSha256],
+    }],
+    fonts: [{ sha256: fontSha256, bytes: font.length }],
+    familyNames,
+    cssBytes: source.length,
+    fontBytes: font.length,
+  }
+  return {
+    fontCss,
+    familyNames,
+    materializationManifest: { ...core, manifestSha256: testSha256(JSON.stringify(core)) },
+  }
+}
+
+function durableReferenceStyle(
+  sourceEvidenceSha256: string,
+  fontEvidence: ReferenceFontEvidenceManifest | undefined,
+  strictness: 'exact' | 'inspired' = 'exact',
+) {
+  return {
+    contract: {
+      sourceUrl: 'https://example.test/reference',
+      strictness,
+      colors: ['#123456', '#abcdef'],
+      fonts: ['Preview Reference Sans'],
+      layout: ['fixed slide canvas', 'two-column content'],
+      components: ['title', 'content card'],
+      requiredMarkers: ['.slide', '--accent-color'],
+      signature: 'Reference fixture',
+      avoid: ['generic fallback typography'],
+      viewport: { width: 1_440, height: 900 },
+    },
+    provenance: {
+      resolvedUrl: 'https://example.test/reference',
+      evidenceSha256: sourceEvidenceSha256,
+      evidenceBytes: 123,
+    },
+    ...(fontEvidence ? { fontEvidence } : {}),
+  }
+}
 
 describe('workspace active-content policy', () => {
   it('allows local artifacts while blocking API/network and navigation exfiltration channels', () => {
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("script-src 'self' 'unsafe-inline' blob:")
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("style-src 'self' 'unsafe-inline'")
+    expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("font-src 'self' data:")
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("connect-src 'none'")
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("frame-src 'none'")
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("object-src 'none'")
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("base-uri 'none'")
     expect(WORKSPACE_CONTENT_SECURITY_POLICY).toContain("form-action 'none'")
+  })
+
+  it('injects integrity-checked private fonts only into exact HTML previews and fails closed', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-app-reference-font-preview-'))
+    const created = await createApp({ dataRoot: resolve(root, 'data'), model: 'test-model' })
+    const sourceEvidenceSha256 = 'a'.repeat(64)
+    const fixture = previewReferenceFontFixture()
+    const createPreview = async (
+      strictness: 'exact' | 'inspired',
+      html: string,
+      includeEvidence = true,
+    ) => {
+      const session = await created.store.create()
+      const workspace = created.store.workspaceDir(session.summary.id)
+      await writeFile(resolve(workspace, 'index.html'), html)
+      await writeFile(resolve(workspace, 'styles.css'), 'body { color: navy; }\n')
+      const fontEvidence = includeEvidence
+        ? await created.store.commitReferenceFontEvidence(session.summary.id, {
+            sourceEvidenceSha256,
+            ...fixture,
+          })
+        : undefined
+      await created.store.update(session.summary.id, (state) => {
+        state.activeReferenceStyleContract = durableReferenceStyle(
+          sourceEvidenceSha256,
+          fontEvidence,
+          strictness,
+        )
+      })
+      return { session, fontEvidence }
+    }
+
+    const exact = await createPreview(
+      'exact',
+      '<!doctype html><html><head><title>Exact</title></head><body><main>EXACT_PREVIEW</main></body></html>',
+    )
+    const inspired = await createPreview(
+      'inspired',
+      '<!doctype html><html><body><main>INSPIRED_PREVIEW</main></body></html>',
+    )
+    const missing = await createPreview(
+      'exact',
+      '<!doctype html><html><body><main>MISSING_EVIDENCE_MUST_NOT_RENDER</main></body></html>',
+      false,
+    )
+    const reserved = await createPreview(
+      'exact',
+      '<!doctype html><html><body data-anera-reference-fonts><main>RESERVED_MARKER_MUST_NOT_RENDER</main></body></html>',
+    )
+
+    const server = createServer(created.app)
+    try {
+      await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not bind')
+      const base = `http://127.0.0.1:${address.port}`
+
+      const exactResponse = await fetch(`${base}/workspace/${exact.session.summary.id}/preview/index.html?aneraElementPicker=1`)
+      expect(exactResponse.status).toBe(200)
+      expect(exactResponse.headers.get('content-security-policy')).toBe(WORKSPACE_CONTENT_SECURITY_POLICY)
+      expect(exactResponse.headers.get('cache-control')).toBe('private, no-store')
+      const exactHtml = await exactResponse.text()
+      expect(exactHtml).toMatch(/^<!doctype html><style data-anera-reference-fonts data-manifest-sha256="[0-9a-f]{64}">/u)
+      expect(exactHtml).toContain(fixture.fontCss)
+      expect(exactHtml).toContain('data:font/woff2;base64,')
+      expect(exactHtml).toContain('data-anera-element-picker-bootstrap')
+      expect(exactHtml.match(/<style data-anera-reference-fonts\b/gu)).toHaveLength(1)
+
+      const exactAsset = await fetch(`${base}/workspace/${exact.session.summary.id}/preview/styles.css`)
+      expect(exactAsset.status).toBe(200)
+      expect(await exactAsset.text()).toBe('body { color: navy; }\n')
+      expect(exactAsset.headers.get('cache-control')).toBe('no-cache')
+
+      await created.store.update(exact.session.summary.id, (state) => {
+        state.website = {
+          status: 'asleep',
+          entryPath: 'index.html',
+          previewUrl: 'http://127.0.0.1:65535/unmaterialized-preview',
+          updatedAt: new Date().toISOString(),
+          restartCount: 1,
+        }
+      })
+      const restarted = await fetch(
+        `${base}/api/sessions/${exact.session.summary.id}/website/restart`,
+        { method: 'POST' },
+      )
+      expect(restarted.status).toBe(200)
+      await expect(restarted.json()).resolves.toMatchObject({
+        website: {
+          status: 'running',
+          entryPath: 'index.html',
+          previewUrl: `/workspace/${exact.session.summary.id}/preview/index.html`,
+          restartCount: 2,
+        },
+      })
+      const exactDownload = await fetch(
+        `${base}/api/sessions/${exact.session.summary.id}/download?path=index.html`,
+      )
+      expect(exactDownload.status).toBe(200)
+      expect(exactDownload.headers.get('content-disposition')).toContain('attachment;')
+      expect(exactDownload.headers.get('cache-control')).toBe('private, no-store')
+      expect(exactDownload.headers.get('x-anera-reference-font-manifest-sha256'))
+        .toBe(exact.fontEvidence?.manifestSha256)
+      const downloadedHtml = await exactDownload.text()
+      expect(downloadedHtml).toContain(fixture.fontCss)
+      expect(downloadedHtml).toContain('data-anera-reference-fonts')
+      await expect(readFile(resolve(
+        created.store.workspaceDir(exact.session.summary.id),
+        'index.html',
+      ), 'utf8')).resolves.not.toContain('data-anera-reference-fonts')
+
+      const inspiredResponse = await fetch(`${base}/workspace/${inspired.session.summary.id}/preview/index.html`)
+      expect(inspiredResponse.status).toBe(200)
+      expect(inspiredResponse.headers.get('cache-control')).toBe('no-cache')
+      expect(await inspiredResponse.text()).not.toContain('data-anera-reference-fonts')
+
+      const missingResponse = await fetch(`${base}/workspace/${missing.session.summary.id}/preview/index.html`)
+      expect(missingResponse.status).toBe(409)
+      const missingText = await missingResponse.text()
+      expect(missingText).toContain('private font evidence is missing')
+      expect(missingText).not.toContain('MISSING_EVIDENCE_MUST_NOT_RENDER')
+
+      const reservedResponse = await fetch(`${base}/workspace/${reserved.session.summary.id}/preview/index.html`)
+      expect(reservedResponse.status).toBe(400)
+      const reservedText = await reservedResponse.text()
+      expect(reservedText).toContain('invalid reserved reference font evidence marker')
+      expect(reservedText).not.toContain('RESERVED_MARKER_MUST_NOT_RENDER')
+
+      if (!exact.fontEvidence) throw new Error('Exact fixture font evidence was not committed')
+      const fontPath = resolve(
+        created.store.sessionDir(exact.session.summary.id),
+        'reference-style',
+        'fonts',
+        'v1',
+        exact.fontEvidence.manifestSha256,
+        `${exact.fontEvidence.fontCssSha256}.css`,
+      )
+      await writeFile(fontPath, Buffer.alloc(exact.fontEvidence.fontCssBytes, 0x78))
+      const tamperedResponse = await fetch(`${base}/workspace/${exact.session.summary.id}/preview/index.html`)
+      expect(tamperedResponse.status).toBe(500)
+      const tamperedText = await tamperedResponse.text()
+      expect(tamperedText).toContain('bytes do not match')
+      expect(tamperedText).not.toContain('EXACT_PREVIEW')
+    } finally {
+      await created.agent.shutdown()
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('projects an Arena U02-style build to source files across reconciliation, terminal metrics, tree, and ZIP', async () => {
@@ -315,15 +529,30 @@ describe('private harness state', () => {
   })
 })
 
-describe('session limit API contract', () => {
-  it('returns the Arena error category and 409 without creating another turn', async () => {
-    const root = await mkdtemp(resolve(tmpdir(), 'anera-app-session-limit-'))
-    const created = await createApp({ dataRoot: resolve(root, 'data'), model: 'test-model', sessionTokenLimit: 10 })
+describe('cumulative Session usage API contract', () => {
+  it('admits a new turn after high historical token usage while preserving model validation', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-app-unlimited-session-usage-'))
+    const stream = async (options: { onContent: (delta: string) => void }) => {
+      options.onContent('Continued after high cumulative usage.')
+      return {
+        content: 'Continued after high cumulative usage.',
+        reasoningContent: '',
+        toolCalls: [],
+        finishReason: 'stop' as const,
+        usage: { promptTokens: 12, completionTokens: 4, totalTokens: 16, cachedPromptTokens: 10 },
+      }
+    }
+    const created = await createApp({
+      dataRoot: resolve(root, 'data'),
+      model: 'test-model',
+      agent: { client: { stream } as never, runTimeoutMs: 1_000 },
+    })
     const session = await created.store.create()
     await created.store.update(session.summary.id, (state) => {
-      state.summary.usage.totalTokens = 10
-      state.summary.usage.promptTokens = 8
-      state.summary.usage.completionTokens = 2
+      state.summary.usage.totalTokens = 1_002_796
+      state.summary.usage.promptTokens = 986_843
+      state.summary.usage.completionTokens = 15_953
+      state.summary.usage.cachedPromptTokens = 925_952
     })
     const server = createServer(created.app)
     try {
@@ -348,14 +577,20 @@ describe('session limit API contract', () => {
       const response = await fetch(`${base}/api/sessions/${session.summary.id}/messages`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ content: 'Continue in the exhausted session.', attachments: [] }),
+        body: JSON.stringify({ content: 'Continue in this high-usage session.', attachments: [] }),
       })
-      expect(response.status).toBe(409)
-      expect(await response.json()).toEqual({
-        code: 'session_token_limit',
-        error: 'This session has reached its token usage limit. Please start a new chat to continue.',
-      })
-      expect((await created.store.events(session.summary.id)).filter((event) => event.type === 'turn.started')).toHaveLength(0)
+      expect(response.status).toBe(202)
+      expect(await response.json()).toMatchObject({ turnId: expect.any(String) })
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await created.store.get(session.summary.id)).summary.status === 'completed') break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      }
+      const resumed = await created.store.get(session.summary.id)
+      expect(resumed.summary.status).toBe('completed')
+      expect(resumed.summary.limits).toBeUndefined()
+      expect(resumed.summary.usage).toMatchObject({ totalTokens: 1_002_812, cachedPromptTokens: 925_962 })
+      expect((await created.store.events(session.summary.id)).filter((event) => event.type === 'turn.started')).toHaveLength(1)
+      expect((await created.store.events(session.summary.id)).some((event) => event.type === 'session.limit.reached')).toBe(false)
     } finally {
       await created.agent.shutdown()
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()))

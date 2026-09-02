@@ -1,4 +1,5 @@
 import type { ModelMessage } from '../shared/types.js'
+import { projectReferenceStyleToolResultForProvider } from './reference-style.js'
 import type { ToolDefinition } from './tools.js'
 
 interface StreamToolCall {
@@ -50,6 +51,8 @@ export interface ModelResult {
   modelRequestCount?: number
   /** Requests for which provider-authoritative token usage was observed. */
   modelCallCount: number
+  /** The provider became trapped in a highly repetitive text loop. */
+  degenerateRepetition?: boolean
 }
 
 export class DeepSeekClient {
@@ -77,6 +80,12 @@ export class DeepSeekClient {
 
   async stream(options: {
     messages: ModelMessage[]
+    /**
+     * Stable provider-visible schema surface used to preserve prompt-cache
+     * prefixes. `tools` remains the caller's authorization/validation surface;
+     * callers must still reject any generated call that is not authorized.
+     */
+    providerTools?: ToolDefinition[]
     tools: ToolDefinition[]
     signal: AbortSignal
     onContent: (delta: string) => void
@@ -97,6 +106,7 @@ export class DeepSeekClient {
     let accumulatedUsage: ModelResult['usage'] = emptyUsage()
     let accumulatedContent = ''
     let accumulatedReasoning = ''
+    let degenerateRepetition = false
     let requestMessages = options.messages
     while (true) {
       let emitted = false
@@ -146,6 +156,9 @@ export class DeepSeekClient {
           // do not tag this local sentinel as a new failed request attempt.
           throw new Error(`DeepSeek provider completion error: ${providerCompletionError}`)
         }
+        if (result.toolCalls.length === 0 && isDegenerateModelRepetition(result.content)) {
+          degenerateRepetition = true
+        }
         let continuationResolved = !continuationAttempt
         if (continuationAttempt) {
           if (result.toolCalls.length === 0 && result.content.trim()) {
@@ -164,7 +177,7 @@ export class DeepSeekClient {
             : visibleBuffer?.flush() ?? result.content
         }
         accumulatedReasoning += result.reasoningContent
-        const continuationNeeded = result.toolCalls.length === 0 && (
+        const continuationNeeded = !degenerateRepetition && result.toolCalls.length === 0 && (
           result.finishReason === 'length'
           || (continuationAttempt && !continuationResolved)
         )
@@ -181,6 +194,7 @@ export class DeepSeekClient {
           usage: accumulatedUsage,
           modelCallCount: completedModelCalls,
           modelRequestCount: physicalModelRequests,
+          ...(degenerateRepetition ? { degenerateRepetition: true } : {}),
         }
       } catch (error) {
         const failedAttempt = modelAccountingFromError(error)
@@ -211,6 +225,7 @@ export class DeepSeekClient {
 
   private async request(options: {
     messages: ModelMessage[]
+    providerTools?: ToolDefinition[]
     tools: ToolDefinition[]
     signal: AbortSignal
     onContent: (delta: string) => void
@@ -220,8 +235,9 @@ export class DeepSeekClient {
     model?: string
     toolChoice?: 'auto' | 'none'
   }): Promise<ModelResult> {
-    const toolOptions = options.tools.length > 0
-      ? { tools: options.tools, tool_choice: options.toolChoice ?? 'auto' }
+    const providerTools = options.providerTools ?? options.tools
+    const toolOptions = providerTools.length > 0
+      ? { tools: providerTools, tool_choice: options.toolChoice ?? 'auto' }
       : {}
     const firstEventDeadline = createFirstEventDeadline(options.signal, this.options.firstEventTimeoutMs)
     let response: Response
@@ -235,7 +251,7 @@ export class DeepSeekClient {
         },
         body: JSON.stringify({
           model: options.model ?? this.options.model,
-          messages: options.messages.map(providerMessage),
+          messages: projectProviderMessages(options.messages),
           ...toolOptions,
           stream: true,
           stream_options: { include_usage: true },
@@ -443,14 +459,51 @@ function createFirstEventDeadline(parent: AbortSignal, configuredMs: number | un
   }
 }
 
-function providerMessage(message: ModelMessage): Record<string, unknown> {
+/**
+ * Produce the exact provider-visible message projection used by both request
+ * serialization and context-pressure accounting. Reference fingerprints are
+ * private durable evidence, so project them only when the surrounding
+ * assistant call proves this result came from record_reference_style.
+ */
+export function projectProviderMessages(messages: readonly ModelMessage[]): Array<Record<string, unknown>> {
+  const pendingCallNames = new Map<string, string[]>()
+  return messages.map((message) => {
+    if (message.role === 'assistant') {
+      for (const call of message.tool_calls ?? []) {
+        const names = pendingCallNames.get(call.id) ?? []
+        names.push(call.function.name)
+        pendingCallNames.set(call.id, names)
+      }
+      return providerMessage(message, false)
+    }
+    let projectReferenceStyleResult = false
+    if (message.role === 'tool' && typeof message.tool_call_id === 'string') {
+      const names = pendingCallNames.get(message.tool_call_id)
+      const callName = names?.shift()
+      if (names?.length === 0) pendingCallNames.delete(message.tool_call_id)
+      projectReferenceStyleResult = callName === 'record_reference_style'
+    }
+    return providerMessage(message, projectReferenceStyleResult)
+  })
+}
+
+function providerMessage(
+  message: ModelMessage,
+  projectReferenceStyleResult: boolean,
+): Record<string, unknown> {
   const {
     tool_result_status: _privateStatus,
     tool_content_parts: toolContentParts,
     arena_system_messages: _privateArenaSystemMessages,
     ...provider
   } = message
-  if (!toolContentParts?.length) return provider
+  if (!toolContentParts?.length) {
+    return message.role === 'tool'
+      && typeof provider.content === 'string'
+      && projectReferenceStyleResult
+      ? { ...provider, content: projectReferenceStyleToolResultForProvider(provider.content) }
+      : provider
+  }
   return {
     ...provider,
     content: toolContentParts.map((part) => ({
@@ -479,6 +532,52 @@ function isEmptyCompletion(result: ModelResult): boolean {
     && result.content.length === 0
     && result.reasoningContent.length === 0
     && result.toolCalls.length === 0
+}
+
+const REPETITION_MIN_CHARACTERS = 1_200
+const REPETITION_SHINGLE_TOKENS = 18
+const REPETITION_SHINGLE_STRIDE = 6
+
+/**
+ * Detect provider degeneration, not ordinary repeated prose. The thresholds
+ * intentionally require a long response whose exact blocks or token shingles
+ * dominate most of the output. This catches loops that fill the output window
+ * with one repeated paragraph while leaving normal lists, tables, and code
+ * templates alone.
+ */
+export function isDegenerateModelRepetition(content: string): boolean {
+  const normalized = content.replace(/\s+/gu, ' ').trim()
+  if (normalized.length < REPETITION_MIN_CHARACTERS) return false
+
+  const blocks = content
+    .split(/\n\s*\n/gu)
+    .map((block) => block.replace(/\s+/gu, ' ').trim())
+    .filter((block) => block.length >= 80)
+  const blockCounts = new Map<string, number>()
+  for (const block of blocks) blockCounts.set(block, (blockCounts.get(block) ?? 0) + 1)
+  const repeatedBlockCharacters = [...blockCounts]
+    .filter(([, count]) => count >= 4)
+    .reduce((total, [block, count]) => total + block.length * count, 0)
+  if (repeatedBlockCharacters / normalized.length >= 0.65) return true
+
+  const tokens = normalized.match(/[\p{L}\p{N}_]+|[^\s]/gu) ?? []
+  if (tokens.length < REPETITION_SHINGLE_TOKENS * 8) return false
+  const shingles: string[] = []
+  for (
+    let index = 0;
+    index + REPETITION_SHINGLE_TOKENS <= tokens.length;
+    index += REPETITION_SHINGLE_STRIDE
+  ) {
+    shingles.push(tokens.slice(index, index + REPETITION_SHINGLE_TOKENS).join('\u0001'))
+  }
+  if (shingles.length < 16) return false
+  const counts = new Map<string, number>()
+  for (const shingle of shingles) counts.set(shingle, (counts.get(shingle) ?? 0) + 1)
+  const repeatedWindows = shingles.reduce((total, shingle) => (
+    total + ((counts.get(shingle) ?? 0) >= 3 ? 1 : 0)
+  ), 0)
+  return repeatedWindows / shingles.length >= 0.75
+    && counts.size / shingles.length <= 0.35
 }
 
 function providerErrorCompletion(result: ModelResult): string | undefined {

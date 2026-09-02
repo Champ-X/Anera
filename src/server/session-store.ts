@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { appendFile, link, lstat, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, link, lstat, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, resolve } from 'node:path'
 import type {
   ArtifactRecord,
@@ -20,7 +20,6 @@ import type {
   SpeechProviderMetering,
   WebsiteState,
 } from '../shared/types.js'
-import { SESSION_TOKEN_LIMIT_ERROR_MESSAGE } from '../shared/types.js'
 import { isWorkspaceSnapshotExcludedPath } from '../shared/workspace-snapshot-policy.js'
 import { arenaToolErrorResult } from './arena-tool-result.js'
 import { createWorkspaceArtifact } from './artifact.js'
@@ -32,6 +31,7 @@ import {
 import { createId } from './ids.js'
 import { validateAgentUploadBytes } from './agent-upload-validation.js'
 import { terminateRecoveredManagedProcess, type ManagedProcessRecoveryResult } from './process-manager.js'
+import type { DurableReferenceStyleContract } from './reference-style.js'
 import { findSensitiveValues, redactDisplayValue, redactText } from './redaction.js'
 import {
   assertNoSymlinkTraversal,
@@ -41,6 +41,15 @@ import {
   type WorkspaceFileSnapshotEntry,
 } from './workspace.js'
 import { recoverWorkspacePatchTransactions, type WorkspacePatchRecovery } from './workspace-patch.js'
+import {
+  REFERENCE_FONT_MAX_FILES,
+  REFERENCE_FONT_MAX_FILE_BYTES,
+  REFERENCE_FONT_MAX_STYLESHEETS,
+  REFERENCE_FONT_MAX_STYLESHEET_BYTES,
+  REFERENCE_FONT_MAX_TOTAL_FILE_BYTES,
+  REFERENCE_RENDER_FONT_CSS_MAX_BYTES,
+  type ReferenceFontManifest,
+} from './reference-fonts.js'
 
 export interface StoredSession {
   summary: SessionSummary
@@ -82,6 +91,20 @@ export interface StoredSession {
   turnMessageStarts?: Record<string, number>
   /** Exact-only Final constraint for the current real user task; operator Continue inherits it. */
   activeTaskExactFinalRequest?: string
+  /**
+   * Server-private exact-reference verifier ledger. Unlike provider-visible
+   * messages, this survives semantic context compaction and resume intact.
+   */
+  activeReferenceStyleContract?: DurableReferenceStyleContract
+  /** Unique commit generation used to prevent stale integrity checks invalidating a newer re-record. */
+  activeReferenceStyleEvidenceGeneration?: string
+  /**
+   * Fail-closed tombstone for an exact StyleContract whose private font or
+   * visual evidence failed an on-disk integrity check. Historical successful
+   * tool messages must not revive the invalidated contract after restart;
+   * only a newly committed record_reference_style result clears this marker.
+   */
+  referenceStyleEvidenceInvalidation?: DurableReferenceStyleEvidenceInvalidation
   /** Connector slugs explicitly enabled when the current real user task was submitted. */
   activeTaskConnectorSlugs?: string[]
   /** Last validated browser timezone used to render Arena's dynamic date prompt. */
@@ -94,6 +117,12 @@ export interface StoredSession {
   pendingApprovals?: Record<string, DurablePendingApproval>
   /** Explicit compact tool request consumed by the next context preparation. */
   forceCompactionRequested?: { turnId: string; stepId: string; callId: string }
+  /**
+   * Server-private visual-workflow liveness checkpoint. It survives provider
+   * context compaction and process restart so an unchanged repaired call/result
+   * loop cannot reset its evidence counter by starting another model process.
+   */
+  visualNoProgress?: DurableVisualNoProgressState
   /** Session-stable public voice ids mapped to provider voices. */
   voices?: Record<string, StoredVoiceSelection>
   /** Next durable public voice-id candidate; advanced in the HITL response transaction. */
@@ -118,6 +147,102 @@ export interface StoredSession {
    */
   pendingDeployment?: DurablePendingDeployment
   repository: CodingRepositoryState | null
+}
+
+export type ReferenceVisualEvidencePhase = 'cover' | 'content' | 'closing'
+
+export type ReferenceStyleEvidenceInvalidationReason =
+  | 'font_evidence_missing_or_invalid'
+  | 'visual_evidence_missing_or_invalid'
+
+export interface DurableReferenceStyleEvidenceInvalidation {
+  version: 1
+  /** Stable binding for the exact contract/evidence generation that failed. */
+  contractEvidenceSha256: string
+  contractEvidenceGeneration?: string
+  sourceUrl: string
+  sourceEvidenceSha256: string
+  strictness: 'exact'
+  reason: ReferenceStyleEvidenceInvalidationReason
+  invalidatedAt: string
+}
+
+export interface CommitReferenceVisualEvidenceInput {
+  sourceEvidenceSha256: string
+  renderProfileSha256: string
+  viewport: { width: number; height: number }
+  screenshots: Record<ReferenceVisualEvidencePhase, Buffer>
+}
+
+export interface ReferenceVisualPhaseEvidence {
+  sha256: string
+  bytes: number
+  width: number
+  height: number
+}
+
+/**
+ * Path-free identity of the three private screenshots rendered from one
+ * reference source. The PNG bytes live beside state.json rather than in the
+ * model-visible Workspace; every filesystem path is derived from these
+ * digests so a persisted manifest can never redirect a later read.
+ */
+export interface ReferenceVisualEvidenceManifest {
+  version: 1
+  sourceEvidenceSha256: string
+  renderProfileSha256: string
+  viewport: { width: number; height: number }
+  phases: Record<ReferenceVisualEvidencePhase, ReferenceVisualPhaseEvidence>
+  manifestSha256: string
+}
+
+export interface CommitReferenceFontEvidenceInput {
+  sourceEvidenceSha256: string
+  fontCss: string
+  familyNames: string[]
+  /** Null attests that the exact reference declared no external Google Fonts. */
+  materializationManifest: ReferenceFontManifest | null
+}
+
+/**
+ * Path-free identity of the server-materialized fonts used to render an exact
+ * reference. The CSS (including its embedded WOFF2 bytes) remains private;
+ * this manifest is safe to retain in the durable reference-style contract.
+ */
+export interface ReferenceFontEvidenceManifest {
+  version: 1
+  sourceEvidenceSha256: string
+  fontCssSha256: string
+  fontCssBytes: number
+  familyNames: string[]
+  materializationManifest: ReferenceFontManifest | null
+  manifestSha256: string
+}
+
+export interface ResolvedReferenceFontEvidence {
+  fontCss: string
+  familyNames: string[]
+}
+
+export const REFERENCE_VISUAL_EVIDENCE_MAX_IMAGE_BYTES = 12 * 1024 * 1024
+export const REFERENCE_VISUAL_EVIDENCE_MAX_TOTAL_BYTES = 24 * 1024 * 1024
+
+const REFERENCE_VISUAL_EVIDENCE_PHASES = ['cover', 'content', 'closing'] as const
+const REFERENCE_VISUAL_EVIDENCE_VERSION = 1 as const
+const REFERENCE_FONT_EVIDENCE_VERSION = 1 as const
+const REFERENCE_FONT_EVIDENCE_MAX_FAMILY_NAME_LENGTH = 128
+const REFERENCE_VISUAL_EVIDENCE_MAX_SIDE = 8_192
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+const WOFF2_SIGNATURE = Buffer.from('wOF2', 'ascii')
+
+export interface DurableVisualNoProgressState {
+  schemaVersion: 1
+  phase: string
+  callSignature: string
+  callNames: string[]
+  outcomeDigest: string
+  consecutiveCount: number
+  recoveryAttempted: boolean
 }
 
 export interface StoredVoiceSelection {
@@ -512,7 +637,6 @@ export class SessionStore {
   constructor(
     private readonly root: string,
     private readonly model: string,
-    private readonly sessionTokenLimit = 1_000_000,
   ) {}
 
   async initialize(): Promise<void> {
@@ -534,6 +658,159 @@ export class SessionStore {
 
   workspaceDir(id: string): string {
     return resolve(this.sessionDir(id), 'workspace')
+  }
+
+  /**
+   * Persist one immutable, content-addressed reference-render triplet outside
+   * the Workspace. Only the path-free manifest is returned; callers cannot
+   * turn these server-private PNGs into model attachments or Artifacts.
+   */
+  async commitReferenceVisualEvidence(
+    id: string,
+    input: CommitReferenceVisualEvidenceInput,
+  ): Promise<ReferenceVisualEvidenceManifest> {
+    const prepared = prepareReferenceVisualEvidence(input)
+    await this.initialize()
+    await this.get(id)
+    return await this.enqueue(id, async () => {
+      // Revalidate Session ownership inside the queue so deletion cannot race
+      // an evidence publication admitted by an older Store operation.
+      await this.get(id)
+      const sessionDirectory = this.sessionDir(id)
+      const referenceDirectory = resolve(sessionDirectory, 'reference-style')
+      const versionDirectory = resolve(referenceDirectory, `v${REFERENCE_VISUAL_EVIDENCE_VERSION}`)
+      const manifestDirectory = resolve(versionDirectory, prepared.manifest.manifestSha256)
+      for (const directory of [referenceDirectory, versionDirectory, manifestDirectory]) {
+        await ensurePrivateReferenceVisualDirectory(directory)
+      }
+
+      for (const phase of REFERENCE_VISUAL_EVIDENCE_PHASES) {
+        const evidence = prepared.manifest.phases[phase]
+        const target = resolve(manifestDirectory, `${phase}-${evidence.sha256}.png`)
+        const existing = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        })
+        if (existing) {
+          await verifyReferenceVisualEvidenceFile(target, evidence, prepared.manifest.viewport)
+          continue
+        }
+
+        const temporary = resolve(manifestDirectory, `.${phase}-${createId('rve')}.tmp`)
+        try {
+          await writeFile(temporary, prepared.screenshots[phase], { flag: 'wx', mode: 0o600 })
+          await chmod(temporary, 0o600)
+          await verifyReferenceVisualEvidenceFile(temporary, evidence, prepared.manifest.viewport)
+          await rename(temporary, target)
+          await chmod(target, 0o600)
+          await verifyReferenceVisualEvidenceFile(target, evidence, prepared.manifest.viewport)
+        } finally {
+          await rm(temporary, { force: true })
+        }
+      }
+      return prepared.manifest
+    })
+  }
+
+  /**
+   * Resolve one phase only after rechecking every manifest binding and the
+   * current on-disk inode. Missing, replaced, malformed, or symlinked evidence
+   * fails closed rather than being repaired from an untrusted path.
+   */
+  async resolveReferenceVisualEvidencePath(
+    id: string,
+    manifest: ReferenceVisualEvidenceManifest,
+    phase: ReferenceVisualEvidencePhase,
+  ): Promise<string> {
+    if (!REFERENCE_VISUAL_EVIDENCE_PHASES.includes(phase)) {
+      throw new Error('Reference visual evidence phase is invalid')
+    }
+    const normalized = normalizeReferenceVisualEvidenceManifest(manifest)
+    await this.initialize()
+    await this.get(id)
+    const sessionDirectory = this.sessionDir(id)
+    const referenceDirectory = resolve(sessionDirectory, 'reference-style')
+    const versionDirectory = resolve(referenceDirectory, `v${REFERENCE_VISUAL_EVIDENCE_VERSION}`)
+    const manifestDirectory = resolve(versionDirectory, normalized.manifestSha256)
+    for (const directory of [referenceDirectory, versionDirectory, manifestDirectory]) {
+      await assertPrivateReferenceVisualDirectory(directory)
+    }
+    const evidence = normalized.phases[phase]
+    const target = resolve(manifestDirectory, `${phase}-${evidence.sha256}.png`)
+    await verifyReferenceVisualEvidenceFile(target, evidence, normalized.viewport)
+    return target
+  }
+
+  /**
+   * Persist the materialized CSS for one exact reference outside the
+   * Workspace. Empty CSS is an intentional attestation that the source used
+   * no external font stylesheet, not an absent evidence record.
+   */
+  async commitReferenceFontEvidence(
+    id: string,
+    input: CommitReferenceFontEvidenceInput,
+  ): Promise<ReferenceFontEvidenceManifest> {
+    const prepared = prepareReferenceFontEvidence(input)
+    await this.initialize()
+    await this.get(id)
+    return await this.enqueue(id, async () => {
+      await this.get(id)
+      const sessionDirectory = this.sessionDir(id)
+      const referenceDirectory = resolve(sessionDirectory, 'reference-style')
+      const fontDirectory = resolve(referenceDirectory, 'fonts')
+      const versionDirectory = resolve(fontDirectory, `v${REFERENCE_FONT_EVIDENCE_VERSION}`)
+      const manifestDirectory = resolve(versionDirectory, prepared.manifest.manifestSha256)
+      for (const directory of [referenceDirectory, fontDirectory, versionDirectory, manifestDirectory]) {
+        await ensurePrivateReferenceFontDirectory(directory)
+      }
+
+      const target = resolve(manifestDirectory, `${prepared.manifest.fontCssSha256}.css`)
+      const existing = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return undefined
+        throw error
+      })
+      if (existing) {
+        await verifyReferenceFontEvidenceFile(target, prepared.manifest)
+        return prepared.manifest
+      }
+
+      const temporary = resolve(manifestDirectory, `.${createId('rfe')}.tmp`)
+      try {
+        await writeFile(temporary, prepared.fontCssBytes, { flag: 'wx', mode: 0o600 })
+        await chmod(temporary, 0o600)
+        await verifyReferenceFontEvidenceFile(temporary, prepared.manifest)
+        await rename(temporary, target)
+        await chmod(target, 0o600)
+        await verifyReferenceFontEvidenceFile(target, prepared.manifest)
+      } finally {
+        await rm(temporary, { force: true })
+      }
+      return prepared.manifest
+    })
+  }
+
+  /**
+   * Resolve private exact-reference font CSS only after revalidating the
+   * path-free manifest, directory boundary, inode, byte length, and digest.
+   */
+  async resolveReferenceFontEvidence(
+    id: string,
+    manifest: ReferenceFontEvidenceManifest,
+  ): Promise<ResolvedReferenceFontEvidence> {
+    const normalized = normalizeReferenceFontEvidenceManifest(manifest)
+    await this.initialize()
+    await this.get(id)
+    const sessionDirectory = this.sessionDir(id)
+    const referenceDirectory = resolve(sessionDirectory, 'reference-style')
+    const fontDirectory = resolve(referenceDirectory, 'fonts')
+    const versionDirectory = resolve(fontDirectory, `v${REFERENCE_FONT_EVIDENCE_VERSION}`)
+    const manifestDirectory = resolve(versionDirectory, normalized.manifestSha256)
+    for (const directory of [referenceDirectory, fontDirectory, versionDirectory, manifestDirectory]) {
+      await assertPrivateReferenceFontDirectory(directory)
+    }
+    const target = resolve(manifestDirectory, `${normalized.fontCssSha256}.css`)
+    const fontCss = await verifyReferenceFontEvidenceFile(target, normalized)
+    return { fontCss, familyNames: [...normalized.familyNames] }
   }
 
   workspacePatchTransactionDir(id: string): string {
@@ -579,15 +856,6 @@ export class SessionStore {
         model: this.model,
         workspaceBytes: 0,
         usage: { ...EMPTY_USAGE },
-        limits: {
-          sessionTokens: {
-            maxTokens: this.sessionTokenLimit,
-            usedTokens: 0,
-            remainingTokens: this.sessionTokenLimit,
-            reached: false,
-            message: SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
-          },
-        },
         productMode: options.repository ? 'coding' : 'chat',
         ...(options.repository ? { codingSessionStatus: 'active' as const } : {}),
         isFreeSession: options.isFreeSession === true,
@@ -1362,7 +1630,10 @@ export class SessionStore {
     )
     state.summary.usage.estimatedCostStatus ??= estimatedCostStatusForUsage(state.summary.usage)
     state.usageSettlements ??= {}
-    this.syncSessionTokenLimit(state.summary)
+    // Cumulative usage is metering, not an admission budget. Normalizing the
+    // legacy projection here makes already-exhausted persisted Sessions
+    // resumable while their historical limit events remain available to audit.
+    delete state.summary.limits
     return state
   }
 
@@ -1374,7 +1645,7 @@ export class SessionStore {
     return this.enqueue(id, async () => {
       const state = await this.get(id)
       mutate(state)
-      this.syncSessionTokenLimit(state.summary)
+      delete state.summary.limits
       state.summary.updatedAt = options.updatedAt ?? new Date().toISOString()
       await this.writeState(id, state)
       return state
@@ -2033,6 +2304,7 @@ export class SessionStore {
         createdAt,
       }
       state.messages = state.messages.slice(0, messageCountAfter)
+      delete state.visualNoProgress
       for (const turnId of targetTurnIds) delete state.turnMessageStarts?.[turnId]
       state.pendingTurnUndo = pending
       state.summary.updatedAt = createdAt
@@ -3219,25 +3491,6 @@ export class SessionStore {
     await rename(temporary, target)
   }
 
-  private syncSessionTokenLimit(summary: SessionSummary): void {
-    const previous = summary.limits?.sessionTokens
-    const maxTokens = previous?.maxTokens && previous.maxTokens > 0
-      ? previous.maxTokens
-      : this.sessionTokenLimit
-    const usedTokens = Math.max(0, summary.usage.totalTokens)
-    const reached = usedTokens >= maxTokens
-    summary.limits = {
-      sessionTokens: {
-        maxTokens,
-        usedTokens,
-        remainingTokens: Math.max(0, maxTokens - usedTokens),
-        reached,
-        message: SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
-        ...(previous?.reachedAt ? { reachedAt: previous.reachedAt } : {}),
-      },
-    }
-  }
-
   private enqueue<T>(id: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.writeQueues.get(id) ?? Promise.resolve()
     const current = previous.then(operation, operation)
@@ -3599,6 +3852,684 @@ async function inspectWorkspaceFile(target: string): Promise<
 
 function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex')
+}
+
+interface PreparedReferenceFontEvidence {
+  manifest: ReferenceFontEvidenceManifest
+  fontCssBytes: Buffer
+}
+
+function prepareReferenceFontEvidence(input: CommitReferenceFontEvidenceInput): PreparedReferenceFontEvidence {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('Reference font evidence input must be an object')
+  }
+  if (typeof input.fontCss !== 'string') {
+    throw new Error('Reference font evidence CSS must be a string')
+  }
+  const fontCssBytes = Buffer.from(input.fontCss, 'utf8')
+  if (fontCssBytes.length > REFERENCE_RENDER_FONT_CSS_MAX_BYTES) {
+    throw new Error('Reference font evidence CSS exceeds the bounded size')
+  }
+  const sourceEvidenceSha256 = normalizeReferenceVisualSha256(
+    input.sourceEvidenceSha256,
+    'Reference font source evidence SHA-256',
+  )
+  const familyNames = normalizeReferenceFontFamilyNames(input.familyNames)
+  const materializationManifest = normalizeReferenceFontMaterializationManifest(input.materializationManifest)
+  assertReferenceFontEvidenceShape(fontCssBytes.length, sha256(fontCssBytes), familyNames, materializationManifest)
+  validateReferenceFontCssBindings(fontCssBytes, familyNames, materializationManifest)
+
+  const core = {
+    version: REFERENCE_FONT_EVIDENCE_VERSION,
+    sourceEvidenceSha256,
+    fontCssSha256: sha256(fontCssBytes),
+    fontCssBytes: fontCssBytes.length,
+    familyNames,
+    materializationManifest,
+  }
+  return {
+    manifest: {
+      ...core,
+      manifestSha256: referenceFontEvidenceManifestDigest(core),
+    },
+    fontCssBytes,
+  }
+}
+
+/** Validate and canonicalize a path-free durable font evidence manifest. */
+export function normalizeReferenceFontEvidenceManifest(value: unknown): ReferenceFontEvidenceManifest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Reference font evidence manifest must be an object')
+  }
+  const input = value as Record<string, unknown>
+  if (input.version !== REFERENCE_FONT_EVIDENCE_VERSION) {
+    throw new Error('Reference font evidence manifest version is invalid')
+  }
+  const sourceEvidenceSha256 = normalizeReferenceVisualSha256(
+    input.sourceEvidenceSha256,
+    'Reference font source evidence SHA-256',
+  )
+  const fontCssSha256 = normalizeReferenceVisualSha256(
+    input.fontCssSha256,
+    'Reference font CSS SHA-256',
+  )
+  const fontCssBytes = referenceFontBoundedInteger(
+    input.fontCssBytes,
+    'Reference font CSS bytes',
+    0,
+    REFERENCE_RENDER_FONT_CSS_MAX_BYTES,
+  )
+  const familyNames = normalizeReferenceFontFamilyNames(input.familyNames)
+  const materializationManifest = normalizeReferenceFontMaterializationManifest(input.materializationManifest)
+  assertReferenceFontEvidenceShape(fontCssBytes, fontCssSha256, familyNames, materializationManifest)
+
+  const core = {
+    version: REFERENCE_FONT_EVIDENCE_VERSION,
+    sourceEvidenceSha256,
+    fontCssSha256,
+    fontCssBytes,
+    familyNames,
+    materializationManifest,
+  }
+  const manifestSha256 = normalizeReferenceVisualSha256(
+    input.manifestSha256,
+    'Reference font evidence manifest SHA-256',
+  )
+  if (manifestSha256 !== referenceFontEvidenceManifestDigest(core)) {
+    throw new Error('Reference font evidence manifest SHA-256 does not match its bindings')
+  }
+  return { ...core, manifestSha256 }
+}
+
+function normalizeReferenceFontMaterializationManifest(value: unknown): ReferenceFontManifest | null {
+  if (value === null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Reference font materialization manifest must be an object or null')
+  }
+  const input = value as Record<string, unknown>
+  if (input.version !== 1) throw new Error('Reference font materialization manifest version is invalid')
+  if (!Array.isArray(input.stylesheets) || input.stylesheets.length < 1 || input.stylesheets.length > REFERENCE_FONT_MAX_STYLESHEETS) {
+    throw new Error('Reference font materialization stylesheets are out of bounds')
+  }
+  const stylesheets = input.stylesheets.map((value, index) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`Reference font stylesheet ${index + 1} manifest must be an object`)
+    }
+    const stylesheet = value as Record<string, unknown>
+    if (!Array.isArray(stylesheet.fontSha256) || stylesheet.fontSha256.length < 1 || stylesheet.fontSha256.length > REFERENCE_FONT_MAX_FILES) {
+      throw new Error(`Reference font stylesheet ${index + 1} file bindings are out of bounds`)
+    }
+    const fontSha256 = stylesheet.fontSha256.map((digest) => normalizeReferenceVisualSha256(
+      digest,
+      `Reference font stylesheet ${index + 1} file SHA-256`,
+    ))
+    if (new Set(fontSha256).size !== fontSha256.length) {
+      throw new Error(`Reference font stylesheet ${index + 1} file bindings must be unique`)
+    }
+    return {
+      sha256: normalizeReferenceVisualSha256(stylesheet.sha256, `Reference font stylesheet ${index + 1} SHA-256`),
+      bytes: referenceFontBoundedInteger(
+        stylesheet.bytes,
+        `Reference font stylesheet ${index + 1} bytes`,
+        1,
+        REFERENCE_FONT_MAX_STYLESHEET_BYTES,
+      ),
+      materializedSha256: normalizeReferenceVisualSha256(
+        stylesheet.materializedSha256,
+        `Materialized reference font stylesheet ${index + 1} SHA-256`,
+      ),
+      materializedBytes: referenceFontBoundedInteger(
+        stylesheet.materializedBytes,
+        `Materialized reference font stylesheet ${index + 1} bytes`,
+        1,
+        REFERENCE_RENDER_FONT_CSS_MAX_BYTES,
+      ),
+      fontSha256,
+    }
+  })
+  if (!Array.isArray(input.fonts) || input.fonts.length < 1 || input.fonts.length > REFERENCE_FONT_MAX_FILES) {
+    throw new Error('Reference font materialization files are out of bounds')
+  }
+  const fonts = input.fonts.map((value, index) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`Reference font file ${index + 1} manifest must be an object`)
+    }
+    const font = value as Record<string, unknown>
+    return {
+      sha256: normalizeReferenceVisualSha256(font.sha256, `Reference font file ${index + 1} SHA-256`),
+      bytes: referenceFontBoundedInteger(
+        font.bytes,
+        `Reference font file ${index + 1} bytes`,
+        WOFF2_SIGNATURE.length,
+        REFERENCE_FONT_MAX_FILE_BYTES,
+      ),
+    }
+  })
+  if (new Set(fonts.map((font) => font.sha256)).size !== fonts.length) {
+    throw new Error('Reference font materialization file SHA-256 digests must be unique')
+  }
+  const fontDigestSet = new Set(fonts.map((font) => font.sha256))
+  if (stylesheets.some((stylesheet) => stylesheet.fontSha256.some((digest) => !fontDigestSet.has(digest)))) {
+    throw new Error('Reference font stylesheet binds a font outside its materialization manifest')
+  }
+
+  const familyNames = normalizeReferenceFontFamilyNames(input.familyNames)
+  if (familyNames.length === 0) throw new Error('Reference font materialization must declare a font family')
+  const cssBytes = referenceFontBoundedInteger(
+    input.cssBytes,
+    'Reference font source stylesheet bytes',
+    1,
+    REFERENCE_FONT_MAX_STYLESHEETS * REFERENCE_FONT_MAX_STYLESHEET_BYTES,
+  )
+  if (cssBytes !== stylesheets.reduce((total, stylesheet) => total + stylesheet.bytes, 0)) {
+    throw new Error('Reference font source stylesheet bytes do not match their manifest')
+  }
+  const fontBytes = referenceFontBoundedInteger(
+    input.fontBytes,
+    'Reference font file bytes',
+    WOFF2_SIGNATURE.length,
+    REFERENCE_FONT_MAX_TOTAL_FILE_BYTES,
+  )
+  if (fontBytes !== fonts.reduce((total, font) => total + font.bytes, 0)) {
+    throw new Error('Reference font file bytes do not match their manifest')
+  }
+
+  const core = { version: 1 as const, stylesheets, fonts, familyNames, cssBytes, fontBytes }
+  const manifestSha256 = normalizeReferenceVisualSha256(
+    input.manifestSha256,
+    'Reference font materialization manifest SHA-256',
+  )
+  if (manifestSha256 !== sha256(Buffer.from(JSON.stringify(core), 'utf8'))) {
+    throw new Error('Reference font materialization manifest SHA-256 does not match its bindings')
+  }
+  return { ...core, manifestSha256 }
+}
+
+function normalizeReferenceFontFamilyNames(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > REFERENCE_FONT_MAX_FILES) {
+    throw new Error('Reference font family names are out of bounds')
+  }
+  const names = value.map((entry) => {
+    if (
+      typeof entry !== 'string'
+      || entry.length === 0
+      || entry.length > REFERENCE_FONT_EVIDENCE_MAX_FAMILY_NAME_LENGTH
+      || entry.trim() !== entry
+      || !/^[\p{L}\p{N} _-]+$/u.test(entry)
+    ) {
+      throw new Error('Reference font family name is invalid')
+    }
+    return entry
+  })
+  if (new Set(names).size !== names.length) {
+    throw new Error('Reference font family names must be unique')
+  }
+  return names
+}
+
+function assertReferenceFontEvidenceShape(
+  fontCssBytes: number,
+  fontCssSha256: string,
+  familyNames: string[],
+  materializationManifest: ReferenceFontManifest | null,
+): void {
+  if (materializationManifest === null) {
+    if (fontCssBytes !== 0 || fontCssSha256 !== sha256(Buffer.alloc(0)) || familyNames.length !== 0) {
+      throw new Error('A reference without materialized fonts must attest empty CSS and no font families')
+    }
+    return
+  }
+  if (fontCssBytes === 0 || familyNames.length === 0) {
+    throw new Error('Materialized reference fonts require non-empty CSS and font families')
+  }
+  if (JSON.stringify(familyNames) !== JSON.stringify(materializationManifest.familyNames)) {
+    throw new Error('Reference font family names do not match the materialization manifest')
+  }
+  const expectedBytes = materializationManifest.stylesheets.reduce(
+    (total, stylesheet) => total + stylesheet.materializedBytes,
+    Math.max(0, materializationManifest.stylesheets.length - 1),
+  )
+  if (fontCssBytes !== expectedBytes) {
+    throw new Error('Reference font CSS bytes do not match the materialization manifest')
+  }
+}
+
+function validateReferenceFontCssBindings(
+  content: Buffer,
+  familyNames: string[],
+  materializationManifest: ReferenceFontManifest | null,
+): string {
+  let fontCss: string
+  try {
+    fontCss = new TextDecoder('utf-8', { fatal: true }).decode(content)
+  } catch (error) {
+    throw new Error('Reference font evidence CSS is not valid UTF-8', { cause: error })
+  }
+  if (materializationManifest === null) {
+    if (fontCss !== '') throw new Error('Reference font evidence without a materialization manifest must be empty')
+    return fontCss
+  }
+  if (/<\s*\/\s*style\b/iu.test(fontCss)) {
+    throw new Error('Reference font evidence CSS contains an unsafe HTML style terminator')
+  }
+  if (/@import\b/iu.test(fontCss)) {
+    throw new Error('Reference font evidence CSS contains an unsupported @import rule')
+  }
+  if (/\blocal\s*\(/iu.test(fontCss) || fontCss.includes('\\')) {
+    throw new Error('Reference font evidence CSS contains a nondeterministic font source')
+  }
+
+  let offset = 0
+  for (let index = 0; index < materializationManifest.stylesheets.length; index += 1) {
+    const stylesheet = materializationManifest.stylesheets[index]
+    const end = offset + stylesheet.materializedBytes
+    const chunk = content.subarray(offset, end)
+    if (chunk.length !== stylesheet.materializedBytes || sha256(chunk) !== stylesheet.materializedSha256) {
+      throw new Error(`Materialized reference font stylesheet ${index + 1} bytes do not match their manifest`)
+    }
+    offset = end
+    if (index < materializationManifest.stylesheets.length - 1) {
+      if (content[offset] !== 0x0a) throw new Error('Reference font stylesheets are missing their canonical separator')
+      offset += 1
+    }
+  }
+  if (offset !== content.length) throw new Error('Reference font CSS contains bytes outside its stylesheet manifest')
+
+  const urlTokens = fontCss.match(/\burl\s*\(/giu)?.length ?? 0
+  const urlPattern = /\burl\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^\s"')]+))\s*\)/giu
+  const embeddedFonts: Array<{ sha256: string; bytes: number }> = []
+  let parsedUrls = 0
+  for (const match of fontCss.matchAll(urlPattern)) {
+    parsedUrls += 1
+    const raw = match[1] ?? match[2] ?? match[3] ?? ''
+    const encoded = /^data:font\/woff2;base64,([A-Za-z0-9+/]+={0,2})$/u.exec(raw)?.[1]
+    if (!encoded || encoded.length % 4 !== 0) {
+      throw new Error('Reference font evidence CSS contains a non-materialized font URL')
+    }
+    const bytes = Buffer.from(encoded, 'base64')
+    if (bytes.toString('base64') !== encoded || !bytes.subarray(0, WOFF2_SIGNATURE.length).equals(WOFF2_SIGNATURE)) {
+      throw new Error('Reference font evidence CSS contains an invalid WOFF2 data URI')
+    }
+    embeddedFonts.push({ sha256: sha256(bytes), bytes: bytes.length })
+  }
+  if (parsedUrls !== urlTokens || parsedUrls === 0) {
+    throw new Error('Reference font evidence CSS contains an unparseable or missing font URL')
+  }
+  const uniqueEmbeddedFonts = embeddedFonts.filter((font, index) => (
+    embeddedFonts.findIndex((candidate) => candidate.sha256 === font.sha256) === index
+  ))
+  if (JSON.stringify(uniqueEmbeddedFonts) !== JSON.stringify(materializationManifest.fonts)) {
+    throw new Error('Reference font evidence WOFF2 bytes do not match the materialization manifest')
+  }
+
+  const declaredFamilies: string[] = []
+  const familyPattern = /\bfont-family\s*:\s*(?:"([^"]+)"|'([^']+)'|([^;{}]+))/giu
+  for (const match of fontCss.matchAll(familyPattern)) {
+    const family = (match[1] ?? match[2] ?? match[3] ?? '').trim()
+    if (!declaredFamilies.includes(family)) declaredFamilies.push(family)
+  }
+  if (JSON.stringify(declaredFamilies) !== JSON.stringify(familyNames)) {
+    throw new Error('Reference font evidence CSS families do not match their manifest')
+  }
+  return fontCss
+}
+
+function referenceFontBoundedInteger(value: unknown, label: string, minimum: number, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${label} must be an integer between ${minimum} and ${maximum}`)
+  }
+  return value
+}
+
+function referenceFontEvidenceManifestDigest(
+  core: Omit<ReferenceFontEvidenceManifest, 'manifestSha256'>,
+): string {
+  return sha256(Buffer.from(JSON.stringify(core), 'utf8'))
+}
+
+interface PreparedReferenceVisualEvidence {
+  manifest: ReferenceVisualEvidenceManifest
+  screenshots: Record<ReferenceVisualEvidencePhase, Buffer>
+}
+
+function prepareReferenceVisualEvidence(input: CommitReferenceVisualEvidenceInput): PreparedReferenceVisualEvidence {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('Reference visual evidence input must be an object')
+  }
+  const sourceEvidenceSha256 = normalizeReferenceVisualSha256(
+    input.sourceEvidenceSha256,
+    'Reference source evidence SHA-256',
+  )
+  const renderProfileSha256 = normalizeReferenceVisualSha256(
+    input.renderProfileSha256,
+    'Reference render profile SHA-256',
+  )
+  const viewport = normalizeReferenceVisualViewport(input.viewport)
+  if (!input.screenshots || typeof input.screenshots !== 'object' || Array.isArray(input.screenshots)) {
+    throw new Error('Reference visual screenshots must be an object')
+  }
+
+  const screenshots = {} as Record<ReferenceVisualEvidencePhase, Buffer>
+  const phases = {} as Record<ReferenceVisualEvidencePhase, ReferenceVisualPhaseEvidence>
+  let totalBytes = 0
+  for (const phase of REFERENCE_VISUAL_EVIDENCE_PHASES) {
+    const raw = input.screenshots[phase]
+    if (!Buffer.isBuffer(raw)) throw new Error(`Reference ${phase} screenshot must be a Buffer`)
+    const screenshot = Buffer.from(raw)
+    if (screenshot.length === 0 || screenshot.length > REFERENCE_VISUAL_EVIDENCE_MAX_IMAGE_BYTES) {
+      throw new Error(`Reference ${phase} screenshot exceeds the bounded image size`)
+    }
+    const dimensions = referenceVisualPngDimensions(screenshot, `Reference ${phase} screenshot`)
+    if (dimensions.width !== viewport.width || dimensions.height !== viewport.height) {
+      throw new Error(`Reference ${phase} screenshot dimensions do not match the reference viewport`)
+    }
+    totalBytes += screenshot.length
+    screenshots[phase] = screenshot
+    phases[phase] = {
+      sha256: sha256(screenshot),
+      bytes: screenshot.length,
+      width: dimensions.width,
+      height: dimensions.height,
+    }
+  }
+  if (totalBytes > REFERENCE_VISUAL_EVIDENCE_MAX_TOTAL_BYTES) {
+    throw new Error('Reference visual screenshots exceed the bounded total size')
+  }
+  if (new Set(REFERENCE_VISUAL_EVIDENCE_PHASES.map((phase) => phases[phase].sha256)).size !== REFERENCE_VISUAL_EVIDENCE_PHASES.length) {
+    throw new Error('Reference cover, content, and closing screenshots must have distinct SHA-256 digests')
+  }
+
+  const core = {
+    version: REFERENCE_VISUAL_EVIDENCE_VERSION,
+    sourceEvidenceSha256,
+    renderProfileSha256,
+    viewport,
+    phases,
+  }
+  const manifest = {
+    ...core,
+    manifestSha256: referenceVisualManifestDigest(core),
+  } satisfies ReferenceVisualEvidenceManifest
+  return { manifest, screenshots }
+}
+
+export function normalizeReferenceVisualEvidenceManifest(value: unknown): ReferenceVisualEvidenceManifest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Reference visual evidence manifest must be an object')
+  }
+  const input = value as Record<string, unknown>
+  if (input.version !== REFERENCE_VISUAL_EVIDENCE_VERSION) {
+    throw new Error('Reference visual evidence manifest version is invalid')
+  }
+  const sourceEvidenceSha256 = normalizeReferenceVisualSha256(
+    input.sourceEvidenceSha256,
+    'Reference source evidence SHA-256',
+  )
+  const renderProfileSha256 = normalizeReferenceVisualSha256(
+    input.renderProfileSha256,
+    'Reference render profile SHA-256',
+  )
+  const viewport = normalizeReferenceVisualViewport(input.viewport)
+  if (!input.phases || typeof input.phases !== 'object' || Array.isArray(input.phases)) {
+    throw new Error('Reference visual evidence phases must be an object')
+  }
+  const rawPhases = input.phases as Record<string, unknown>
+  const phases = {} as Record<ReferenceVisualEvidencePhase, ReferenceVisualPhaseEvidence>
+  let totalBytes = 0
+  for (const phase of REFERENCE_VISUAL_EVIDENCE_PHASES) {
+    const rawEvidence = rawPhases[phase]
+    if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) {
+      throw new Error(`Reference ${phase} visual evidence must be an object`)
+    }
+    const evidence = rawEvidence as Record<string, unknown>
+    const bytes = Number(evidence.bytes)
+    const width = Number(evidence.width)
+    const height = Number(evidence.height)
+    if (!Number.isInteger(bytes) || bytes <= 0 || bytes > REFERENCE_VISUAL_EVIDENCE_MAX_IMAGE_BYTES) {
+      throw new Error(`Reference ${phase} visual evidence bytes are out of bounds`)
+    }
+    if (width !== viewport.width || height !== viewport.height) {
+      throw new Error(`Reference ${phase} visual evidence dimensions do not match the reference viewport`)
+    }
+    totalBytes += bytes
+    phases[phase] = {
+      sha256: normalizeReferenceVisualSha256(evidence.sha256, `Reference ${phase} image SHA-256`),
+      bytes,
+      width,
+      height,
+    }
+  }
+  if (totalBytes > REFERENCE_VISUAL_EVIDENCE_MAX_TOTAL_BYTES) {
+    throw new Error('Reference visual evidence manifest exceeds the bounded total size')
+  }
+  if (new Set(REFERENCE_VISUAL_EVIDENCE_PHASES.map((phase) => phases[phase].sha256)).size !== REFERENCE_VISUAL_EVIDENCE_PHASES.length) {
+    throw new Error('Reference visual evidence phase SHA-256 digests must be distinct')
+  }
+  const core = {
+    version: REFERENCE_VISUAL_EVIDENCE_VERSION,
+    sourceEvidenceSha256,
+    renderProfileSha256,
+    viewport,
+    phases,
+  }
+  const manifestSha256 = normalizeReferenceVisualSha256(
+    input.manifestSha256,
+    'Reference visual evidence manifest SHA-256',
+  )
+  if (manifestSha256 !== referenceVisualManifestDigest(core)) {
+    throw new Error('Reference visual evidence manifest SHA-256 does not match its bindings')
+  }
+  return { ...core, manifestSha256 }
+}
+
+function normalizeReferenceVisualViewport(value: unknown): { width: number; height: number } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Reference visual evidence viewport must be an object')
+  }
+  const viewport = value as Record<string, unknown>
+  const width = Number(viewport.width)
+  const height = Number(viewport.height)
+  if (
+    !Number.isInteger(width)
+    || !Number.isInteger(height)
+    || width <= 0
+    || height <= 0
+    || width > REFERENCE_VISUAL_EVIDENCE_MAX_SIDE
+    || height > REFERENCE_VISUAL_EVIDENCE_MAX_SIDE
+  ) {
+    throw new Error(`Reference visual evidence viewport must be between 1 and ${REFERENCE_VISUAL_EVIDENCE_MAX_SIDE} pixels per side`)
+  }
+  return { width, height }
+}
+
+function normalizeReferenceVisualSha256(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/iu.test(value)) {
+    throw new Error(`${label} must be a SHA-256 digest`)
+  }
+  return value.toLowerCase()
+}
+
+function referenceVisualManifestDigest(
+  core: Omit<ReferenceVisualEvidenceManifest, 'manifestSha256'>,
+): string {
+  return sha256(Buffer.from(JSON.stringify(core), 'utf8'))
+}
+
+function referenceVisualPngDimensions(
+  content: Buffer,
+  label: string,
+): { width: number; height: number } {
+  if (
+    content.length < 33
+    || !content.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+    || content.readUInt32BE(8) !== 13
+    || content.subarray(12, 16).toString('ascii') !== 'IHDR'
+  ) {
+    throw new Error(`${label} is not a PNG with a valid IHDR header`)
+  }
+  const width = content.readUInt32BE(16)
+  const height = content.readUInt32BE(20)
+  if (
+    width <= 0
+    || height <= 0
+    || width > REFERENCE_VISUAL_EVIDENCE_MAX_SIDE
+    || height > REFERENCE_VISUAL_EVIDENCE_MAX_SIDE
+  ) {
+    throw new Error(`${label} dimensions are out of bounds`)
+  }
+  return { width, height }
+}
+
+async function ensurePrivateReferenceVisualDirectory(target: string): Promise<void> {
+  try {
+    await mkdir(target, { mode: 0o700 })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+  }
+  const info = await lstat(target)
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error('Reference visual evidence directory is not a private regular directory')
+  }
+  await chmod(target, 0o700)
+  await assertPrivateReferenceVisualDirectory(target)
+}
+
+async function assertPrivateReferenceVisualDirectory(target: string): Promise<void> {
+  let info
+  try {
+    info = await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('Reference visual evidence directory is missing')
+    }
+    throw error
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error('Reference visual evidence directory is not a private regular directory')
+  }
+  if ((info.mode & 0o777) !== 0o700) {
+    throw new Error('Reference visual evidence directory permissions are invalid')
+  }
+}
+
+async function verifyReferenceVisualEvidenceFile(
+  target: string,
+  expected: ReferenceVisualPhaseEvidence,
+  viewport: { width: number; height: number },
+): Promise<void> {
+  let before
+  try {
+    before = await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('Reference visual evidence file is missing')
+    }
+    throw error
+  }
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error('Reference visual evidence path is not a regular file')
+  }
+  if ((before.mode & 0o777) !== 0o600) {
+    throw new Error('Reference visual evidence file permissions are invalid')
+  }
+  if (before.size !== expected.bytes) {
+    throw new Error('Reference visual evidence byte size does not match its manifest')
+  }
+  const content = await readFile(target)
+  const after = await lstat(target)
+  if (
+    after.isSymbolicLink()
+    || !after.isFile()
+    || before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+  ) {
+    throw new Error('Reference visual evidence changed while it was being verified')
+  }
+  if (content.length !== expected.bytes || sha256(content) !== expected.sha256) {
+    throw new Error('Reference visual evidence bytes do not match their manifest')
+  }
+  const dimensions = referenceVisualPngDimensions(content, 'Reference visual evidence file')
+  if (
+    dimensions.width !== expected.width
+    || dimensions.height !== expected.height
+    || dimensions.width !== viewport.width
+    || dimensions.height !== viewport.height
+  ) {
+    throw new Error('Reference visual evidence dimensions do not match their manifest')
+  }
+}
+
+async function ensurePrivateReferenceFontDirectory(target: string): Promise<void> {
+  try {
+    await mkdir(target, { mode: 0o700 })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+  }
+  const info = await lstat(target)
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error('Reference font evidence directory is not a private regular directory')
+  }
+  await chmod(target, 0o700)
+  await assertPrivateReferenceFontDirectory(target)
+}
+
+async function assertPrivateReferenceFontDirectory(target: string): Promise<void> {
+  let info
+  try {
+    info = await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('Reference font evidence directory is missing')
+    }
+    throw error
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error('Reference font evidence directory is not a private regular directory')
+  }
+  if ((info.mode & 0o777) !== 0o700) {
+    throw new Error('Reference font evidence directory permissions are invalid')
+  }
+}
+
+async function verifyReferenceFontEvidenceFile(
+  target: string,
+  expected: ReferenceFontEvidenceManifest,
+): Promise<string> {
+  let before
+  try {
+    before = await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('Reference font evidence file is missing')
+    }
+    throw error
+  }
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error('Reference font evidence path is not a regular file')
+  }
+  if ((before.mode & 0o777) !== 0o600) {
+    throw new Error('Reference font evidence file permissions are invalid')
+  }
+  if (before.size !== expected.fontCssBytes) {
+    throw new Error('Reference font evidence byte size does not match its manifest')
+  }
+  const content = await readFile(target)
+  const after = await lstat(target)
+  if (
+    after.isSymbolicLink()
+    || !after.isFile()
+    || (after.mode & 0o777) !== 0o600
+    || before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+  ) {
+    throw new Error('Reference font evidence changed while it was being verified')
+  }
+  if (content.length !== expected.fontCssBytes || sha256(content) !== expected.fontCssSha256) {
+    throw new Error('Reference font evidence bytes do not match their manifest')
+  }
+  return validateReferenceFontCssBindings(content, expected.familyNames, expected.materializationManifest)
 }
 
 async function cleanupWorkspaceMutationFiles(

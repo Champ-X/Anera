@@ -567,8 +567,14 @@ function assertPresentFileResult(record: Record<string, unknown>): void {
   const status = statusOf(record)
   if (status === 'error') return assertErrorMessage(record)
   if (status !== 'success') throw new Error('result.status must be success or error')
-  exactKeys(record, ['status', 'path'], [], 'result')
+  // The local presenter binds publication to the exact bytes that were
+  // opened. Keep the legacy two-field success variant readable for recovered
+  // Arena histories, while admitting and validating the stronger attestation
+  // emitted by the current runtime.
+  exactKeys(record, ['status', 'path'], ['artifact_hash', 'bytes'], 'result')
   stringValue(record.path, 'result.path')
+  if (record.artifact_hash !== undefined) boundedString(record.artifact_hash, 'result.artifact_hash', 128)
+  if (record.bytes !== undefined) nonNegativeInteger(record.bytes, 'result.bytes')
 }
 
 function assertProposePlanResult(record: Record<string, unknown>): void {

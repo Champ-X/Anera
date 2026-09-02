@@ -468,10 +468,12 @@ button { color: inherit; }
 .session-limit-card button { height: 28px; display: flex; align-items: center; gap: 5px; flex: none; border: 1px solid #cfc5b7; border-radius: 6px; padding: 0 9px; background: white; color: #5c5349; font-size: 9.5px; cursor: pointer; }
 .session-limit-card button:hover { background: #f4efe7; }
 .composer { position: relative; width: min(760px, 100%); min-height: 138px; margin: 0 auto; border: 1px solid #d5d2cb; border-radius: 12px; background: white; box-shadow: 0 3px 14px rgb(40 38 32 / 5%); overflow: visible; transition: border-color 150ms ease, box-shadow 150ms ease; }
+.composer:focus-within:not(.is-dragging) { border-color: #aaa69d; }
 .composer.has-repository-control { border-radius: 12px 12px 0 0; }
 .composer.is-dragging { border-color: #278be3; box-shadow: 0 0 0 3px rgb(39 139 227 / 12%), 0 5px 22px rgb(40 38 32 / 8%); }
 .drop-files-overlay { position: absolute; z-index: 4; inset: 0; display: flex; align-items: center; justify-content: center; gap: 7px; border-radius: inherit; background: rgb(244 249 254 / 94%); color: #278be3; font-size: 12px; font-weight: 600; pointer-events: none; }
 .composer-editor { display: block; width: 100%; min-height: 93px; max-height: 180px; overflow-x: hidden; overflow-y: auto; border: 0; outline: 0; padding: 16px 14px 6px; background: transparent; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; line-height: 1.5; cursor: text; }
+.composer .composer-editor:focus-visible { outline: 0; }
 .composer-editor:empty::before { content: attr(data-placeholder); color: #9a978f; pointer-events: none; }
 .composer-editor[contenteditable="false"] { cursor: default; }
 .composer-tools { height: 44px; display: flex; align-items: center; gap: 8px; padding: 0 7px 7px; }

@@ -15,7 +15,7 @@ const call = {
   arguments: { path, content: `${marker}\n` },
 }
 
-const first = new SessionStore(config.dataRoot, config.model, config.sessionTokenLimit)
+const first = new SessionStore(config.dataRoot, config.model)
 await first.initialize()
 const session = await first.create()
 await first.update(session.summary.id, (state) => {
@@ -48,7 +48,7 @@ await first.append(session.summary.id, 'tool.started', { call }, { turnId, stepI
 // but neither the terminal event nor the provider tool message became durable.
 await writeFile(first.workspaceDir(session.summary.id) + `/${path}`, `${marker}\n`, 'utf8')
 
-const restarted = new SessionStore(config.dataRoot, config.model, config.sessionTokenLimit)
+const restarted = new SessionStore(config.dataRoot, config.model)
 await restarted.initialize()
 const recoveredBeforeResume = await restarted.get(session.summary.id)
 const recoveryEvents = await restarted.events(session.summary.id)

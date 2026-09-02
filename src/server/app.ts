@@ -40,6 +40,7 @@ import {
   type CodingSessionInput,
 } from './github-connector.js'
 import { SessionStore, type StoredSession } from './session-store.js'
+import { injectMaterializedReferenceFonts } from './reference-fonts.js'
 import { extractAttachmentPage } from './attachment-extractor.js'
 import { validateAgentUploadBytes } from './agent-upload-validation.js'
 import { normalizeAneraTrace, traceToJsonl } from './trace-normalizer.js'
@@ -63,7 +64,6 @@ import {
 export interface CreateAppOptions {
   dataRoot?: string
   model?: string
-  sessionTokenLimit?: number
   dailyFreeCredits?: number
   creditsPerUsd?: number
   creditNow?: () => Date
@@ -86,11 +86,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   const initialModel = options.model ?? config.model
   const dataRoot = options.dataRoot ?? config.dataRoot
   const customFeedbackArm = options.customFeedbackArm ?? config.customFeedbackArm
-  const store = new SessionStore(
-    dataRoot,
-    initialModel,
-    options.sessionTokenLimit ?? config.sessionTokenLimit,
-  )
+  const store = new SessionStore(dataRoot, initialModel)
   await store.initialize()
   const localUserId = await loadLocalUserId(dataRoot)
   const agentCasRoot = resolve(dataRoot, 'agent-cas')
@@ -789,10 +785,41 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   app.get('/api/sessions/:id/download', async (request, response) => {
     const path = typeof request.query.path === 'string' ? request.query.path : ''
     if (!path) throw new Error('path query parameter is required')
-    const target = resolveWorkspacePath(store.workspaceDir(request.params.id), path)
-    await assertNoSymlinkTraversal(store.workspaceDir(request.params.id), target)
+    const id = request.params.id
+    const workspace = store.workspaceDir(id)
+    const target = resolveWorkspacePath(workspace, path)
+    await assertNoSymlinkTraversal(workspace, target)
     if (!(await stat(target)).isFile()) throw new Error('Path is not a file')
     response.attachment(basename(target))
+    const state = await store.get(id)
+    const referenceStyle = state.activeReferenceStyleContract
+    if (
+      referenceStyle?.contract.strictness === 'exact'
+      && state.website.entryPath
+      && /\.html?$/iu.test(target)
+    ) {
+      const entryTarget = resolveWorkspacePath(workspace, state.website.entryPath)
+      await assertNoSymlinkTraversal(workspace, entryTarget)
+      if (entryTarget === target) {
+        const fontEvidence = referenceStyle.fontEvidence
+        if (!fontEvidence) {
+          throw statusError('Exact reference download is unavailable because its private font evidence is missing', 409)
+        }
+        if (fontEvidence.sourceEvidenceSha256 !== referenceStyle.provenance.evidenceSha256) {
+          throw statusError('Exact reference download is unavailable because its font evidence is bound to another source', 409)
+        }
+        const resolvedFonts = await store.resolveReferenceFontEvidence(id, fontEvidence)
+        const html = injectWorkspaceReferenceFonts(
+          await readFile(target, 'utf8'),
+          resolvedFonts.fontCss,
+          fontEvidence.manifestSha256,
+        )
+        response.setHeader('cache-control', 'private, no-store')
+        response.setHeader('x-anera-reference-font-manifest-sha256', fontEvidence.manifestSha256)
+        response.send(html)
+        return
+      }
+    }
     createReadStream(target).pipe(response)
   })
 
@@ -840,6 +867,19 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
         const starting = { ...state.website, status: 'starting' as const, updatedAt: new Date().toISOString() }
         await store.recordWebsiteUpdate(id, starting, { action: 'restart' }, eventContext)
         try {
+          let exactPreviewUrl: string | undefined
+          if (state.activeReferenceStyleContract?.contract.strictness === 'exact') {
+            const fontEvidence = state.activeReferenceStyleContract.fontEvidence
+            const entryPath = state.website.entryPath
+            if (!fontEvidence || !entryPath) {
+              throw new Error('Exact reference Website restart requires its verified entry and private font evidence')
+            }
+            if (fontEvidence.sourceEvidenceSha256 !== state.activeReferenceStyleContract.provenance.evidenceSha256) {
+              throw new Error('Exact reference Website restart font evidence is bound to another source')
+            }
+            await store.resolveReferenceFontEvidence(id, fontEvidence)
+            exactPreviewUrl = `/workspace/${id}/preview/${encodeWorkspaceUrlPath(entryPath)}`
+          }
           if (state.website.processId) {
             const durableProcess = state.processes.find((process) => process.id === state.website.processId)
             if (!durableProcess) throw new Error('Managed Website process record not found')
@@ -849,7 +889,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
               status: 'running' as const,
               processId: process.id,
               port: process.port,
-              previewUrl: `http://127.0.0.1:${process.port}`,
+              ...(state.website.entryPath ? { entryPath: state.website.entryPath } : {}),
+              previewUrl: exactPreviewUrl ?? `http://127.0.0.1:${process.port}`,
               restartCount: state.website.restartCount + 1,
               updatedAt: new Date().toISOString(),
             }
@@ -915,8 +956,25 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
       response.type(contentType)
       if (isActiveWorkspaceContent(contentType)) setWorkspaceSecurityHeaders(response)
       response.setHeader('cache-control', 'no-cache')
-      if (contentType === 'text/html' && request.query.aneraElementPicker === '1') {
-        response.send(injectWorkspaceElementPicker(await readFile(target, 'utf8')))
+      const referenceStyle = state.activeReferenceStyleContract
+      const exactReference = referenceStyle?.contract.strictness === 'exact'
+      const elementPicker = request.query.aneraElementPicker === '1'
+      if (contentType === 'text/html' && (exactReference || elementPicker)) {
+        let html = await readFile(target, 'utf8')
+        if (exactReference) {
+          const fontEvidence = referenceStyle?.fontEvidence
+          if (!fontEvidence) {
+            throw statusError('Exact reference preview is unavailable because its private font evidence is missing', 409)
+          }
+          if (fontEvidence.sourceEvidenceSha256 !== referenceStyle?.provenance.evidenceSha256) {
+            throw statusError('Exact reference preview is unavailable because its font evidence is bound to another source', 409)
+          }
+          const resolvedFonts = await store.resolveReferenceFontEvidence(id, fontEvidence)
+          html = injectWorkspaceReferenceFonts(html, resolvedFonts.fontCss, fontEvidence.manifestSha256)
+          response.setHeader('cache-control', 'private, no-store')
+        }
+        if (elementPicker) html = injectWorkspaceElementPicker(html)
+        response.send(html)
         return
       }
       createReadStream(target).pipe(response)
@@ -1863,6 +1921,18 @@ export function injectWorkspaceElementPicker(html: string): string {
   const closingBody = html.search(/<\/body\s*>/i)
   if (closingBody < 0) return `${html}${WORKSPACE_ELEMENT_PICKER_BOOTSTRAP}`
   return `${html.slice(0, closingBody)}${WORKSPACE_ELEMENT_PICKER_BOOTSTRAP}${html.slice(closingBody)}`
+}
+
+/**
+ * Add verified private font CSS without trusting the candidate document to
+ * choose an insertion point or reserve Arena's evidence marker for itself.
+ */
+export function injectWorkspaceReferenceFonts(
+  html: string,
+  fontCss: string,
+  manifestSha256: string,
+): string {
+  return injectMaterializedReferenceFonts(html, fontCss, manifestSha256)
 }
 
 function isActiveWorkspaceContent(contentType: string): boolean {

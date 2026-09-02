@@ -207,7 +207,6 @@ export const config = {
   agentModels: modelList(primaryModel),
   customFeedbackArm: customFeedbackArm(),
   visionModel: env('DEEPSEEK_VISION_MODEL', 'deepseek-v4-flash-vision-exp'),
-  maxAgentSteps: positiveInt('ANERA_MAX_AGENT_STEPS', 30),
   maxToolCallsPerStep: positiveInt('ANERA_MAX_TOOL_CALLS_PER_STEP', 16),
   maxToolCallsPerRun: positiveInt('ANERA_MAX_TOOL_CALLS_PER_RUN', 96),
   maxParallelToolCalls: positiveInt('ANERA_MAX_PARALLEL_TOOL_CALLS', 6),
@@ -219,7 +218,6 @@ export const config = {
   // provider stall into a multi-minute Agent run.
   modelFirstEventTimeoutMs: positiveInt('ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS', 20_000),
   maxLengthContinuations: positiveInt('ANERA_MAX_LENGTH_CONTINUATIONS', 2),
-  sessionTokenLimit: positiveInt('ANERA_SESSION_TOKEN_LIMIT', 1_000_000),
   dailyFreeCredits: positiveInt('ANERA_DAILY_FREE_CREDITS', 2_500),
   creditsPerUsd: positiveInt('ANERA_CREDITS_PER_USD', 1_000),
   toolTimeoutMs: positiveInt('ANERA_TOOL_TIMEOUT_MS', 120_000),

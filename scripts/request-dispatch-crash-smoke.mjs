@@ -14,7 +14,7 @@ if (process.argv[2] === 'child') {
   const prompt = `Do not use any tools. Resume this accepted request after recovery and return exactly ${marker}, with no other text.`
   const turnId = 'turn_request_dispatch_crash_fixture'
   const eventId = `evt_${randomUUID().replaceAll('-', '').slice(0, 20)}`
-  const store = new SessionStore(root, config.model, config.sessionTokenLimit)
+  const store = new SessionStore(root, config.model)
   await store.initialize()
   const session = await store.create()
   const eventData = {
@@ -95,7 +95,7 @@ try {
     throw new Error(`Expected SIGKILL, got code=${killed.code} signal=${killed.signal}: ${childStderr || childStdout}`)
   }
 
-  const restarted = new SessionStore(config.dataRoot, config.model, config.sessionTokenLimit)
+  const restarted = new SessionStore(config.dataRoot, config.model)
   await restarted.initialize()
   const recovered = await restarted.get(failpoint.sessionId)
   const recoveryEvents = await restarted.events(failpoint.sessionId)

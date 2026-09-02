@@ -14,7 +14,7 @@ if (process.argv[2] === 'child') {
   const { AgentService } = await import('../dist-server/server/agent-service.js')
   const marker = 'TERMINAL-CRASH-RECOVERY-OK-829'
   const prompt = `Do not use any tools. Return only the marker ${marker}, with no other text.`
-  const store = new SessionStore(root, config.model, config.sessionTokenLimit)
+  const store = new SessionStore(root, config.model)
   await store.initialize()
   const session = await store.create()
 
@@ -317,7 +317,7 @@ try {
     throw new Error(`Expected SIGKILL, got code=${killed.code} signal=${killed.signal}: ${childStderr || childStdout}`)
   }
 
-  const restarted = new SessionStore(config.dataRoot, config.model, config.sessionTokenLimit)
+  const restarted = new SessionStore(config.dataRoot, config.model)
   await restarted.initialize()
   const recovered = await restarted.get(failpoint.sessionId)
   const events = await restarted.events(failpoint.sessionId)

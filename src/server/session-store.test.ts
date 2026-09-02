@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -8,7 +8,16 @@ import {
   createStaticDeploymentSnapshot,
   deploymentSnapshotManifestPath,
 } from './deployment.js'
-import { SessionStore, type DurablePendingDeployment, type DurablePendingTerminal } from './session-store.js'
+import {
+  REFERENCE_VISUAL_EVIDENCE_MAX_IMAGE_BYTES,
+  REFERENCE_VISUAL_EVIDENCE_MAX_TOTAL_BYTES,
+  SessionStore,
+  type DurablePendingDeployment,
+  type DurablePendingTerminal,
+  type ReferenceFontEvidenceManifest,
+  type ReferenceVisualEvidenceManifest,
+} from './session-store.js'
+import type { ReferenceFontManifest } from './reference-fonts.js'
 import { applyWorkspacePatch } from './workspace-patch.js'
 import { workspaceFileSnapshot } from './workspace.js'
 
@@ -64,12 +73,389 @@ function artifactRecord(sessionId: string, path: string, id: string, createdAt =
   }
 }
 
+function referencePng(width: number, height: number, marker: string): Buffer {
+  const markerBytes = Buffer.from(marker, 'utf8')
+  const png = Buffer.alloc(33 + markerBytes.length)
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0)
+  png.writeUInt32BE(13, 8)
+  png.write('IHDR', 12, 'ascii')
+  png.writeUInt32BE(width, 16)
+  png.writeUInt32BE(height, 20)
+  png[24] = 8
+  png[25] = 6
+  markerBytes.copy(png, 33)
+  return png
+}
+
+function referenceScreenshots(width = 1_440, height = 900) {
+  return {
+    cover: referencePng(width, height, 'cover'),
+    content: referencePng(width, height, 'content'),
+    closing: referencePng(width, height, 'closing'),
+  }
+}
+
+function testSha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function referenceFontFixture(options: { font?: Buffer; familyName?: string } = {}): {
+  fontCss: string
+  familyNames: string[]
+  materializationManifest: ReferenceFontManifest
+} {
+  const font = options.font ?? Buffer.from('wOF2anera-reference-font')
+  const familyName = options.familyName ?? 'Reference Sans'
+  const fontSha256 = testSha256(font)
+  const fontCss = `@font-face {\n  font-family: '${familyName}';\n  src: url("data:font/woff2;base64,${font.toString('base64')}") format("woff2");\n}\n`
+  const source = Buffer.from(`source stylesheet for ${familyName}`, 'utf8')
+  const core = {
+    version: 1 as const,
+    stylesheets: [{
+      sha256: testSha256(source),
+      bytes: source.length,
+      materializedSha256: testSha256(fontCss),
+      materializedBytes: Buffer.byteLength(fontCss),
+      fontSha256: [fontSha256],
+    }],
+    fonts: [{ sha256: fontSha256, bytes: font.length }],
+    familyNames: [familyName],
+    cssBytes: source.length,
+    fontBytes: font.length,
+  }
+  return {
+    fontCss,
+    familyNames: core.familyNames,
+    materializationManifest: {
+      ...core,
+      manifestSha256: testSha256(JSON.stringify(core)),
+    },
+  }
+}
+
 afterEach(async () => {
   vi.useRealTimers()
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 describe('session store', () => {
+  it('treats cumulative token usage as metering and removes legacy admission limits', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-unlimited-usage-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    expect(session.summary.limits).toBeUndefined()
+
+    const statePath = resolve(store.sessionDir(session.summary.id), 'state.json')
+    const legacy = JSON.parse(await readFile(statePath, 'utf8')) as {
+      summary: Record<string, unknown> & { usage: { totalTokens: number }; limits?: unknown }
+    }
+    legacy.summary.usage.totalTokens = 1_500_000
+    legacy.summary.limits = {
+      sessionTokens: {
+        maxTokens: 1_000_000,
+        usedTokens: 1_500_000,
+        remainingTokens: 0,
+        reached: true,
+        message: 'legacy limit',
+      },
+    }
+    await writeFile(statePath, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8')
+
+    expect((await store.get(session.summary.id)).summary.limits).toBeUndefined()
+    await store.update(session.summary.id, (state) => {
+      state.summary.usage.promptTokens += 1
+    })
+    const persisted = JSON.parse(await readFile(statePath, 'utf8')) as { summary: { limits?: unknown } }
+    expect(persisted.summary.limits).toBeUndefined()
+  })
+
+  it('stores path-free reference visual evidence privately and resolves it after restart', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-reference-visual-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const screenshots = referenceScreenshots()
+    const manifest = await store.commitReferenceVisualEvidence(session.summary.id, {
+      sourceEvidenceSha256: 'A'.repeat(64),
+      renderProfileSha256: 'b'.repeat(64),
+      viewport: { width: 1_440, height: 900 },
+      screenshots,
+    })
+
+    expect(manifest).toMatchObject({
+      version: 1,
+      sourceEvidenceSha256: 'a'.repeat(64),
+      renderProfileSha256: 'b'.repeat(64),
+      viewport: { width: 1_440, height: 900 },
+      manifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      phases: {
+        cover: { bytes: screenshots.cover.length, width: 1_440, height: 900, sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) },
+        content: { bytes: screenshots.content.length, width: 1_440, height: 900, sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) },
+        closing: { bytes: screenshots.closing.length, width: 1_440, height: 900, sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) },
+      },
+    })
+    expect(JSON.stringify(manifest)).not.toContain(store.sessionDir(session.summary.id))
+    expect(JSON.stringify(manifest)).not.toMatch(/(?:^|["'])path["']\s*:/u)
+    expect(new Set(Object.values(manifest.phases).map((phase) => phase.sha256))).toHaveProperty('size', 3)
+
+    const privateRoot = resolve(store.sessionDir(session.summary.id), 'reference-style')
+    const manifestDirectory = resolve(privateRoot, 'v1', manifest.manifestSha256)
+    for (const directory of [privateRoot, resolve(privateRoot, 'v1'), manifestDirectory]) {
+      expect((await lstat(directory)).mode & 0o777).toBe(0o700)
+    }
+    for (const phase of ['cover', 'content', 'closing'] as const) {
+      const expectedPath = resolve(
+        manifestDirectory,
+        `${phase}-${manifest.phases[phase].sha256}.png`,
+      )
+      expect(await store.resolveReferenceVisualEvidencePath(session.summary.id, manifest, phase)).toBe(expectedPath)
+      expect(await readFile(expectedPath)).toEqual(screenshots[phase])
+      expect((await lstat(expectedPath)).mode & 0o777).toBe(0o600)
+    }
+
+    expect(await readdir(store.workspaceDir(session.summary.id))).toEqual([])
+    const unchanged = await store.get(session.summary.id)
+    expect(unchanged.artifacts).toEqual([])
+    expect(unchanged.summary.workspaceBytes).toBe(0)
+
+    const restarted = new SessionStore(root, 'test-model')
+    await restarted.initialize()
+    for (const phase of ['cover', 'content', 'closing'] as const) {
+      const path = await restarted.resolveReferenceVisualEvidencePath(session.summary.id, manifest, phase)
+      expect(await readFile(path)).toEqual(screenshots[phase])
+    }
+  })
+
+  it('fails closed for tampered, missing, symlinked, or wrongly bound private reference evidence', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-reference-visual-corrupt-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+
+    const createEvidence = async () => {
+      const session = await store.create()
+      const manifest = await store.commitReferenceVisualEvidence(session.summary.id, {
+        sourceEvidenceSha256: 'c'.repeat(64),
+        renderProfileSha256: 'd'.repeat(64),
+        viewport: { width: 1_440, height: 900 },
+        screenshots: referenceScreenshots(),
+      })
+      return { sessionId: session.summary.id, manifest }
+    }
+
+    const tampered = await createEvidence()
+    const tamperedPath = await store.resolveReferenceVisualEvidencePath(tampered.sessionId, tampered.manifest, 'cover')
+    await writeFile(tamperedPath, referencePng(1_440, 900, 'tampered'))
+    await expect(store.resolveReferenceVisualEvidencePath(tampered.sessionId, tampered.manifest, 'cover'))
+      .rejects.toThrow(/(?:byte size|bytes do not match)/iu)
+
+    const missing = await createEvidence()
+    const missingPath = await store.resolveReferenceVisualEvidencePath(missing.sessionId, missing.manifest, 'content')
+    await rm(missingPath)
+    await expect(store.resolveReferenceVisualEvidencePath(missing.sessionId, missing.manifest, 'content'))
+      .rejects.toThrow(/missing/iu)
+
+    const linked = await createEvidence()
+    const linkedCover = await store.resolveReferenceVisualEvidencePath(linked.sessionId, linked.manifest, 'cover')
+    const linkedClosing = await store.resolveReferenceVisualEvidencePath(linked.sessionId, linked.manifest, 'closing')
+    await rm(linkedClosing)
+    await symlink(linkedCover, linkedClosing)
+    await expect(store.resolveReferenceVisualEvidencePath(linked.sessionId, linked.manifest, 'closing'))
+      .rejects.toThrow(/regular file/iu)
+
+    const wrong = await createEvidence()
+    const wrongManifest: ReferenceVisualEvidenceManifest = {
+      ...wrong.manifest,
+      sourceEvidenceSha256: 'e'.repeat(64),
+    }
+    await expect(store.resolveReferenceVisualEvidencePath(wrong.sessionId, wrongManifest, 'cover'))
+      .rejects.toThrow(/manifest SHA-256 does not match/iu)
+  })
+
+  it('rejects malformed, duplicate, dimension-mismatched, and oversized reference screenshots before writing', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-reference-visual-invalid-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const base = {
+      sourceEvidenceSha256: '1'.repeat(64),
+      renderProfileSha256: '2'.repeat(64),
+      viewport: { width: 1_440, height: 900 },
+    }
+
+    await expect(store.commitReferenceVisualEvidence(session.summary.id, {
+      ...base,
+      screenshots: { ...referenceScreenshots(), cover: Buffer.alloc(33) },
+    })).rejects.toThrow(/valid IHDR/iu)
+    await expect(store.commitReferenceVisualEvidence(session.summary.id, {
+      ...base,
+      screenshots: { ...referenceScreenshots(), content: referencePng(1_439, 900, 'wrong-size') },
+    })).rejects.toThrow(/dimensions do not match/iu)
+    const duplicate = referencePng(1_440, 900, 'same')
+    await expect(store.commitReferenceVisualEvidence(session.summary.id, {
+      ...base,
+      screenshots: { cover: duplicate, content: duplicate, closing: referencePng(1_440, 900, 'other') },
+    })).rejects.toThrow(/distinct SHA-256/iu)
+
+    const tooLarge = Buffer.alloc(REFERENCE_VISUAL_EVIDENCE_MAX_IMAGE_BYTES + 1)
+    referencePng(1_440, 900, 'large').copy(tooLarge)
+    await expect(store.commitReferenceVisualEvidence(session.summary.id, {
+      ...base,
+      screenshots: { ...referenceScreenshots(), cover: tooLarge },
+    })).rejects.toThrow(/bounded image size/iu)
+
+    const perImage = Math.floor(REFERENCE_VISUAL_EVIDENCE_MAX_TOTAL_BYTES / 3) + 1
+    const largePhase = (marker: number) => {
+      const value = Buffer.alloc(perImage, marker)
+      referencePng(1_440, 900, String(marker)).copy(value)
+      return value
+    }
+    await expect(store.commitReferenceVisualEvidence(session.summary.id, {
+      ...base,
+      screenshots: { cover: largePhase(1), content: largePhase(2), closing: largePhase(3) },
+    })).rejects.toThrow(/bounded total size/iu)
+    await expect(readdir(resolve(store.sessionDir(session.summary.id), 'reference-style')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('stores path-free materialized font evidence privately and resolves it after restart', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-reference-fonts-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const fixture = referenceFontFixture()
+    const manifest = await store.commitReferenceFontEvidence(session.summary.id, {
+      sourceEvidenceSha256: 'A'.repeat(64),
+      ...fixture,
+    })
+
+    expect(manifest).toMatchObject({
+      version: 1,
+      sourceEvidenceSha256: 'a'.repeat(64),
+      fontCssSha256: testSha256(fixture.fontCss),
+      fontCssBytes: Buffer.byteLength(fixture.fontCss),
+      familyNames: ['Reference Sans'],
+      materializationManifest: fixture.materializationManifest,
+      manifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    })
+    expect(JSON.stringify(manifest)).not.toContain(store.sessionDir(session.summary.id))
+    expect(JSON.stringify(manifest)).not.toMatch(/(?:^|["'])path["']\s*:/u)
+
+    const privateRoot = resolve(store.sessionDir(session.summary.id), 'reference-style')
+    const manifestDirectory = resolve(privateRoot, 'fonts', 'v1', manifest.manifestSha256)
+    for (const directory of [
+      privateRoot,
+      resolve(privateRoot, 'fonts'),
+      resolve(privateRoot, 'fonts', 'v1'),
+      manifestDirectory,
+    ]) {
+      expect((await lstat(directory)).mode & 0o777).toBe(0o700)
+    }
+    const cssPath = resolve(manifestDirectory, `${manifest.fontCssSha256}.css`)
+    expect((await lstat(cssPath)).mode & 0o777).toBe(0o600)
+    await expect(readFile(cssPath, 'utf8')).resolves.toBe(fixture.fontCss)
+    await expect(store.resolveReferenceFontEvidence(session.summary.id, manifest)).resolves.toEqual({
+      fontCss: fixture.fontCss,
+      familyNames: fixture.familyNames,
+    })
+
+    const restarted = new SessionStore(root, 'test-model')
+    await restarted.initialize()
+    await expect(restarted.resolveReferenceFontEvidence(session.summary.id, manifest)).resolves.toEqual({
+      fontCss: fixture.fontCss,
+      familyNames: fixture.familyNames,
+    })
+    expect(await readdir(store.workspaceDir(session.summary.id))).toEqual([])
+    expect((await store.get(session.summary.id)).artifacts).toEqual([])
+
+    const noExternalFonts = await store.commitReferenceFontEvidence(session.summary.id, {
+      sourceEvidenceSha256: 'b'.repeat(64),
+      fontCss: '',
+      familyNames: [],
+      materializationManifest: null,
+    })
+    expect(noExternalFonts).toMatchObject({
+      fontCssBytes: 0,
+      fontCssSha256: testSha256(''),
+      familyNames: [],
+      materializationManifest: null,
+    })
+    await expect(store.resolveReferenceFontEvidence(session.summary.id, noExternalFonts)).resolves.toEqual({
+      fontCss: '',
+      familyNames: [],
+    })
+  })
+
+  it('fails closed for tampered, missing, symlinked, wrongly bound, or unsafe font evidence', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-reference-fonts-corrupt-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const fixture = referenceFontFixture()
+
+    const createEvidence = async () => {
+      const session = await store.create()
+      const manifest = await store.commitReferenceFontEvidence(session.summary.id, {
+        sourceEvidenceSha256: 'c'.repeat(64),
+        ...fixture,
+      })
+      const path = resolve(
+        store.sessionDir(session.summary.id),
+        'reference-style',
+        'fonts',
+        'v1',
+        manifest.manifestSha256,
+        `${manifest.fontCssSha256}.css`,
+      )
+      return { sessionId: session.summary.id, manifest, path }
+    }
+
+    const tampered = await createEvidence()
+    await writeFile(tampered.path, Buffer.alloc(tampered.manifest.fontCssBytes, 0x78))
+    await expect(store.resolveReferenceFontEvidence(tampered.sessionId, tampered.manifest))
+      .rejects.toThrow(/bytes do not match/iu)
+
+    const missing = await createEvidence()
+    await rm(missing.path)
+    await expect(store.resolveReferenceFontEvidence(missing.sessionId, missing.manifest))
+      .rejects.toThrow(/missing/iu)
+
+    const linked = await createEvidence()
+    await rm(linked.path)
+    await symlink(resolve(store.sessionDir(linked.sessionId), 'state.json'), linked.path)
+    await expect(store.resolveReferenceFontEvidence(linked.sessionId, linked.manifest))
+      .rejects.toThrow(/regular file/iu)
+
+    const wrong = await createEvidence()
+    const wrongManifest: ReferenceFontEvidenceManifest = {
+      ...wrong.manifest,
+      sourceEvidenceSha256: 'd'.repeat(64),
+    }
+    await expect(store.resolveReferenceFontEvidence(wrong.sessionId, wrongManifest))
+      .rejects.toThrow(/manifest SHA-256 does not match/iu)
+
+    const emptySession = await store.create()
+    await expect(store.commitReferenceFontEvidence(emptySession.summary.id, {
+      sourceEvidenceSha256: 'e'.repeat(64),
+      fontCss: 'body { font-family: sans-serif; }',
+      familyNames: [],
+      materializationManifest: null,
+    })).rejects.toThrow(/must attest empty CSS/iu)
+
+    const invalidWoff2 = referenceFontFixture({ font: Buffer.from('NOT-a-woff2-file') })
+    await expect(store.commitReferenceFontEvidence(emptySession.summary.id, {
+      sourceEvidenceSha256: 'e'.repeat(64),
+      ...invalidWoff2,
+    })).rejects.toThrow(/invalid WOFF2/iu)
+    await expect(readdir(resolve(store.sessionDir(emptySession.summary.id), 'reference-style')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('treats only a missing event log as empty and surfaces other read failures', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-read-errors-'))
     roots.push(root)

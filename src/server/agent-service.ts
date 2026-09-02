@@ -4,7 +4,6 @@ import {
   type AgentModelOption,
   type CodingSessionStatus,
   type EstimatedCostStatus,
-  SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
   type ModelMessage,
   type SessionEvent,
   type SessionSummary,
@@ -16,20 +15,41 @@ import { arenaToolErrorResult } from './arena-tool-result.js'
 import { createWorkspaceArtifact } from './artifact.js'
 import { config } from './config.js'
 import type { DailyCreditStore } from './credit-store.js'
-import { DeepSeekClient, type ModelResult, type ModelToolCallDelta } from './deepseek.js'
+import {
+  DeepSeekClient,
+  isDegenerateModelRepetition,
+  projectProviderMessages,
+  type ModelResult,
+  type ModelToolCallDelta,
+} from './deepseek.js'
 import { createId } from './ids.js'
 import { ProcessManager } from './process-manager.js'
 import { fetchPublicUrl } from './network-policy.js'
 import { findSensitiveValues } from './redaction.js'
-import type {
-  ContextPressureAnchor,
-  DurablePendingApproval,
-  DurablePendingHitl,
-  DurablePendingTerminal,
-  DurableUsageSettlement,
-  DurableUsageSource,
-  SessionStore,
-  StoredSession,
+import {
+  findReferenceStyleEvidence,
+  latestSuccessfulReferenceStyleContract,
+  referenceStyleEvidenceContinuation,
+  referenceUrlsAreRelated,
+  type DurableReferenceStyleContract,
+  type ReferenceRenderPhase,
+  type ReferenceStyleEvidenceContinuation,
+  type ReferenceStrictness,
+  type ReferenceStyleContract,
+} from './reference-style.js'
+import {
+  normalizeReferenceFontEvidenceManifest,
+  normalizeReferenceVisualEvidenceManifest,
+  type ContextPressureAnchor,
+  type DurableVisualNoProgressState,
+  type DurableReferenceStyleEvidenceInvalidation,
+  type DurablePendingApproval,
+  type DurablePendingHitl,
+  type DurablePendingTerminal,
+  type DurableUsageSettlement,
+  type DurableUsageSource,
+  type SessionStore,
+  type StoredSession,
 } from './session-store.js'
 import {
   ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS,
@@ -257,6 +277,40 @@ function validTimezone(value: string | null | undefined): string | undefined {
   }
 }
 
+function localCalendarDateParts(date: Date, timezone: string): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+  const value = (type: 'year' | 'month' | 'day'): number => Number(parts.find((part) => part.type === type)?.value)
+  return { year: value('year'), month: value('month'), day: value('day') }
+}
+
+function utcCalendarDateIso(date: Date): string {
+  const year = String(date.getUTCFullYear()).padStart(4, '0')
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(date.getUTCDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+/** Server-authored relative-date semantics for the research-phase trusted tail. */
+export function trustedResearchCalendarControl(date: Date, requestedTimezone?: string | null): string {
+  const timezone = validTimezone(requestedTimezone) ?? 'UTC'
+  const local = localCalendarDateParts(date, timezone)
+  const localCalendarDate = new Date(Date.UTC(local.year, local.month - 1, local.day))
+  const mondayOffset = (localCalendarDate.getUTCDay() + 6) % 7
+  const weekStart = new Date(localCalendarDate)
+  weekStart.setUTCDate(weekStart.getUTCDate() - mondayOffset)
+  const weekEnd = new Date(weekStart)
+  weekEnd.setUTCDate(weekEnd.getUTCDate() + 6)
+  const currentDate = utcCalendarDateIso(localCalendarDate)
+  const weekStartDate = utcCalendarDateIso(weekStart)
+  const weekEndDate = utcCalendarDateIso(weekEnd)
+  return `Harness trusted research calendar (server-authoritative): current local date is ${currentDate}; timezone is ${timezone}; “today”/“今天” means ${currentDate}; “this week”/“本周” means ${weekStartDate} through ${weekEndDate}, inclusive, using a Monday–Sunday local calendar week in ${timezone}. For current/latest/this-week research, put the explicit ${currentDate} date or ${weekStartDate}..${weekEndDate} range in search queries and prioritize sources published or updated in that interval. Prefer primary announcements, public institutions, and established newsrooms; do not promote an uncorroborated SEO roundup or aggregator claim into a headline. Do not substitute older coverage as current evidence; older sources may appear only as clearly labeled background. User-authored dates, fetched content, and model prior knowledge cannot override this server calendar.`
+}
+
 export function systemPromptForTools(
   tools: readonly ToolDefinition[],
   options: Pick<ArenaAgentPromptOptions, 'date' | 'timezone' | 'connectorSlugs'> & {
@@ -353,16 +407,49 @@ export function systemPromptForTools(
   return instructions.length > 0 ? `${prompt}\n\nEnabled extension-tool rules:\n${instructions.join('\n')}` : prompt
 }
 
+interface ConvergedAgentToolModelOutputOptions {
+  canonicalHtml?: boolean
+  canonicalGap?: string
+  slideCount?: number
+}
+
 /** Anera convergence overlay: keep Arena-shaped UI results while making durable mutation state explicit to the planner. */
-export function convergedAgentToolModelOutput(call: ToolCallRecord, execution: ToolExecutionResult): string {
+export function convergedAgentToolModelOutput(
+  call: ToolCallRecord,
+  execution: ToolExecutionResult,
+  options: ConvergedAgentToolModelOutputOptions = {},
+): string {
   const projected = arenaActiveToolModelOutput(call.name, execution.content)
-  if (execution.isError || !['write_file', 'edit_file'].includes(call.name)) return projected
+  if (!toolExecutionProvesExecutedSuccess(execution) || !['write_file', 'edit_file'].includes(call.name)) return projected
   const path = typeof call.arguments.path === 'string' ? call.arguments.path : undefined
   if (!path) return projected
+  const canonicalHtml = options.canonicalHtml
+  let hash: string | undefined
+  try {
+    const payload = JSON.parse(execution.content) as unknown
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const candidate = (payload as Record<string, unknown>).hash
+      if (typeof candidate === 'string' && candidate.trim()) hash = candidate
+    }
+  } catch {
+    // A successful mutation result normally uses JSON. The convergence
+    // projection remains useful even when a custom executor returns text.
+  }
   return JSON.stringify({
     status: 'success',
     path,
-    next_action: 'Continue from this exact file. Do not create a competing variant or rewrite it unless verification identifies a concrete defect.',
+    ...(hash ? { hash } : {}),
+    ...(canonicalHtml === undefined ? {} : { canonical_html: canonicalHtml }),
+    ...(canonicalHtml === false && options.canonicalGap ? { canonical_gap: options.canonicalGap } : {}),
+    next_action: canonicalHtml === false
+      ? `${call.name === 'edit_file'
+        ? 'This successful targeted edit remains non-canonical. Continue repairing this same file without a full-file rewrite.'
+        : /^The complete exact-reference HTML contains \d+ rendered \.slide elements; it must contain exactly \d+ for the (?:explicitly requested|default) slide plan\.$/u.test(options.canonicalGap ?? '')
+          ? 'This successful complete write remains a non-canonical draft solely because its rendered slide count is wrong. Repair this same file with one targeted edit_file call; do not regenerate the full document.'
+          : 'This successful write is a non-canonical intermediate file and remains in the workspace. Write the one complete standalone HTML target next; this file does not lock the canonical path.'}${options.slideCount
+        ? ` Keep exactly ${options.slideCount} rendered .slide elements total: 1 cover + ${options.slideCount - 2} content + 1 closing; an agenda counts as content. Repair missing markers inside or by replacing an existing content slide, never by appending an extra slide.`
+        : ''}`
+      : 'Continue from this exact file. Do not create a competing variant or rewrite it unless verification identifies a concrete defect.',
   })
 }
 
@@ -371,6 +458,20 @@ const COMPACTION_MAX_OUTPUT_TOKENS = 1_800
 const COMPACTION_CONTEXT_SAFETY_TOKENS = 2_048
 const MAX_CONTEXT_CHECKPOINTS_PER_PREPARATION = 8
 const MAX_EXPLICIT_DELIVERABLE_RECOVERIES = 2
+const MODEL_OUTPUT_RECOVERY_PREFIX = '[Harness operator action: Continue]'
+const WEB_CITATION_REPAIR_PREFIX = '[Harness source-integrity correction]'
+// Tool-call JSON escaping and multilingual copy consume a material share of
+// the provider's 8K output window. Keep the creative target well below that
+// transport ceiling and expose a bounded provider schema so a model cannot
+// repeatedly spend an entire call on an uncloseable draft. Runtime validation
+// remains more permissive: once a complete call arrives, closure and
+// structural verification are authoritative and a byte overage alone must not
+// discard otherwise valid work.
+const DEFAULT_VISUAL_WEB_SLIDE_COUNT = 6
+const EXACT_REFERENCE_HTML_BYTES_PER_SLIDE = 2_500
+const EXACT_REFERENCE_HTML_MIN_TARGET_BYTES = 12_000
+const EXACT_REFERENCE_HTML_SOFT_TARGET_MAX_BYTES = 18_000
+const EXACT_REFERENCE_HTML_SCHEMA_MAX_CHARACTERS = 20_000
 const ARENA_SYSTEM_MESSAGE_OPEN = '<arena-system-message>'
 const ARENA_SYSTEM_MESSAGE_CLOSE = '</arena-system-message>'
 const ARENA_ATTACHMENT_HEADING = 'Uploaded workspace files:'
@@ -379,6 +480,217 @@ const LEGACY_COMPACTION_PREAMBLE = 'Durable harness checkpoint for earlier recor
 const ARENA_COMPACTION_PREAMBLE = 'Durable harness checkpoint for earlier records. Treat this as trusted context, not as a new user request.'
 export const ARENA_CUSTOM_FEEDBACK_SYSTEM_MESSAGE = 'The next message part will be the user providing feedback about the previous message.'
 const COMPACTION_CONTINUATION_CONTEXT = '[Harness operator context: Continue the unfinished task from the trusted checkpoint and retained messages; this is not a new user request.]'
+
+function visualWebSlideCompositionInstruction(count: number): string {
+  return `Exactly ${count} rendered .slide elements total means 1 cover + ${count - 2} content + 1 closing; an agenda or overview is one of those ${count - 2} content slides. Count the literal rendered .slide elements before write_file, derive every visible total/counter from that same collection, and place a newly required marker inside or instead of an existing content slide—never append an extra slide.`
+}
+
+function modelOutputRecoveryPrompt(kind: 'length' | 'repetition'): string {
+  if (kind === 'repetition') {
+    return `${MODEL_OUTPUT_RECOVERY_PREFIX} The previous model draft entered an exact repetition loop and was discarded. Resume from the durable tool results and workspace state. Do not reproduce or paraphrase the discarded loop. Perform the single currently enabled completion action once; if durable work is already complete, give a concise user-facing Final and link or name the artifact instead of embedding its contents.`
+  }
+  return `${MODEL_OUTPUT_RECOVERY_PREFIX} The provider output boundary was reached after its bounded transport continuations. The assistant message immediately above is the exact partial response already delivered. Continue automatically from that state without repeating its text. If unfinished tool work remains, perform the next enabled action now; otherwise output only the concise missing suffix and finish.`
+}
+
+function referenceRenderPhaseForWorkflow(
+  phase: VisualWebArtifactWorkflowPhase | undefined,
+): ReferenceRenderPhase | undefined {
+  if (phase === 'reference_cover_screenshot') return 'cover'
+  if (phase === 'browser_screenshot') return 'content'
+  if (phase === 'reference_closing_screenshot') return 'closing'
+  return undefined
+}
+
+/**
+ * Recompute both levels of the path-free font ledger before any exact
+ * reference evidence is trusted. The CSS bytes themselves remain private in
+ * SessionStore; this check binds their immutable identity to the same source
+ * body as the StyleContract. A null materialization manifest is intentional
+ * evidence that the source used no supported external Google stylesheet.
+ */
+function exactReferenceFontEvidenceBound(
+  reference: DurableReferenceStyleContract | undefined,
+  requirePrivateEvidence: boolean,
+): boolean {
+  if (!reference || reference.contract.strictness !== 'exact') return true
+  const raw = reference.fontEvidence as unknown
+  if (raw === undefined) return !requirePrivateEvidence
+  try {
+    const evidence = normalizeReferenceFontEvidenceManifest(raw)
+    return evidence.sourceEvidenceSha256 === reference.provenance.evidenceSha256
+  } catch {
+    return false
+  }
+}
+
+function exactReferenceVisualEvidenceBound(
+  reference: DurableReferenceStyleContract | undefined,
+  requirePrivateEvidence: boolean,
+): boolean {
+  if (!reference || reference.contract.strictness !== 'exact') return true
+  if (!reference.visualEvidence || !reference.renderProfile) return !requirePrivateEvidence
+  try {
+    const manifest = normalizeReferenceVisualEvidenceManifest(reference.visualEvidence)
+    const renderProfileSha256 = createHash('sha256')
+      .update(JSON.stringify(reference.renderProfile))
+      .digest('hex')
+    return manifest.sourceEvidenceSha256 === reference.provenance.evidenceSha256
+      && manifest.renderProfileSha256 === renderProfileSha256
+      && manifest.viewport.width === reference.contract.viewport.width
+      && manifest.viewport.height === reference.contract.viewport.height
+      && manifest.viewport.width === reference.renderProfile.viewport.width
+      && manifest.viewport.height === reference.renderProfile.viewport.height
+  } catch {
+    return false
+  }
+}
+
+function exactReferenceContractEvidenceSha256(reference: DurableReferenceStyleContract): string {
+  return createHash('sha256').update(JSON.stringify({
+    sourceUrl: reference.contract.sourceUrl,
+    sourceEvidenceSha256: reference.provenance.evidenceSha256,
+    sourceEvidenceBytes: reference.provenance.evidenceBytes,
+    renderProfileSha256: reference.renderProfile
+      ? createHash('sha256').update(JSON.stringify(reference.renderProfile)).digest('hex')
+      : null,
+    visualEvidenceManifestSha256: reference.visualEvidence?.manifestSha256 ?? null,
+    fontEvidenceManifestSha256: reference.fontEvidence?.manifestSha256 ?? null,
+  })).digest('hex')
+}
+
+/**
+ * Revalidate every private byte required by an active exact reference before
+ * its contract can influence phase selection or Final publication. A failed
+ * check atomically replaces the active contract with a durable tombstone, so
+ * process restart and historical tool-message fallback remain fail closed.
+ */
+export async function revalidateActiveExactReferenceEvidence(
+  store: SessionStore,
+  sessionId: string,
+  initialState?: StoredSession,
+): Promise<StoredSession> {
+  const state = initialState ?? await store.get(sessionId)
+  if (state.referenceStyleEvidenceInvalidation) {
+    if (!state.activeReferenceStyleContract
+      && !state.activeReferenceStyleEvidenceGeneration
+      && !state.visualNoProgress) return state
+    return await store.update(sessionId, (next) => {
+      delete next.activeReferenceStyleContract
+      delete next.activeReferenceStyleEvidenceGeneration
+      delete next.visualNoProgress
+    })
+  }
+
+  const reference = state.activeReferenceStyleContract
+  if (!reference || reference.contract.strictness !== 'exact') return state
+  const expectedContractEvidenceSha256 = exactReferenceContractEvidenceSha256(reference)
+  const expectedGeneration = state.activeReferenceStyleEvidenceGeneration
+  let reason: DurableReferenceStyleEvidenceInvalidation['reason'] | undefined
+  try {
+    reason = 'font_evidence_missing_or_invalid'
+    if (!exactReferenceFontEvidenceBound(reference, true) || !reference.fontEvidence) {
+      throw new Error('invalid exact-reference font evidence binding')
+    }
+    await store.resolveReferenceFontEvidence(sessionId, reference.fontEvidence)
+
+    reason = 'visual_evidence_missing_or_invalid'
+    if (!exactReferenceVisualEvidenceBound(reference, true) || !reference.visualEvidence) {
+      throw new Error('invalid exact-reference visual evidence binding')
+    }
+    for (const phase of ['cover', 'content', 'closing'] as const) {
+      await store.resolveReferenceVisualEvidencePath(sessionId, reference.visualEvidence, phase)
+    }
+    return state
+  } catch {
+    reason ??= 'visual_evidence_missing_or_invalid'
+  }
+
+  const invalidatedAt = new Date().toISOString()
+  return await store.update(sessionId, (next) => {
+    const current = next.activeReferenceStyleContract
+    // The filesystem checks run outside the state queue. Do not invalidate a
+    // newly recorded generation that won the race while those reads occurred.
+    if (!current
+      || exactReferenceContractEvidenceSha256(current) !== expectedContractEvidenceSha256
+      || next.activeReferenceStyleEvidenceGeneration !== expectedGeneration) return
+    next.referenceStyleEvidenceInvalidation = {
+      version: 1,
+      contractEvidenceSha256: expectedContractEvidenceSha256,
+      ...(expectedGeneration ? { contractEvidenceGeneration: expectedGeneration } : {}),
+      sourceUrl: reference.contract.sourceUrl,
+      sourceEvidenceSha256: reference.provenance.evidenceSha256,
+      strictness: 'exact',
+      reason,
+      invalidatedAt,
+    }
+    delete next.activeReferenceStyleContract
+    delete next.activeReferenceStyleEvidenceGeneration
+    delete next.visualNoProgress
+  })
+}
+
+function withRenderedReferenceVerification(
+  execution: ToolExecutionResult,
+  verification: Awaited<ReturnType<BrowserManager['verifyRenderedReferenceStyle']>>,
+  attestation: Record<string, unknown> = {},
+): ToolExecutionResult {
+  let result: Record<string, unknown> = {
+    status: 'success',
+    message: execution.content,
+  }
+  try {
+    const parsed = JSON.parse(execution.content) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      result = parsed as Record<string, unknown>
+    }
+  } catch {
+    // Browser screenshot results are currently concise text. Preserve it as a
+    // message while projecting the deterministic render verdict as JSON.
+  }
+  const renderedViolations = verification.violations.slice(0, 3)
+  const interiorAttestation = verification.interiorAttestation
+    ? {
+        candidate_slides: verification.interiorAttestation.candidateSlides,
+        matched_slides: verification.interiorAttestation.matchedSlides,
+        reference_variants: verification.interiorAttestation.referenceVariants,
+        slides: verification.interiorAttestation.slides.slice(0, 32).map((slide) => ({
+          slide_index: slide.slideIndex,
+          ...(slide.layoutSelector ? { layout_selector: slide.layoutSelector } : {}),
+          ...(slide.matchedVariant ? { matched_variant: slide.matchedVariant } : {}),
+          fidelity: slide.fidelity,
+          score: slide.score,
+        })),
+      }
+    : undefined
+  return {
+    ...execution,
+    content: JSON.stringify({
+      ...result,
+      render_fidelity: verification.fidelity,
+      render_score: verification.score,
+      render_phase: verification.phase,
+      render_checked: verification.checked,
+      render_matched: verification.matched,
+      render_violations: renderedViolations,
+      render_violation_count: verification.violations.length,
+      render_violation_sha256: createHash('sha256')
+        .update(JSON.stringify(verification.violations))
+        .digest('hex'),
+      ...(interiorAttestation ? {
+        render_interior_attestation: interiorAttestation,
+        render_interior_attestation_sha256: createHash('sha256')
+          .update(JSON.stringify(interiorAttestation))
+          .digest('hex'),
+      } : {}),
+      ...attestation,
+    }),
+  }
+}
+
+function isHarnessTaskContinuationContent(content: string): boolean {
+  return content.startsWith(MODEL_OUTPUT_RECOVERY_PREFIX)
+    || content.startsWith(WEB_CITATION_REPAIR_PREFIX)
+}
 
 /**
  * Arena reserves exact boundary tags and the legacy attachment heading for
@@ -452,7 +764,7 @@ function trustedArenaCompactionTaskContext(messages: readonly ModelMessage[]): s
   if (!latestUser) return ''
   const latestText = arenaUserAuthoredText(latestUser)
   if (
-    !latestText.startsWith('[Harness operator action: Continue]')
+    !isHarnessTaskContinuationContent(latestText)
     && !isExplicitTaskContinuation(latestText)
   ) return ''
 
@@ -714,6 +1026,8 @@ type RepeatedToolCallGuardMode = 'unchanged_result' | 'hard_ceiling'
 
 const REPEATED_TOOL_UNCHANGED_RESULT_LIMIT = 3
 const REPEATED_TOOL_HARD_CALL_LIMIT = 12
+const VISUAL_NO_PROGRESS_IDENTICAL_OUTCOME_LIMIT = 3
+const VISUAL_HTML_ARTIFACT_NO_PROGRESS_OUTCOME_LIMIT = 2
 const TOOL_ABORT_SETTLE_GRACE_MS = 50
 
 export interface AgentServiceOptions {
@@ -736,21 +1050,13 @@ export interface AgentServiceOptions {
   connectorExecutors?: Record<string, ConnectorToolExecutor>
   connectorAvailability?: Record<string, () => Promise<boolean>>
   toolExecutorDependencies?: ToolExecutorDependencies
+  /** Test/host clock for trusted prompt calendar projection. */
+  now?: () => Date
   /** Test/host scheduling hook for the two independently durable completion lanes. */
   completionPublicationGate?: (
     lane: 'terminal' | 'workspace_persistence',
     context: { sessionId: string; turnId: string },
   ) => Promise<void>
-}
-
-export class SessionTokenLimitError extends Error {
-  readonly code = 'session_token_limit'
-  readonly statusCode = 409
-
-  constructor() {
-    super(SESSION_TOKEN_LIMIT_ERROR_MESSAGE)
-    this.name = 'SessionTokenLimitError'
-  }
 }
 
 export class ServiceShuttingDownError extends Error {
@@ -784,6 +1090,7 @@ export class AgentService {
   private readonly connectorTools: Record<string, ToolDefinition[]>
   private readonly connectorAvailability: Record<string, () => Promise<boolean>>
   private readonly completionPublicationGate?: AgentServiceOptions['completionPublicationGate']
+  private readonly now: () => Date
   private readonly active = new Map<string, ActiveRun>()
   private readonly starting = new Set<string>()
   private readonly startReservations = new Map<string, StartReservation>()
@@ -843,6 +1150,7 @@ export class AgentService {
     this.connectorTools = Object.fromEntries(Object.entries(options.connectorTools ?? {}).map(([slug, definitions]) => [slug.trim().toLowerCase(), definitions]))
     this.connectorAvailability = Object.fromEntries(Object.entries(options.connectorAvailability ?? {}).map(([slug, available]) => [slug.trim().toLowerCase(), available]))
     this.completionPublicationGate = options.completionPublicationGate
+    this.now = options.now ?? (() => new Date())
     // Production provider traffic always uses the pinned public-network path.
     // A guarded test-only seam permits deterministic local DeepSeek fixtures;
     // it is scoped to these provider clients and never reaches Web/HTTP tools.
@@ -971,7 +1279,6 @@ export class AgentService {
       if (reviewedNodeId) {
         assertArenaCustomFeedbackTarget(state, await this.store.events(sessionId), reviewedNodeId)
       }
-      this.assertSessionTokenLimit(state.summary)
       await this.credits?.assertCanStart(state.summary.isFreeSession === true)
       const selectedModel = this.resolveModel(state.summary, options.model)
       const timezone = validTimezone(options.timezone) ?? state.timezone ?? 'UTC'
@@ -1012,6 +1319,12 @@ export class AgentService {
         next.summary.modelSelection = selectedModel.selection
         next.timezone = timezone
         next.activeTaskConnectorSlugs = activeTaskConnectorSlugs
+        if (!reviewedNodeId && !isExplicitTaskContinuation(content)) {
+          delete next.activeReferenceStyleContract
+          delete next.activeReferenceStyleEvidenceGeneration
+          delete next.referenceStyleEvidenceInvalidation
+          delete next.visualNoProgress
+        }
         if (taskExactFinalRequest) next.activeTaskExactFinalRequest = taskExactFinalRequest
         else delete next.activeTaskExactFinalRequest
         next.turnMessageStarts ??= {}
@@ -1063,12 +1376,28 @@ export class AgentService {
     let launched = false
     try {
       const state = await this.store.get(sessionId)
-      this.assertSessionTokenLimit(state.summary)
       await this.credits?.assertCanStart(state.summary.isFreeSession === true)
       if (!['cancelled', 'failed', 'timed_out', 'interrupted'].includes(state.summary.status)) {
         throw new Error(`A ${state.summary.status} session cannot be continued`)
       }
       if (state.messages.length === 0) throw new Error('There is no prior task to continue')
+      const priorEvents = await this.store.events(sessionId)
+      const reconciled = reconcilePersistedNonExecutedToolResults(state.messages, priorEvents)
+      const compactedTail = collapseConsecutiveIdenticalToolCallTail(reconciled.messages)
+      const resumedMessages = compactedTail.messages
+      const lastError = [...priorEvents].reverse().find((event) => event.type === 'error')
+      const trailingMessage = resumedMessages.at(-1)
+      const discardDegeneratePartial = (
+        lastError?.data.partialResponsePersisted === true
+        && /model response remained truncated/iu.test(String(lastError.data.message || ''))
+        && trailingMessage?.role === 'assistant'
+        && (trailingMessage.tool_calls?.length ?? 0) === 0
+        && typeof trailingMessage.content === 'string'
+        && isDegenerateModelRepetition(trailingMessage.content)
+      )
+      const discardedPartialBytes = discardDegeneratePartial && typeof trailingMessage?.content === 'string'
+        ? Buffer.byteLength(trailingMessage.content)
+        : 0
       const activeTaskConnectorSlugs = state.activeTaskConnectorSlugs ?? await this.connectedConnectorSlugs()
       const turnId = createId('turn')
       const startEventId = createId('evt')
@@ -1076,6 +1405,14 @@ export class AgentService {
         previousStatus: state.summary.status,
         message: 'Continue from the persisted conversation and workspace without repeating completed work.',
       }
+      const recoveryDetails = [
+        reconciled.repairedCallIds.length > 0
+          ? `Restored ${reconciled.repairedCallIds.length} persisted not-executed tool result${reconciled.repairedCallIds.length === 1 ? '' : 's'} from durable events.`
+          : '',
+        compactedTail.collapsedOccurrences > 0
+          ? `Collapsed ${compactedTail.collapsedOccurrences} redundant identical trailing tool-call occurrence${compactedTail.collapsedOccurrences === 1 ? '' : 's'} into one compact result.`
+          : '',
+      ].filter(Boolean).join(' ')
       await this.store.stageRunStart(sessionId, {
         kind: 'resume',
         turnId,
@@ -1083,15 +1420,41 @@ export class AgentService {
         eventData: startEventData,
         createdAt: new Date().toISOString(),
       }, (next) => {
+        if (reconciled.changed || compactedTail.collapsedOccurrences > 0) {
+          next.messages = [...resumedMessages]
+        }
+        if (discardDegeneratePartial) next.messages.pop()
         next.activeTaskConnectorSlugs = activeTaskConnectorSlugs
         next.turnMessageStarts ??= {}
         next.turnMessageStarts[turnId] = next.messages.length
         next.messages.push({
           role: 'user',
-          content: '[Harness operator action: Continue] Resume the unfinished task from the persisted conversation and workspace. Do not redo work that already completed successfully.',
+          content: `[Harness operator action: Continue] Resume the unfinished task from the persisted conversation and workspace. Do not redo work that already completed successfully.${recoveryDetails ? ` ${recoveryDetails} Re-evaluate the next action from the corrected durable evidence.` : ''}`,
         })
       })
       await this.store.append(sessionId, 'run.resumed', startEventData, { turnId, eventId: startEventId })
+      if (reconciled.repairedCallIds.length > 0) {
+        await this.store.append(sessionId, 'model.tool_call.repair', {
+          reason: 'persisted_non_executed_result_reconciliation',
+          repairedCallIds: reconciled.repairedCallIds,
+          succeeded: true,
+        }, { turnId })
+      }
+      if (compactedTail.collapsedOccurrences > 0) {
+        await this.store.append(sessionId, 'model.tool_call.repair', {
+          reason: 'repeated_tool_tail_compaction',
+          collapsedOccurrences: compactedTail.collapsedOccurrences,
+          retainedSignature: compactedTail.signature,
+          succeeded: true,
+        }, { turnId })
+      }
+      if (discardDegeneratePartial) {
+        await this.store.append(sessionId, 'model.final.repair', {
+          reason: 'degenerate_repetition',
+          resumedCleanup: true,
+          discardedPartialBytes,
+        }, { turnId })
+      }
       active = this.activate(sessionId, turnId)
       await this.store.commitRunStart(sessionId, turnId)
       await this.store.append(sessionId, 'run.status', { status: 'running', resumed: true, previousStatus: state.summary.status }, { turnId })
@@ -1660,23 +2023,56 @@ export class AgentService {
     let singleArtifactPresentationRecoveryActive = false
     let webCitationRecoveryCount = 0
     let visualWebArtifactRecoveryCount = 0
+    let modelOutputRecoveryCount = 0
     let admittedToolCalls = 0
     let singleArtifactWebMode = false
     let visualWebArtifactMode = false
     let visualWebResearchRequired = false
+    let visualWebStyleReference: VisualStyleReferenceRequest | undefined
+    let repeatedToolStrategyReset: {
+      signature: string
+      callName: string
+      canonicalArguments: string
+      previousResult?: string
+    } | undefined
     try {
       let consecutiveToolCall: ConsecutiveToolCallState | undefined
       let activeToolDefinitions: ToolDefinition[] = ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS
-      for (let step = 1; step <= config.maxAgentSteps; step += 1) {
+      // Do not terminate useful long-running work at an arbitrary model-step
+      // or cumulative-token count. Current context pressure, cancellation,
+      // the run deadline, tool budgets, and progress guards are the relevant
+      // bounded safety controls.
+      for (let step = 1; ; step += 1) {
         if (controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError')
         const stepId = createId('step')
-        const state = await this.store.get(sessionId)
-        this.assertSessionTokenLimit(state.summary)
+        const state = await revalidateActiveExactReferenceEvidence(
+          this.store,
+          sessionId,
+          await this.store.get(sessionId),
+        )
+        const strategyResetActive = repeatedToolStrategyReset !== undefined
         singleArtifactWebMode ||= isSingleArtifactWebTask(state.messages)
         visualWebArtifactMode ||= isVisualWebArtifactTask(state.messages)
         if (visualWebArtifactMode) visualWebResearchRequired ||= visualWebTaskRequiresResearch(state.messages)
+        if (visualWebArtifactMode) visualWebStyleReference ??= visualWebStyleReferenceRequest(state.messages)
+        if (visualWebArtifactMode && !visualWebStyleReference) {
+          const durableReference = state.activeReferenceStyleContract
+          const invalidatedReference = state.referenceStyleEvidenceInvalidation
+          if (durableReference) {
+            visualWebStyleReference = {
+              urls: [durableReference.contract.sourceUrl],
+              strictness: durableReference.contract.strictness,
+            }
+          } else if (invalidatedReference) {
+            visualWebStyleReference = {
+              urls: [invalidatedReference.sourceUrl],
+              strictness: invalidatedReference.strictness,
+            }
+          }
+        }
         const singleArtifactWebTask = singleArtifactWebMode
         const visualWebArtifactTask = visualWebArtifactMode
+        const slidePlan = visualWebSlidePlan(state.messages)
         if (singleArtifactWebTask && !singleArtifactCanonicalPath) {
           singleArtifactCanonicalPath = successfulSingleArtifactCanonicalPath(state.messages)
         }
@@ -1684,13 +2080,18 @@ export class AgentService {
           ? visualWebArtifactCompletionGap(state.messages, {
             forceTask: true,
             requiresResearch: visualWebResearchRequired,
+            requirePrivateVisualEvidence: true,
+            referenceRequest: visualWebStyleReference,
+            referenceContract: state.activeReferenceStyleContract,
+            referenceContractInvalidated: Boolean(state.referenceStyleEvidenceInvalidation),
             canonicalPath: singleArtifactCanonicalPath,
           })
           : undefined
         const visualWebWorkflowComplete = visualWebArtifactTask && visualWebWorkflowGap === undefined
+        const visualCurrentPhase = nextVisualWebArtifactPhase(visualWebWorkflowGap)
         const visualWebResearchMissing = visualWebArtifactTask
           && visualWebResearchRequired
-          && (webResearchCitationEvidence([...state.messages])?.sourceUrls.length ?? 0) === 0
+          && Boolean(visualWebWorkflowGap?.missingPhases.includes('web_research'))
         const directSingleArtifactMode = singleArtifactWebTask && !isPlanExplicitlyRequested(state.messages)
         const sourceRepairPhase = singleArtifactCanonicalPath
           ? researchArtifactSourceRepairPhase(state.messages, singleArtifactCanonicalPath)
@@ -1699,21 +2100,37 @@ export class AgentService {
         // `NO DEFECTS` inspection verdict. A generic single-page task may ask
         // Vision a descriptive question; treating that prose as a failed
         // defect audit incorrectly locks the next tool surface to read/edit.
-        const visualRepairPhase = singleArtifactWebTask && singleArtifactCanonicalPath
+        const detectedVisualRepairPhase = singleArtifactWebTask && singleArtifactCanonicalPath
           ? visualArtifactDefectRepairPhase(state.messages, singleArtifactCanonicalPath)
+          : undefined
+        const detectedReferenceStyleRepairPhase = singleArtifactWebTask && singleArtifactCanonicalPath
+          ? referenceStyleArtifactRepairPhase(state.messages, singleArtifactCanonicalPath)
+          : undefined
+        // The durable visual workflow owns dependency order. A deterministic
+        // screenshot mismatch is already a byte-bound defect verdict, so the
+        // gap moves directly to the canonical read/edit lane; a Vision audit
+        // remains required only for screenshots that pass deterministic
+        // rendering. Activate repair subphases only at that repair boundary.
+        const visualRepairPhase = !visualWebArtifactTask || visualCurrentPhase === 'visual_inspection_pass'
+          ? detectedVisualRepairPhase
+          : undefined
+        const referenceStyleRepairPhase = !visualWebArtifactTask || visualCurrentPhase === 'reference_implementation'
+          ? detectedReferenceStyleRepairPhase
           : undefined
         const canonicalDiagnosticRead = Boolean(singleArtifactCanonicalPath) && (
           sourceRepairPhase === 'read'
           || visualRepairPhase === 'read'
+          || referenceStyleRepairPhase === 'read'
           || (
             sourceRepairPhase !== 'edit'
             && visualRepairPhase !== 'edit'
+            && referenceStyleRepairPhase !== 'edit'
             && canonicalArtifactDiagnosticReadRequired(state.messages)
           )
         )
         const canonicalTargetedEdit = Boolean(singleArtifactCanonicalPath)
           && !canonicalDiagnosticRead
-          && (sourceRepairPhase === 'edit' || visualRepairPhase === 'edit')
+          && (sourceRepairPhase === 'edit' || visualRepairPhase === 'edit' || referenceStyleRepairPhase === 'edit')
         const canonicalPresentationGap = singleArtifactWebTask
           && !visualWebArtifactTask
           && singleArtifactCanonicalPath
@@ -1726,6 +2143,7 @@ export class AgentService {
           && Boolean(canonicalPresentationGap)
           && sourceRepairPhase === undefined
           && visualRepairPhase === undefined
+          && referenceStyleRepairPhase === undefined
         const visualRequiredToolNames = visualWebWorkflowGap
           ? visualWebArtifactRequiredToolNames(visualWebWorkflowGap)
           : undefined
@@ -1745,14 +2163,39 @@ export class AgentService {
             selectedNames.add(requiredName)
           }
         }
+        // Keep the provider-visible system prefix stable for the entire visual
+        // episode. Phase authorization is still enforced below against the
+        // narrow executable surface; this superset is used only to build the
+        // invariant system prompt so prior messages remain prompt-cacheable.
+        if (visualWebArtifactTask) {
+          const stableVisualExtensions: ExtensionToolName[] = [
+            'browser',
+            'inspect_image',
+            ...(visualWebStyleReference ? ['web_fetch', 'record_reference_style', 'verify_reference_style'] as ExtensionToolName[] : []),
+          ]
+          const selectedNames = new Set(activeToolDefinitions.map((tool) => tool.function.name))
+          for (const name of stableVisualExtensions) {
+            if (selectedNames.has(name)) continue
+            activeToolDefinitions.push(EXTENSION_TOOL_DEFINITIONS[name])
+            selectedNames.add(name)
+          }
+        }
+        const systemPromptToolDefinitions = [...activeToolDefinitions]
         if (directSingleArtifactMode) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name !== 'propose_plan')
         }
         if (singleArtifactWebTask && singleArtifactCanonicalPath) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => (
             ![
-              'write_file', 'bash', 'list_files', 'grep_files', 'glob_files',
-              ...(!visualWebResearchMissing ? ['web_search', 'web_fetch', 'fetch_page'] : []),
+              // Once the canonical file exists, every mutation must cross the
+              // hash-producing edit_file boundary. Keep opaque or destructive
+              // mutations unavailable even during a repeated-tool strategy
+              // reset, which intentionally bypasses the phase whitelist below.
+              'write_file', 'create_file', 'delete_file', 'apply_patch',
+              'bash', 'list_files', 'grep_files', 'glob_files',
+              ...(!visualWebResearchMissing && visualCurrentPhase !== 'reference_acquisition'
+                ? ['web_search', 'web_fetch', 'fetch_page']
+                : []),
             ].includes(tool.function.name)
               && (tool.function.name !== 'read_file' || canonicalDiagnosticRead)
           ))
@@ -1766,9 +2209,37 @@ export class AgentService {
         } else if (visualRequiredToolNames) {
           activeToolDefinitions = activeToolDefinitions.filter((tool) => visualRequiredToolNames.has(tool.function.name))
         }
+        // A repetition recovery may ask the model for a different strategy,
+        // but it must not broaden the durable phase's authority. Keep the same
+        // executable whitelist and argument schema during reset; progress can
+        // come from a different URL/chunk/edit, not from skipping dependencies.
+        activeToolDefinitions = constrainVisualWebArtifactPhaseToolDefinitions(
+          activeToolDefinitions,
+          visualCurrentPhase,
+          singleArtifactCanonicalPath,
+          visualWebWorkflowGap?.referenceContract,
+          slidePlan.count,
+          visualWebWorkflowGap?.referenceVerification,
+          visualWebWorkflowGap?.htmlArtifactRepair,
+        )
         if (visualWebWorkflowComplete) activeToolDefinitions = []
+        // The executable surface above remains phase-minimal and is the sole
+        // authorization source. DeepSeek's automatic cache key also includes
+        // the serialized tool schemas, however, so sending that oscillating
+        // one-tool surface caused an otherwise stable 40–50K-token prefix to
+        // miss on nearly every phase transition. Keep a stable provider-only
+        // schema superset through the tool-free Final as well; generated calls
+        // are still normalized, validated, and rejected against the empty
+        // `activeToolDefinitions` authorization surface before execution.
+        const providerToolDefinitions = visualWebArtifactTask
+          ? systemPromptToolDefinitions
+          : activeToolDefinitions
         const enabledConnectorSlugs = state.activeTaskConnectorSlugs ?? []
-        const baseSystemPrompt = systemPromptForTools(activeToolDefinitions, {
+        const trustedNow = this.now()
+        const baseSystemPrompt = systemPromptForTools(
+          visualWebArtifactTask ? systemPromptToolDefinitions : activeToolDefinitions,
+          {
+          date: trustedNow,
           timezone: state.timezone,
           connectorSlugs: enabledConnectorSlugs,
           includeHarnessConvergence: true,
@@ -1783,26 +2254,70 @@ export class AgentService {
               sessionStatus: state.summary.codingSessionStatus ?? 'active',
             },
           } : {}),
-        })
+          },
+        )
+        const slideCompositionPrompt = visualWebSlideCompositionInstruction(slidePlan.count)
+        const slideCountPrompt = slidePlan.explicitlyRequested
+          ? `Build exactly ${slidePlan.count} slides because that is the user's explicit page count; never replace it with a six-slide default.`
+          : `Build ${slidePlan.count} slides as the default because the user did not specify a page count; any later explicit count takes priority.`
+        const retrievedCitationExamples = visualWebResearchRequired
+          ? retrievedNonReferenceResearchSourceUrls(state.messages).slice(0, 3)
+          : []
+        const referenceSourcePrompt = visualWebResearchRequired
+          ? `Retain exact retrieved source URLs in the visible citation surface.${retrievedCitationExamples.length > 0 ? ` Copy at least one verbatim, including its scheme: ${retrievedCitationExamples.map((url) => JSON.stringify(url)).join(', ')}.` : ''}`
+          : 'This task does not require research citations; do not invent or require an unrelated source URL.'
         const visualWebWorkflowPrompt = visualWebArtifactTask
-          ? `\n\nHarness visual HTML presentation contract: treat this as one canonical self-contained HTML artifact unless the user explicitly requested a multi-file framework. For current, recent, weekly, news, trend, or hotspot content, issue at most three complementary web_search calls together in one parallel model step, then stop searching once those results cover the requested themes; fetch a page only for one concrete fact that the returned evidence does not support. Use only exact returned URLs as visible source links. Build a focused 6–10-slide artifact, normally within 8–28 KiB, with accessible next/previous and keyboard navigation plus a visible current/total state. After the durable write, start one managed Website preview and open the current artifact once in Browser. Perform exactly one forward click or keypress and use its fresh snapshot to prove navigation; do not traverse every slide. Then save exactly one post-navigation screenshot to a workspace-relative PNG. Inspect that exact screenshot with inspect_image using a defect-check prompt that returns exactly \`NO DEFECTS\` when layout, contrast, clipping, overlap, and readability pass, or at most three concrete defects otherwise. If defects are reported, edit only those defects and repeat the minimum current preview/one-action/screenshot/inspection cycle. If source verification rejects a URL, edit only the named unsupported anchor instead of replacing the whole sources section. Then call present_file for the verified canonical HTML, and only then give the Final. These are completion boundaries, not optional suggestions.`
+          ? `\n\nHarness visual HTML presentation contract: treat this as one canonical self-contained HTML artifact unless the user explicitly requested a multi-file framework. For current, recent, weekly, news, trend, or hotspot content, issue at most three complementary web_search calls together in one parallel model step, then stop searching once those results cover the requested themes; fetch a page only for one concrete fact that the returned evidence does not support. When research is required, use only exact returned URLs as visible source links. ${slideCountPrompt} ${slideCompositionPrompt} Include accessible next/previous and keyboard navigation plus a visible current/total state. ${visualWebStyleReference ? `The user supplied a ${visualWebStyleReference.strictness} visual reference. This is a hard dependency separate from news research: a directory listing, link citation, template name, or generic visual quality is not reference evidence. Retrieve the concrete design specification or template source, record a grounded StyleContract, preserve its palette, typography, layout grammar, component treatment, decoration, chrome, and forbidden substitutions, then run verify_reference_style before preview. In exact mode, use the retrieved template as the structural and CSS base: retain its controlling variables, required structural selectors, navigation chrome, geometry, and decorations while replacing only example content and data. Every exact StyleContract color must remain consumed by a real visible DOM-connected reference selector/state, including semantic status colors; :root-only declarations, comments, scripts, hidden elements, and unused classes are not evidence. Build the complete ${slidePlan.count}-slide deck and minify CSS/HTML. Aim for the soft compactness target of ${slidePlan.targetBytes.toLocaleString('en-US')} UTF-8 bytes. Keep only layout CSS used by the requested slides or required verifier markers; omit comments, whitespace, unused layout/demo CSS, and optional component variants; cap each slide at a headline plus two or three short content blocks, and shorten body copy and visible source labels. Minification may remove whitespace but must preserve the reference's exact numeric font sizes, gaps, padding, grid rows, and letter-spacing; never shrink those declarations to make content fit. Visible source/citation text must reuse the existing reference typography for its chosen layout; shortening a label never permits a new smaller font-size, line-height, letter-spacing, or color override. Completeness and required reference structure still take priority over compactness. ${referenceSourcePrompt} Never split the document into part files or continue a truncated tool call; emit one closed standalone HTML document in one fresh tool call. Do not redraw the theme from a prose summary or merely include reference tokens in unused comments, metadata, or scripts. After Browser open, verify the untouched cover, one post-navigation representative content slide, and the End/closing slide with separate screenshots. Every inspect_image prompt must include the StyleContract and returns exactly two lines—\`NO DEFECTS\` then \`REFERENCE MATCH\`—only when both render integrity and reference fidelity pass.` : `After the durable write, start one managed Website preview and open the artifact once, perform one forward navigation, save one post-navigation screenshot, and inspect it for layout, contrast, clipping, overlap, and readability. A clean result is exactly \`NO DEFECTS\`.`} If any render, source, or fidelity check fails, edit only the concrete defects and repeat the minimum invalidated verification cycle. Then call present_file for the verified canonical HTML, and only then give the Final. These are completion boundaries, not optional suggestions.`
           : ''
+        const targetedReferenceStructure = referenceInteriorStructureProjection(
+          visualWebWorkflowGap?.referenceContract,
+        )
+        const canonicalTargetedEditPrompt = visualCurrentPhase === 'reference_implementation'
+          ? `apply exactly one coherent targeted edit for every current source-verifier defect using the current canonical bytes. ${referenceVerificationRepairInstruction(
+            visualWebWorkflowGap?.referenceVerification,
+            visualWebWorkflowGap?.referenceContract,
+          )}`
+          : visualCurrentPhase === 'visual_inspection_pass'
+            ? `apply exactly one coherent targeted edit for the complete latest deterministic render or Vision defect list using the current canonical bytes.${targetedReferenceStructure
+              ? ` Preserve these exact existing interior DOM anchor counts: ${targetedReferenceStructure}. Reclassify or restyle existing anchors; never append duplicate children or change a listed count.`
+              : ''}`
+            : 'apply exactly one targeted edit for the pending source or visual defect using the current canonical bytes'
         const visualWebCurrentPhasePrompt = visualWebArtifactTask && !visualWebWorkflowComplete
           ? `\n\nHarness current visual phase: ${canonicalDiagnosticRead
             ? 'read the canonical HTML exactly once so the pending targeted correction can use current bytes'
             : canonicalTargetedEdit
-              ? 'apply exactly one targeted edit for the pending source or visual defect using the current canonical bytes'
-              : visualWebArtifactPhaseInstruction(visualWebWorkflowGap)}. The tool surface is intentionally limited to this next durable phase; perform it once and do not substitute extra inspection or navigation.`
+              ? canonicalTargetedEditPrompt
+              : visualWebArtifactPhaseInstruction(
+                visualWebWorkflowGap,
+                slidePlan.count,
+                visualWebStyleReference,
+              )}. The tool surface is intentionally limited to this next durable phase; perform it once and do not substitute extra inspection or navigation.`
           : ''
-        const activeSystemPrompt = visualWebWorkflowComplete
-          ? `${baseSystemPrompt}\n\nHarness durable completion: the canonical visual HTML presentation has already passed research grounding, live Website preview, Browser navigation, screenshot inspection containing NO DEFECTS, and present_file. All required durable boundaries are complete. Give the concise user-facing Final now. Do not request, repeat, or describe any further tool action.`
+        const phaseSystemPrompt = visualWebWorkflowComplete
+          ? `${baseSystemPrompt}\n\nHarness durable completion: the canonical visual HTML presentation has already passed research grounding, ${visualWebStyleReference ? 'source-grounded StyleContract recording, deterministic source-level reference verification, cover/content/closing reference-fidelity inspection,' : ''} live Website preview, Browser navigation, screenshot render inspection, and present_file. All required durable boundaries are complete. Give the concise user-facing Final now. Do not request, repeat, or describe any further tool action.`
           : canonicalPresentationOnly
             ? `${baseSystemPrompt}\n\nHarness presentation recovery: the requested canonical HTML deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)} and all remaining work is to publish that exact current file. present_file is the only available tool; call it now, then give the concise Final. Do not rewrite, reread, inspect, or create a competing artifact.`
           : singleArtifactCanonicalPath
-          ? `${baseSystemPrompt}\n\nHarness durable progress: the canonical self-contained Web deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)}. ${canonicalDiagnosticRead ? 'A targeted correction requires exact current bytes. read_file is the only tool available for this one diagnostic step; read the canonical file now, then retry only the necessary targeted edit on the next step.' : canonicalTargetedEdit ? 'The exact current bytes are already available from the completed diagnostic read. edit_file is the only tool available for this correction step; make one coherent targeted replacement that fixes the reported defect, using exact current text rather than guessing selectors or fragments.' : 'Continue from it without rereading or listing the file you just created.'} Start the preview and verify it now; use edit_file only for a concrete correction observed in the browser. Historical mutation records under _historicalMutation are metadata, not file content; never use their hashes or fields as edit_file.old_text. Do not create or overwrite another full-file variant. start_process is only for the long-running preview server; never use it for finite cat, sed, grep, wc, or other inspection commands. For this bounded artifact, use browser open once at the requested viewport and test each specifically requested interaction state once; if an interaction changes durable page state, test dependent controls in that resulting state rather than only as isolated happy paths. Every action already returns a fresh snapshot. Exact browser text and control state override approximate screenshot OCR. If a genuine visual question remains, save and inspect one screenshot; if that inspection reports no concrete defect, do not capture or inspect another screenshot. Do not restore an earlier control state, query the console, or reread source after the requested action result passes unless the user explicitly requires it. Do not run generic markup checks unless an observed failure requires diagnosis. When the requested states pass, present the canonical HTML and finish.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
+          ? `${baseSystemPrompt}\n\nHarness durable progress: the canonical self-contained Web deliverable already exists at ${JSON.stringify(singleArtifactCanonicalPath)}. ${canonicalDiagnosticRead ? 'A targeted correction requires exact current bytes. read_file is the only tool available for this one diagnostic step; read the canonical file now, then retry only the necessary targeted edit on the next step.' : canonicalTargetedEdit ? 'The exact current bytes are already available from the completed diagnostic read. edit_file is the only tool available for this correction step; make one coherent targeted replacement that fixes the reported defect, using exact current text rather than guessing selectors or fragments.' : 'Continue from it without rereading or listing the file you just created.'} Continue the current durable verification phase; use edit_file only for a concrete source verifier, Browser, or reference-fidelity defect. Historical mutation records under _historicalMutation are metadata, not file content; never use their hashes or fields as edit_file.old_text. Do not create or overwrite another full-file variant. start_process is only for the long-running preview server; never use it for finite inspection commands. Open once at the requested viewport and follow the phase-gated screenshot coverage exactly. Every Browser action returns a fresh snapshot; exact browser text and control state override approximate OCR. Do not restore an earlier state, query the console, or reread source after the required checks pass. When every required state passes, present the canonical HTML and finish.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
           : directSingleArtifactMode
             ? `${baseSystemPrompt}\n\nHarness bounded single-artifact mode: the user supplied explicit requirements and acceptance criteria for one self-contained Web artifact, with no unresolved product choice. Build the complete HTML directly. Do not create or propose a plan.${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
             : `${baseSystemPrompt}${visualWebWorkflowPrompt}${visualWebCurrentPhasePrompt}`
+        const fullPhaseSystemPrompt = repeatedToolStrategyReset
+          ? `${phaseSystemPrompt}\n\nHarness progress recovery: an unchanged ${repeatedToolStrategyReset.callName} call with arguments ${repeatedToolStrategyReset.canonicalArguments} was blocked after repeated identical results, and the redundant tail was compacted. Do not issue that exact call again. The normal visual phase repair is temporarily suspended for this one recovery step so you can use a materially different action to diagnose or repair the underlying state. Rely on the compact retained result, then make one different call that can create new evidence or progress.`
+          : phaseSystemPrompt
+        // Phase-specific control belongs at the request tail. Keeping it out
+        // of the leading system message lets the provider reuse the complete
+        // stable system+history prefix across cover/content/closing phases.
+        const activeSystemPrompt = visualWebArtifactTask ? baseSystemPrompt : fullPhaseSystemPrompt
+        const visualPhaseControlPrompt = visualWebArtifactTask
+          ? fullPhaseSystemPrompt.slice(baseSystemPrompt.length).trim()
+          : ''
+        const trustedResearchCalendarPrompt = visualWebArtifactTask && visualCurrentPhase === 'web_research'
+          ? trustedResearchCalendarControl(trustedNow, state.timezone)
+          : ''
+        const trustedPhaseControlPrompt = [trustedResearchCalendarPrompt, visualPhaseControlPrompt]
+          .filter(Boolean)
+          .join('\n\n')
         const forcedCompaction = state.forceCompactionRequested
         const prepared = await this.prepareContext(
           sessionId,
@@ -1812,7 +2327,7 @@ export class AgentService {
           controller.signal,
           model,
           state.contextPressure,
-          activeToolDefinitions,
+          providerToolDefinitions,
           activeSystemPrompt,
           forcedCompaction ? { force: true, reason: 'tool_request' } : {},
         )
@@ -1820,7 +2335,6 @@ export class AgentService {
           if (prepared.changed) next.messages = prepared.messages
           if (forcedCompaction?.callId === next.forceCompactionRequested?.callId) delete next.forceCompactionRequested
         })
-        this.assertSessionTokenLimit((await this.store.get(sessionId)).summary)
         await this.store.append(sessionId, 'assistant.started', { step }, { turnId, stepId })
         let reasoningStarted = false
         streamedAssistantContent = ''
@@ -1844,7 +2358,13 @@ export class AgentService {
           }
         }
         let result: ModelResult
-        let modelMessages = prepared.messages
+        let persistentModelMessages = prepared.messages
+        let modelMessages = trustedPhaseControlPrompt
+          ? [...persistentModelMessages, {
+            role: 'user' as const,
+            content: `[Harness trusted phase control — not a new user request]\n${trustedPhaseControlPrompt}`,
+          }]
+          : persistentModelMessages
         let contextOverflowRetried = false
         let streamedEventWriteError: unknown
         let streamedEventWriteBarrier: Promise<void> = Promise.resolve()
@@ -1907,6 +2427,7 @@ export class AgentService {
             result = normalizeModelToolCallIds(await this.client.stream({
               messages: [{ role: 'system', content: activeSystemPrompt }, ...modelMessages],
               tools: activeToolDefinitions,
+              providerTools: providerToolDefinitions,
               model,
               signal: controller.signal,
               onReasoning: onReasoningDelta,
@@ -1932,18 +2453,23 @@ export class AgentService {
               sessionId,
               turnId,
               stepId,
-              modelMessages,
+              persistentModelMessages,
               controller.signal,
               model,
               state.contextPressure,
-              activeToolDefinitions,
+              providerToolDefinitions,
               activeSystemPrompt,
               { force: true, reason: 'context_overflow' },
             )
             if (!recovered.changed) throw error
             await this.store.update(sessionId, (next) => { next.messages = recovered.messages })
-            this.assertSessionTokenLimit((await this.store.get(sessionId)).summary)
-            modelMessages = recovered.messages
+            persistentModelMessages = recovered.messages
+            modelMessages = trustedPhaseControlPrompt
+              ? [...persistentModelMessages, {
+                role: 'user' as const,
+                content: `[Harness trusted phase control — not a new user request]\n${trustedPhaseControlPrompt}`,
+              }]
+              : persistentModelMessages
             contextOverflowRetried = true
           }
         }
@@ -1961,6 +2487,7 @@ export class AgentService {
             repaired = normalizeModelToolCallIds(await this.client.stream({
               messages: [{ role: 'system', content: activeSystemPrompt }, ...repairContextMessages],
               tools: activeToolDefinitions,
+              providerTools: providerToolDefinitions,
               model,
               signal: controller.signal,
               onReasoning: onReasoningDelta,
@@ -1986,7 +2513,7 @@ export class AgentService {
               originalCalls,
               originalRequests,
               originalCalls === 1
-                ? { messages: modelMessages, tools: activeToolDefinitions, systemPrompt: activeSystemPrompt }
+                ? { messages: modelMessages, tools: providerToolDefinitions, systemPrompt: activeSystemPrompt }
                 : null,
             )
             await this.recordFailedModelUsage(sessionId, turnId, stepId, error, 'agent', model)
@@ -2029,7 +2556,7 @@ export class AgentService {
           completedModelCalls,
           physicalModelRequests,
           completedModelCalls === 1
-            ? { messages: modelMessages, tools: activeToolDefinitions, systemPrompt: activeSystemPrompt }
+            ? { messages: modelMessages, tools: providerToolDefinitions, systemPrompt: activeSystemPrompt }
             : null,
         )
         if (controller.signal.aborted) {
@@ -2038,6 +2565,111 @@ export class AgentService {
             : new DOMException('Run aborted after the model response', 'AbortError')
         }
         assertAgentModelFinishReason(result)
+
+        if (visualWebArtifactTask && result.toolCalls.length > 0) {
+          const requestedHtmlPath = visualCurrentPhase === 'html_artifact'
+            ? explicitDeliverableCompletionGap(state.messages, state.artifacts, '')
+              ?.requestedPaths.find((path) => /\.html?$/iu.test(path))
+            : undefined
+          const phaseRepair = repairVisualWebArtifactPhaseToolCalls(
+            result.toolCalls,
+            visualCurrentPhase,
+            singleArtifactCanonicalPath ?? requestedHtmlPath,
+            visualWebWorkflowGap?.referenceContract,
+            visualWebWorkflowGap?.currentScreenshotPath,
+            visualWebStyleReference,
+            visualWebWorkflowGap?.referenceContinuation,
+            visualCurrentPhase === 'html_artifact'
+              ? retrievedNonReferenceResearchSourceUrls(state.messages)
+              : undefined,
+            visualWebWorkflowGap?.htmlArtifactRepair,
+          )
+          if (phaseRepair.repairs.length > 0) {
+            result = { ...result, toolCalls: phaseRepair.toolCalls }
+            await this.store.append(sessionId, 'model.tool_call.repair', {
+              reason: 'visual_workflow_phase_action',
+              phase: visualCurrentPhase,
+              succeeded: true,
+              repairs: phaseRepair.repairs,
+            }, { turnId, stepId })
+          }
+          const maximumPhaseCalls = visualCurrentPhase === 'web_research' ? 3 : 1
+          const seenPhaseCalls = new Set<string>()
+          const admittedPhaseCalls = result.toolCalls.filter((call) => {
+            const signature = `${call.function.name}:${call.function.arguments}`
+            if (seenPhaseCalls.has(signature) || seenPhaseCalls.size >= maximumPhaseCalls) return false
+            seenPhaseCalls.add(signature)
+            return true
+          })
+          if (admittedPhaseCalls.length !== result.toolCalls.length) {
+            const droppedCallIds = result.toolCalls
+              .filter((call) => !admittedPhaseCalls.includes(call))
+              .map((call) => call.id)
+            result = { ...result, toolCalls: admittedPhaseCalls }
+            await this.store.append(sessionId, 'model.tool_call.repair', {
+              reason: 'visual_workflow_phase_cardinality',
+              phase: visualCurrentPhase,
+              succeeded: true,
+              maximumPhaseCalls,
+              droppedCallIds,
+            }, { turnId, stepId })
+          }
+        }
+
+        const degenerateModelOutput = result.toolCalls.length === 0 && (
+          result.degenerateRepetition === true
+          || isDegenerateModelRepetition(result.content)
+        )
+        if (degenerateModelOutput) {
+          modelOutputRecoveryCount += 1
+          const recoveryMessage: ModelMessage = {
+            role: 'user',
+            content: modelOutputRecoveryPrompt('repetition'),
+          }
+          await this.store.update(sessionId, (next) => { next.messages.push(recoveryMessage) })
+          // The streamed draft was intentionally discarded. Mark it handled so
+          // a later failure cannot persist the same repetition from the catch
+          // path and poison the next resumed context.
+          streamedAssistantPersisted = true
+          streamedAssistantContent = ''
+          await this.store.append(sessionId, 'model.final.repair', {
+            reason: 'degenerate_repetition',
+            attempt: modelOutputRecoveryCount,
+            succeeded: false,
+            discardedPartialBytes: Buffer.byteLength(result.content),
+            modelRequestCount: modelPhysicalRequestCount(result, modelAuthoritativeCallCount(result)),
+          }, { turnId, stepId })
+          await this.store.append(sessionId, 'assistant.thought.started', {
+            step,
+            visibleProgress: true,
+            modelOutputRecovery: true,
+          }, { turnId, stepId })
+          await this.store.append(sessionId, 'assistant.thought.completed', {
+            text: 'The model response entered a repetition loop. Discarding that draft and resuming from durable progress.',
+            visibleProgress: true,
+            modelOutputRecovery: true,
+          }, { turnId, stepId })
+          continue
+        }
+
+        if (repeatedToolStrategyReset && result.toolCalls.length > 0) {
+          const recoverySignatures = result.toolCalls.map((call) => (
+            `${call.function.name}:${stableJson(parseArguments(call.function.arguments))}`
+          ))
+          if (recoverySignatures.length === 1 && recoverySignatures[0] === repeatedToolStrategyReset.signature) {
+            await this.store.append(sessionId, 'model.tool_call.repair', {
+              reason: 'repeated_tool_strategy_reset_failed',
+              blockedSignature: repeatedToolStrategyReset.signature,
+              succeeded: false,
+            }, { turnId, stepId })
+            // Do not persist another assistant/tool pair for the same blocked
+            // call. The compact first block remains the durable recovery point.
+            streamedAssistantPersisted = true
+            streamedAssistantContent = ''
+            throw new Error(`Model repeated the same ${repeatedToolStrategyReset.callName} call after an explicit progress recovery. Continue the run to retry from the compacted durable evidence.`)
+          }
+          repeatedToolStrategyReset = undefined
+        }
 
         if (
           exactFinalRequest
@@ -2102,11 +2734,34 @@ export class AgentService {
             if (webCitationBuffering && !visualWorkflowBuffering && !suppressSensitiveStreaming && result.content) {
               await this.store.append(sessionId, 'assistant.final.delta', { delta: result.content }, { turnId, stepId })
             }
-            await this.store.update(sessionId, (next) => { next.messages.push(assistantMessage) })
+            modelOutputRecoveryCount += 1
+            const recoveryMessage: ModelMessage = {
+              role: 'user',
+              content: modelOutputRecoveryPrompt('length'),
+            }
+            await this.store.update(sessionId, (next) => {
+              next.messages.push(assistantMessage, recoveryMessage)
+            })
             streamedAssistantPersisted = true
             incompleteAssistantPersisted = true
-            const completedCalls = modelAuthoritativeCallCount(result)
-            throw new Error(`Model response remained truncated after ${completedCalls} completed model call${completedCalls === 1 ? '' : 's'}. Continue the run to resume from the persisted partial response.`)
+            await this.store.append(sessionId, 'model.final.repair', {
+              reason: 'output_length_continuation',
+              attempt: modelOutputRecoveryCount,
+              succeeded: false,
+              persistedPartialBytes: Buffer.byteLength(result.content),
+              modelRequestCount: modelPhysicalRequestCount(result, modelAuthoritativeCallCount(result)),
+            }, { turnId, stepId })
+            await this.store.append(sessionId, 'assistant.thought.started', {
+              step,
+              visibleProgress: true,
+              modelOutputRecovery: true,
+            }, { turnId, stepId })
+            await this.store.append(sessionId, 'assistant.thought.completed', {
+              text: 'Continuing automatically from the persisted partial response after the provider output boundary.',
+              visibleProgress: true,
+              modelOutputRecovery: true,
+            }, { turnId, stepId })
+            continue
           }
           if (webCitationBuffering) {
             const citationGap = webResearchCitationGap(prepared.messages, result.content)
@@ -2154,10 +2809,18 @@ export class AgentService {
               }, { turnId, stepId })
             }
           }
-          const completionState = await this.store.get(sessionId)
+          const completionState = await revalidateActiveExactReferenceEvidence(
+            this.store,
+            sessionId,
+            await this.store.get(sessionId),
+          )
           const visualWorkflowGap = visualWebArtifactCompletionGap(completionState.messages, {
             forceTask: visualWebArtifactMode,
             requiresResearch: visualWebResearchRequired,
+            requirePrivateVisualEvidence: true,
+            referenceRequest: visualWebStyleReference,
+            referenceContract: completionState.activeReferenceStyleContract,
+            referenceContractInvalidated: Boolean(completionState.referenceStyleEvidenceInvalidation),
             canonicalPath: singleArtifactCanonicalPath,
           })
           if (visualWorkflowGap) {
@@ -2307,6 +2970,7 @@ export class AgentService {
             && call.name === 'inspect_image'
             && typeof call.arguments.prompt === 'string'
             && /\bNO\s+DEFECTS\b/iu.test(call.arguments.prompt)
+            && !/\bREFERENCE\s+FIDELITY\b/iu.test(call.arguments.prompt)
           ) {
             call.arguments.prompt = `${call.arguments.prompt}\nJudge only visible layout, contrast, clipping, overlap, spacing, and readability. Browser snapshots are authoritative for exact text and control state; do not infer semantic mismatches between pagination dots, counters, labels, or OCR.`
           }
@@ -2329,59 +2993,104 @@ export class AgentService {
             ? { ...consecutiveToolCall, count: consecutiveToolCall.count + 1 }
             : { signature, count: 1, canonicalArguments, unchangedResultCount: 0 }
         }
+        let blockedRepeatedTool: {
+          signature: string
+          callName: string
+          canonicalArguments: string
+          previousResult?: string
+        } | undefined
         const toolMessages = result.finishReason === 'length'
-          ? await this.failTruncatedToolCalls(sessionId, turnId, stepId, calls)
+          ? await this.failTruncatedToolCalls(sessionId, turnId, stepId, calls, {
+              visualPhase: visualCurrentPhase,
+              exactReference: visualWebStyleReference?.strictness === 'exact',
+              slideCount: slidePlan.count,
+            })
           : await executeToolBatch(calls, async (call) => {
             const repeatState = calls.length === 1 ? consecutiveToolCall : undefined
             const repeatGuardMode = repeatedToolCallGuardMode(repeatState)
             const canonicalWriteBlocked = singleArtifactWebTask
               && Boolean(singleArtifactCanonicalPath)
               && call.name === 'write_file'
-              const canonicalInspectionSkipped = singleArtifactWebTask
-                && Boolean(singleArtifactCanonicalPath)
+            const exactReferenceHtmlWriteCandidate = visualWebArtifactTask
+              && visualWebStyleReference?.strictness === 'exact'
+              && !singleArtifactCanonicalPath
+              && call.name === 'write_file'
+              && typeof call.arguments.path === 'string'
+              && typeof call.arguments.content === 'string'
+              && /\.html?$/iu.test(call.arguments.path)
+            const exactReferenceHtmlRepairCandidate = visualWebArtifactTask
+              && visualWebStyleReference?.strictness === 'exact'
+              && !singleArtifactCanonicalPath
+              && visualCurrentPhase === 'html_artifact'
+              && call.name === 'edit_file'
+              && typeof call.arguments.path === 'string'
+              && visualWebWorkflowGap?.htmlArtifactRepair?.path === arenaWorkspacePathForVision(call.arguments.path)
+            const exactReferenceHtmlMutationCandidate = exactReferenceHtmlWriteCandidate
+              || exactReferenceHtmlRepairCandidate
+            let exactReferenceCanonicalGap = exactReferenceHtmlWriteCandidate
+              ? exactReferenceCanonicalHtmlWriteGap(
+                state.messages,
+                call.arguments.content as string,
+                Number.POSITIVE_INFINITY,
+                state.referenceStyleEvidenceInvalidation
+                  ? null
+                  : state.activeReferenceStyleContract,
+              )
+              : undefined
+            let durableCanonicalHtmlWrite = isCompleteHtmlWrite(call)
+              && (!exactReferenceHtmlWriteCandidate || exactReferenceCanonicalGap === undefined)
+            const canonicalInspectionSkipped = singleArtifactWebTask
+              && Boolean(singleArtifactCanonicalPath)
               && !canonicalDiagnosticRead
               && canonicalArtifactInspectionTargets(call, singleArtifactCanonicalPath as string)
-              const needsVerificationMessages = (
-                call.name === 'present_file' && typeof call.arguments.path === 'string'
-              ) || (
-                visualWebArtifactTask
-                && visualWebResearchRequired
-                && !singleArtifactCanonicalPath
-                && call.name === 'write_file'
-                && typeof call.arguments.path === 'string'
-                && typeof call.arguments.content === 'string'
-                && /\.html?$/iu.test(call.arguments.path)
-              )
-              const verificationMessages = needsVerificationMessages
-                ? (await this.store.get(sessionId)).messages
+            const needsVerificationMessages = (
+              call.name === 'present_file' && typeof call.arguments.path === 'string'
+            ) || (
+              visualWebArtifactTask
+              && visualWebResearchRequired
+              && !singleArtifactCanonicalPath
+              && call.name === 'write_file'
+              && typeof call.arguments.path === 'string'
+              && typeof call.arguments.content === 'string'
+              && /\.html?$/iu.test(call.arguments.path)
+            )
+            const verificationMessages = needsVerificationMessages
+              ? (await this.store.get(sessionId)).messages
+              : undefined
+            const initialResearchHtmlWriteGap = verificationMessages
+              && call.name === 'write_file'
+              && typeof call.arguments.content === 'string'
+              ? visualResearchHtmlWriteVerificationGap(verificationMessages, call.arguments.content)
+              : undefined
+            const deliveryVerificationGap = initialResearchHtmlWriteGap ?? (
+              verificationMessages
+              && call.name === 'present_file'
+              && typeof call.arguments.path === 'string'
+                ? officePresentVerificationGap(verificationMessages, call.arguments.path)
+                  ?? pdfPresentVerificationGap(verificationMessages, call.arguments.path)
+                  ?? durableAttachmentPresentVerificationGap(await this.store.events(sessionId), turnId, call.arguments.path)
+                  ?? await webResearchArtifactPresentVerificationGap(
+                    this.store.workspaceDir(sessionId),
+                    verificationMessages,
+                    call.arguments.path,
+                  )
                 : undefined
-              const initialResearchHtmlWriteGap = verificationMessages
-                && call.name === 'write_file'
-                && typeof call.arguments.content === 'string'
-                ? visualResearchHtmlWriteVerificationGap(verificationMessages, call.arguments.content)
-                : undefined
-              const deliveryVerificationGap = initialResearchHtmlWriteGap ?? (
-                verificationMessages
-                && call.name === 'present_file'
-                && typeof call.arguments.path === 'string'
-                  ? officePresentVerificationGap(verificationMessages, call.arguments.path)
-                    ?? pdfPresentVerificationGap(verificationMessages, call.arguments.path)
-                    ?? durableAttachmentPresentVerificationGap(await this.store.events(sessionId), turnId, call.arguments.path)
-                    ?? await webResearchArtifactPresentVerificationGap(
-                      this.store.workspaceDir(sessionId),
-                      verificationMessages,
-                      call.arguments.path,
-                    )
-                  : undefined
-              )
-              const toolNotEnabled = !canonicalWriteBlocked && !canonicalInspectionSkipped && !deliveryVerificationGap && !enabledToolNames.has(call.name)
-              const toolBudgetExceeded = !admittedCalls.has(call)
-              const priorApprovalDenied = !toolNotEnabled
-                && !toolBudgetExceeded
-                && !deliveryVerificationGap
-                && (call.name === 'http_request' || call.name === 'deploy_project')
-                && await this.wasApprovalDeniedForCurrentTask(sessionId, call)
-              const repeated = !toolNotEnabled && !toolBudgetExceeded && !deliveryVerificationGap && !priorApprovalDenied && repeatGuardMode !== undefined
+            )
+            const toolNotEnabled = !canonicalWriteBlocked
+              && !canonicalInspectionSkipped
+              && !deliveryVerificationGap
+              && !enabledToolNames.has(call.name)
+            const toolBudgetExceeded = !admittedCalls.has(call)
+            const priorApprovalDenied = !toolNotEnabled
+              && !toolBudgetExceeded
+              && !deliveryVerificationGap
+              && (call.name === 'http_request' || call.name === 'deploy_project')
+              && await this.wasApprovalDeniedForCurrentTask(sessionId, call)
+            const repeated = !toolNotEnabled
+              && !toolBudgetExceeded
+              && !deliveryVerificationGap
+              && !priorApprovalDenied
+              && repeatGuardMode !== undefined
               const toolStartedAtMs = Date.now()
               const callIndex = callIndexByCall.get(call)
               if (callIndex === undefined) throw new Error('Tool call occurrence is missing its stable batch index')
@@ -2389,7 +3098,7 @@ export class AgentService {
                 call,
                 callIndex,
               }, { turnId, stepId, callId: call.id })
-              let execution
+              let execution: ToolExecutionResult
               if (toolBudgetExceeded) {
                 execution = arenaToolErrorResult(
                   call.name,
@@ -2443,6 +3152,125 @@ export class AgentService {
                   enabledConnectorSlugs,
                 })
               }
+              if (exactReferenceHtmlRepairCandidate && toolExecutionProvesExecutedSuccess(execution)) {
+                try {
+                  const workspace = this.store.workspaceDir(sessionId)
+                  const repairPath = arenaWorkspacePathForVision(call.arguments.path as string)
+                  const target = resolveWorkspacePath(workspace, repairPath)
+                  await assertNoSymlinkTraversal(workspace, target)
+                  const repairedHtml = await readFile(target, 'utf8')
+                  exactReferenceCanonicalGap = exactReferenceCanonicalHtmlWriteGap(
+                    state.messages,
+                    repairedHtml,
+                    Number.POSITIVE_INFINITY,
+                    state.referenceStyleEvidenceInvalidation
+                      ? null
+                      : state.activeReferenceStyleContract,
+                  )
+                  durableCanonicalHtmlWrite = exactReferenceCanonicalGap === undefined
+                } catch (error) {
+                  exactReferenceCanonicalGap = `The edited exact-reference HTML could not be revalidated: ${error instanceof Error ? error.message : String(error)}`
+                  durableCanonicalHtmlWrite = false
+                }
+              }
+              const referenceRenderPhase = referenceRenderPhaseForWorkflow(visualCurrentPhase)
+              if (
+                referenceRenderPhase
+                && call.name === 'browser'
+                && call.arguments.action === 'screenshot'
+                && toolExecutionProvesExecutedSuccess(execution)
+                && visualWebWorkflowGap?.referenceContract?.contract.strictness === 'exact'
+              ) {
+                const renderProfile = visualWebWorkflowGap.referenceContract.renderProfile
+                if (!renderProfile) {
+                  execution = arenaToolErrorResult(
+                    call.name,
+                    'The exact-reference screenshot could not be verified because its durable browser render profile is missing. Reacquire the concrete reference and record the StyleContract again.',
+                  )
+                } else {
+                  try {
+                    const fontEvidence = visualWebWorkflowGap.referenceContract.fontEvidence
+                    if (!fontEvidence || !exactReferenceFontEvidenceBound(visualWebWorkflowGap.referenceContract, true)) {
+                      throw new Error('the durable exact-reference font manifest is missing or invalid')
+                    }
+                    const referenceFonts = await this.store.resolveReferenceFontEvidence(
+                      sessionId,
+                      fontEvidence,
+                    )
+                    const fontOptions = referenceFonts.fontCss.length > 0
+                      ? {
+                          fontCss: referenceFonts.fontCss,
+                          expectedFontFamilies: referenceFonts.familyNames,
+                        }
+                      : undefined
+                    const atomicRender = await this.browser.verifyRenderedReferenceStyleAndScreenshot(
+                      sessionId,
+                      renderProfile,
+                      referenceRenderPhase,
+                      controller.signal,
+                      fontOptions,
+                    )
+                    const verification = atomicRender.verification
+                    const canonicalPath = visualWebWorkflowGap.canonicalPath
+                    if (!canonicalPath) throw new Error('canonical path is missing during screenshot attestation')
+                    const workspace = this.store.workspaceDir(sessionId)
+                    const canonicalTarget = resolveWorkspacePath(workspace, canonicalPath)
+                    await assertNoSymlinkTraversal(workspace, canonicalTarget)
+                    const screenshotPath = arenaWorkspacePathForVision(String(
+                      call.arguments.screenshot_path || call.arguments.path || 'browser-screenshot.png',
+                    ))
+                    const screenshotTarget = resolveWorkspacePath(workspace, screenshotPath)
+                    await assertNoSymlinkTraversal(workspace, screenshotTarget)
+                    const canonicalBytes = await readFile(canonicalTarget)
+                    // Replace the tool's initial capture with the screenshot
+                    // taken inside the deterministic stability window. Vision
+                    // and the render attestation now consume identical bytes.
+                    await this.store.commitWorkspaceWrite(sessionId, {
+                      path: screenshotPath,
+                      content: atomicRender.screenshot,
+                      mode: 'upsert',
+                      operation: 'browser-screenshot-render-attested',
+                      artifact: createWorkspaceArtifact(sessionId, screenshotPath, new Date().toISOString()),
+                      context: { turnId, stepId, callId: call.id },
+                    })
+                    const screenshotBytes = atomicRender.screenshot
+                    execution = withRenderedReferenceVerification(
+                      execution,
+                      verification,
+                      {
+                        render_canonical_path: canonicalPath,
+                        render_artifact_hash: createHash('sha256').update(canonicalBytes).digest('base64url'),
+                        render_reference_sha256: renderProfile.evidenceSha256,
+                        render_font_manifest_sha256: fontEvidence.manifestSha256,
+                        render_page_url: verification.url,
+                        render_page_epoch: verification.pageEpoch,
+                        render_viewport: verification.viewport,
+                        screenshot_path: screenshotPath,
+                        screenshot_sha256: createHash('sha256').update(screenshotBytes).digest('hex'),
+                      },
+                    )
+                  } catch (error) {
+                    execution = arenaToolErrorResult(
+                      call.name,
+                      `The exact-reference screenshot render gate failed: ${error instanceof Error ? error.message : String(error)}`,
+                    )
+                  }
+                }
+              }
+              if (exactReferenceHtmlMutationCandidate && toolExecutionProvesExecutedSuccess(execution)) {
+                // The durable terminal event and the following model Tool
+                // message must carry the same canonical decision. Otherwise a
+                // restart between those writes can recover a successful raw
+                // mutation without its canonical_html marker.
+                execution = {
+                  ...execution,
+                  content: convergedAgentToolModelOutput(call, execution, {
+                    canonicalHtml: durableCanonicalHtmlWrite,
+                    slideCount: slidePlan.count,
+                    ...(exactReferenceCanonicalGap ? { canonicalGap: exactReferenceCanonicalGap } : {}),
+                  }),
+                }
+              }
               if (this.active.get(sessionId)?.termination === 'service_restart_pause') {
                 throw new ServiceRestartPauseError()
               }
@@ -2489,10 +3317,19 @@ export class AgentService {
                 repeatState.previousResult = execution.content
                 repeatState.previousResultSignature = resultSignature
               }
+              if (repeated && repeatState) {
+                blockedRepeatedTool = {
+                  signature: repeatState.signature,
+                  callName: call.name,
+                  canonicalArguments: repeatState.canonicalArguments,
+                  previousResult: repeatState.previousResult,
+                }
+              }
               if (
                 singleArtifactWebTask
-                && isCompleteHtmlWrite(call)
-                && !execution.isError
+                && durableCanonicalHtmlWrite
+                && toolExecutionProvesExecutedSuccess(execution)
+                && typeof call.arguments.path === 'string'
               ) {
                 singleArtifactCanonicalPath = arenaWorkspacePathForVision(call.arguments.path)
               }
@@ -2500,11 +3337,38 @@ export class AgentService {
               return {
                 role: 'tool' as const,
                 tool_call_id: call.id,
-                content: convergedAgentToolModelOutput(call, execution),
+                content: convergedAgentToolModelOutput(call, execution, exactReferenceHtmlMutationCandidate
+                  ? {
+                      canonicalHtml: durableCanonicalHtmlWrite,
+                      slideCount: slidePlan.count,
+                      ...(exactReferenceCanonicalGap ? { canonicalGap: exactReferenceCanonicalGap } : {}),
+                    }
+                  : undefined),
                 ...(toolContentParts ? { tool_content_parts: toolContentParts } : {}),
                 tool_result_status: execution.isError ? 'failed' as const : 'succeeded' as const,
               }
             }, this.maxParallelToolCalls)
+        const visualObservationBase = visualWebArtifactTask
+          && visualCurrentPhase
+          && result.finishReason !== 'length'
+          && calls.length > 0
+          && toolMessages.length === calls.length
+          ? {
+              phase: visualCurrentPhase,
+              callSignature: visualToolCallSignature(calls, visualCurrentPhase),
+              callNames: calls.map((call) => call.name),
+              outcomeDigest: visualToolOutcomeDigest(toolMessages, visualCurrentPhase),
+            }
+          : undefined
+        let visualNoProgressTransition: {
+          action: 'clear' | 'track' | 'recover_phase' | 'fail'
+          phase: VisualWebArtifactWorkflowPhase
+          callSignature: string
+          callNames: string[]
+          outcomeDigest: string
+          consecutiveCount: number
+          collapsedOccurrences: number
+        } | undefined
         await this.store.update(sessionId, (next) => {
           next.messages.push(...toolMessages)
           const completedCallIds = new Set(calls.map((call) => call.id))
@@ -2516,9 +3380,94 @@ export class AgentService {
             if (completedCallIds.has(pending.callId)) delete next.pendingApprovals![approvalId]
           }
           if (next.pendingApprovals && Object.keys(next.pendingApprovals).length === 0) delete next.pendingApprovals
+          if (!visualWebArtifactTask || !visualCurrentPhase) {
+            delete next.visualNoProgress
+            return
+          }
+          const nextGap = visualWebArtifactCompletionGap(next.messages, {
+            forceTask: true,
+            requiresResearch: visualWebResearchRequired,
+            requirePrivateVisualEvidence: true,
+            referenceRequest: visualWebStyleReference,
+            referenceContract: next.activeReferenceStyleContract,
+            referenceContractInvalidated: Boolean(next.referenceStyleEvidenceInvalidation),
+            canonicalPath: singleArtifactCanonicalPath,
+          })
+          const nextPhase = nextVisualWebArtifactPhase(nextGap)
+          if (!visualObservationBase || nextPhase !== visualCurrentPhase) {
+            delete next.visualNoProgress
+            return
+          }
+          const transition = advanceVisualNoProgressState(next.visualNoProgress, {
+            ...visualObservationBase,
+            phaseAdvanced: false,
+          })
+          if (transition.state) next.visualNoProgress = transition.state
+          else delete next.visualNoProgress
+          let collapsedOccurrences = 0
+          if (transition.action === 'recover_phase' && transition.state) {
+            const compacted = collapseConsecutiveIdenticalToolCallTail(next.messages, visualCurrentPhase)
+            collapsedOccurrences = compacted.collapsedOccurrences
+            next.messages = [...compacted.messages, {
+              role: 'user',
+              content: `${MODEL_OUTPUT_RECOVERY_PREFIX} Visual phase recovery: the durable workflow was recomputed and remains at ${transition.state.phase}. The same ${transition.state.callNames.join(', ')} phase action produced an unchanged durable outcome and made no progress ${transition.state.consecutiveCount} times; ${collapsedOccurrences} redundant trailing occurrence${collapsedOccurrences === 1 ? '' : 's'} were removed. Use the exact tool surface supplied for the recomputed phase and fix the concrete reported gap. Retry once only; another unchanged durable outcome will stop the run instead of spending more model tokens.`,
+            }]
+          }
+          visualNoProgressTransition = {
+            action: transition.action,
+            phase: visualCurrentPhase,
+            callSignature: visualObservationBase.callSignature,
+            callNames: visualObservationBase.callNames,
+            outcomeDigest: visualObservationBase.outcomeDigest,
+            consecutiveCount: transition.state?.consecutiveCount ?? 0,
+            collapsedOccurrences,
+          }
         })
+        if (visualNoProgressTransition?.action === 'recover_phase') {
+          consecutiveToolCall = undefined
+          await this.store.append(sessionId, 'model.tool_call.repair', {
+            reason: 'visual_no_progress_phase_recovery',
+            phase: visualNoProgressTransition.phase,
+            callSignature: visualNoProgressTransition.callSignature,
+            callNames: visualNoProgressTransition.callNames,
+            outcomeDigest: visualNoProgressTransition.outcomeDigest,
+            consecutiveCount: visualNoProgressTransition.consecutiveCount,
+            collapsedOccurrences: visualNoProgressTransition.collapsedOccurrences,
+            succeeded: true,
+          }, { turnId, stepId })
+          continue
+        }
+        if (visualNoProgressTransition?.action === 'fail') {
+          await this.store.append(sessionId, 'model.tool_call.repair', {
+            reason: 'visual_no_progress_guard_failed',
+            phase: visualNoProgressTransition.phase,
+            callSignature: visualNoProgressTransition.callSignature,
+            callNames: visualNoProgressTransition.callNames,
+            outcomeDigest: visualNoProgressTransition.outcomeDigest,
+            consecutiveCount: visualNoProgressTransition.consecutiveCount,
+            succeeded: false,
+          }, { turnId, stepId })
+          throw new Error(`Visual workflow phase ${visualNoProgressTransition.phase} produced the same action and unchanged durable outcome after one durable phase-recovery attempt. The run was stopped to prevent an unbounded provider loop; continue only after the underlying tool availability or workspace state changes.`)
+        }
+        if (blockedRepeatedTool) {
+          const compacted = collapseConsecutiveIdenticalToolCallTail((await this.store.get(sessionId)).messages)
+          const recoveryMessage: ModelMessage = {
+            role: 'user',
+            content: `${MODEL_OUTPUT_RECOVERY_PREFIX} The unchanged ${blockedRepeatedTool.callName} call was blocked and ${compacted.collapsedOccurrences} redundant trailing occurrence${compacted.collapsedOccurrences === 1 ? '' : 's'} were removed from active context. Do not repeat arguments ${blockedRepeatedTool.canonicalArguments}. Use one materially different action that can produce new evidence or repair the underlying state.`,
+          }
+          await this.store.update(sessionId, (next) => {
+            next.messages = [...compacted.messages, recoveryMessage]
+          })
+          await this.store.append(sessionId, 'model.tool_call.repair', {
+            reason: 'repeated_tool_strategy_reset',
+            blockedSignature: blockedRepeatedTool.signature,
+            collapsedOccurrences: compacted.collapsedOccurrences,
+            succeeded: false,
+          }, { turnId, stepId })
+          repeatedToolStrategyReset = blockedRepeatedTool
+          consecutiveToolCall = undefined
+        }
       }
-      throw new Error(`Agent exceeded the maximum of ${config.maxAgentSteps} model steps`)
     } catch (error) {
       if (error instanceof ServiceRestartPauseError) return
       const existingTerminal = (await this.store.get(sessionId)).pendingTerminal
@@ -2533,7 +3482,6 @@ export class AgentService {
       const cancelled = controller.signal.aborted || (error as { name?: string })?.name === 'AbortError'
       const timedOut = termination === 'timed_out'
       const serviceShutdown = termination === 'service_shutdown'
-      const sessionTokenLimit = error instanceof SessionTokenLimitError
       const status = timedOut ? 'timed_out' : serviceShutdown ? 'interrupted' : cancelled ? 'cancelled' : 'failed'
       const errorData = {
         message: timedOut
@@ -2547,7 +3495,6 @@ export class AgentService {
         timedOut,
         interrupted: serviceShutdown,
         partialResponsePersisted,
-        ...(sessionTokenLimit ? { code: error.code, category: error.code, recoverableInSession: false } : {}),
       }
       const terminal: DurablePendingTerminal = {
         turnId,
@@ -3043,12 +3990,19 @@ export class AgentService {
     turnId: string,
     stepId: string,
     calls: ToolCallRecord[],
+    options: {
+      visualPhase?: VisualWebArtifactWorkflowPhase
+      exactReference?: boolean
+      slideCount?: number
+    } = {},
   ): Promise<ModelMessage[]> {
     const messages: ModelMessage[] = []
     for (const call of calls) {
       const execution = arenaToolErrorResult(
         call.name,
-        `Tool call "${call.name || 'unknown'}" was not executed because the model response reached its output-token limit and the arguments may be truncated. Re-issue the complete tool call.`,
+        options.exactReference && options.visualPhase === 'html_artifact' && call.name === 'write_file'
+          ? `Tool call "write_file" was not executed because its JSON reached the provider output boundary. Discard that partial draft; do not continue it and do not split it into part files. Start over with one complete closed ${options.slideCount ?? DEFAULT_VISUAL_WEB_SLIDE_COUNT}-slide HTML document. ${visualWebSlideCompositionInstruction(options.slideCount ?? DEFAULT_VISUAL_WEB_SLIDE_COUNT)} Stay near the compactness target of ${exactReferenceHtmlBudgetForSlideCount(options.slideCount ?? DEFAULT_VISUAL_WEB_SLIDE_COUNT).targetBytes.toLocaleString('en-US')} UTF-8 bytes. Preserve the user's explicit page count and required reference selectors, chrome, cover/content/closing geometry, interaction, and visible retrieved source URLs. Remove CSS for unused layouts and variants, shorten body copy and source labels, and use at most two or three short content blocks per slide. Minify the complete document before calling write_file.`
+          : `Tool call "${call.name || 'unknown'}" was not executed because the model response reached its output-token limit and the arguments may be truncated. Re-issue the complete tool call.`,
       )
       await this.store.append(sessionId, 'tool.started', { call }, { turnId, stepId, callId: call.id })
       await this.store.update(sessionId, (next) => {
@@ -3172,8 +4126,7 @@ export class AgentService {
     if ((source === 'vision' || source === 'image_generation' || source === 'speech') && !callId) {
       throw new Error('A durable provider-tool usage settlement requires a tool call identity')
     }
-    let crossedSessionLimit = false
-    const reachedAt = new Date().toISOString()
+    const appliedAt = new Date().toISOString()
     let durableSettlement: DurableUsageSettlement | undefined
     await this.store.update(sessionId, (next) => {
       const existing = next.usageSettlements?.[settlementId]
@@ -3194,9 +4147,6 @@ export class AgentService {
         durableSettlement = existing
         return
       }
-      const tokenLimit = next.summary.limits?.sessionTokens
-      const maxTokens = tokenLimit?.maxTokens ?? Number.POSITIVE_INFINITY
-      const wasReached = tokenLimit?.reached ?? next.summary.usage.totalTokens >= maxTokens
       next.summary.usage.promptTokens += usage.promptTokens
       next.summary.usage.completionTokens += usage.completionTokens
       next.summary.usage.totalTokens += usage.totalTokens
@@ -3225,8 +4175,6 @@ export class AgentService {
           }
         }
       }
-      crossedSessionLimit = !wasReached && next.summary.usage.totalTokens >= maxTokens
-      if (crossedSessionLimit && tokenLimit) tokenLimit.reachedAt = reachedAt
       const applicationOrder = Object.values(next.usageSettlements ?? {})
         .reduce((maximum, settlement) => Math.max(maximum, settlement.applicationOrder ?? 0), 0) + 1
       durableSettlement = {
@@ -3245,12 +4193,13 @@ export class AgentService {
         cumulativeUsageAfter: { ...next.summary.usage },
         cumulativeCostUsdAfter: next.summary.usage.estimatedCostUsd,
         settledCreditsBefore: next.summary.settledCredits ?? 0,
-        crossedSessionLimit,
-        ...(crossedSessionLimit ? { reachedAt } : {}),
-        appliedAt: reachedAt,
+        // Kept in the persisted schema for legacy replay compatibility. New
+        // usage settlements are always metered and never cross an admission
+        // limit, regardless of cached or uncached cumulative token volume.
+        crossedSessionLimit: false,
+        appliedAt,
         applicationOrder,
         expectedUsageEventId: createId('evt'),
-        ...(crossedSessionLimit ? { expectedLimitEventId: createId('evt') } : {}),
       }
       next.usageSettlements ??= {}
       next.usageSettlements[settlementId] = durableSettlement
@@ -3265,28 +4214,22 @@ export class AgentService {
     if (!initialSettlement) throw new Error(`Durable usage settlement ${settlementId} is missing`)
     let settlement: DurableUsageSettlement = initialSettlement
 
-    if (settlement.usageEventId && (!settlement.crossedSessionLimit || settlement.limitEventId)) return
+    if (settlement.usageEventId) return
 
     const priorEvents = await this.store.events(sessionId)
     const priorUsageEvent = settlement.expectedUsageEventId
       ? priorEvents.find((event) => event.id === settlement.expectedUsageEventId)
       : priorEvents.find((event) => usageEventMatchesSettlement(event, settlement))
-    const priorLimitEvent = settlement.crossedSessionLimit
-      ? settlement.expectedLimitEventId
-        ? priorEvents.find((event) => event.id === settlement.expectedLimitEventId)
-        : priorEvents.find((event) => limitEventMatchesSettlement(event, settlement))
-      : undefined
-    if (priorUsageEvent || priorLimitEvent) {
+    if (priorUsageEvent) {
       state = await this.store.update(sessionId, (next) => {
         const current = next.usageSettlements?.[settlementId]
         if (!current) throw new Error(`Durable usage settlement ${settlementId} is missing`)
         if (priorUsageEvent) current.usageEventId = priorUsageEvent.id
-        if (priorLimitEvent) current.limitEventId = priorLimitEvent.id
       })
       const reconciledSettlement = state.usageSettlements?.[settlementId]
       if (!reconciledSettlement) throw new Error(`Durable usage settlement ${settlementId} is missing`)
       settlement = reconciledSettlement
-      if (settlement.usageEventId && (!settlement.crossedSessionLimit || settlement.limitEventId)) return
+      if (settlement.usageEventId) return
     }
 
     if (!settlement.usageEventId) {
@@ -3300,7 +4243,6 @@ export class AgentService {
           next.summary.settledCredits = Math.max(next.summary.settledCredits ?? 0, creditSettlement.settledCredits)
         })
       }
-      const limit = limitAtDurableSettlement(state.summary, settlement)
       const usageEvent = await this.store.append(sessionId, 'usage.updated', {
         usage: settlement.cumulativeUsageAfter,
         lastCall: settlement.usage,
@@ -3315,7 +4257,6 @@ export class AgentService {
             settlement.modelCallCount,
           ),
         ...(settlement.metering ? { metering: settlement.metering } : {}),
-        limit,
         ...(creditSettlement ? {
           creditSettlement: {
             chargedCredits: state.summary.isFreeSession === true
@@ -3341,25 +4282,6 @@ export class AgentService {
       settlement = publishedSettlement
     }
 
-    if (settlement.crossedSessionLimit && !settlement.limitEventId) {
-      const limit = limitAtDurableSettlement(state.summary, settlement)
-      const limitEvent = await this.store.append(sessionId, 'session.limit.reached', {
-        code: 'session_token_limit',
-        category: 'session_token_limit',
-        message: SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
-        limit,
-      }, {
-        turnId: settlement.turnId,
-        stepId: settlement.stepId,
-        callId: settlement.callId,
-        eventId: settlement.expectedLimitEventId,
-      })
-      await this.store.update(sessionId, (next) => {
-        const current = next.usageSettlements?.[settlementId]
-        if (!current) throw new Error(`Durable usage settlement ${settlementId} is missing`)
-        current.limitEventId = limitEvent.id
-      })
-    }
   }
 
   private async reconcileDurableUsageSettlements(): Promise<void> {
@@ -3367,7 +4289,7 @@ export class AgentService {
     for (const summary of sessions) {
       const state = await this.store.get(summary.id)
       const pending = Object.values(state.usageSettlements ?? {})
-        .filter((settlement) => !settlement.usageEventId || (settlement.crossedSessionLimit && !settlement.limitEventId))
+        .filter((settlement) => !settlement.usageEventId)
         .sort(compareDurableUsageSettlementOrder)
       for (const settlement of pending) {
         await this.enqueueUsage(summary.id, async () => {
@@ -3427,10 +4349,6 @@ export class AgentService {
     )
   }
 
-  private assertSessionTokenLimit(summary: SessionSummary): void {
-    if (summary.limits?.sessionTokens.reached) throw new SessionTokenLimitError()
-  }
-
   private resolveModel(summary: SessionSummary, selection: string | null | undefined): { model: string; selection: string | null } {
     if (selection === undefined) return { model: summary.model, selection: summary.modelSelection ?? null }
     if (selection === null) {
@@ -3476,11 +4394,29 @@ export class AgentService {
       return payloadCompacted
     }
 
+    const activeTaskMessages = activeTaskMessageSlice(payloadCompacted.messages)
+    let activeTaskGroupCount = 0
+    let activeTaskSuffixMessages = 0
+    for (let index = groups.length - 1; index >= 0 && activeTaskSuffixMessages < activeTaskMessages.length; index -= 1) {
+      activeTaskGroupCount += 1
+      activeTaskSuffixMessages += groups[index].length
+    }
+    const protectActiveVisualTask = isVisualWebArtifactTask(payloadCompacted.messages)
+    const activeTaskFits = protectActiveVisualTask
+      && estimateProviderContextTokens([...activeTaskMessages], toolDefinitions, systemPrompt)
+      < this.contextCompactionThresholdTokens
+      && Buffer.byteLength(JSON.stringify(activeTaskMessages)) < this.contextSerializationHardLimitBytes
+    // A visual workflow's machine evidence must not disappear into a prose
+    // checkpoint halfway through the same task. Large payloads are already
+    // projected/compacted independently; retain the bounded active-task
+    // skeleton and summarize only older completed tasks when it fits.
+    if (activeTaskFits && activeTaskGroupCount >= groups.length) return payloadCompacted
     let retainCount = options.force || groups.length <= config.contextRetainGroups ? 1 : config.contextRetainGroups
+    if (activeTaskFits) retainCount = Math.max(retainCount, activeTaskGroupCount)
     retainCount = Math.min(retainCount, groups.length - 1)
     let retainedMessages = groups.slice(-retainCount).flat()
     while (
-      retainCount > 1
+      retainCount > (activeTaskFits ? activeTaskGroupCount : 1)
       && (
         estimateProviderContextTokens(retainedMessages, toolDefinitions, systemPrompt) >= this.contextCompactionThresholdTokens
         || Buffer.byteLength(JSON.stringify(retainedMessages)) >= this.contextSerializationHardLimitBytes
@@ -3532,7 +4468,7 @@ export class AgentService {
           },
           {
             role: 'user',
-            content: `Create the checkpoint from these earlier conversation records:\n${JSON.stringify(compactedMessages.map(providerVisibleMessage))}`,
+            content: `Create the checkpoint from these earlier conversation records:\n${JSON.stringify(projectProviderMessages(compactedMessages))}`,
           },
         ],
           tools: [],
@@ -3993,7 +4929,7 @@ export function selectAgentToolDefinitions(
   const latestUserMessage = state.messages[latestUserIndex] ?? { role: 'user' as const, content: '' }
   const latestUserContent = arenaUserAuthoredText(latestUserMessage)
   const continuesPriorTurn = isArenaCustomFeedbackMessage(latestUserMessage)
-    || latestUserContent.startsWith('[Harness operator action: Continue]')
+    || isHarnessTaskContinuationContent(latestUserContent)
     || isExplicitTaskContinuation(latestUserContent)
   let taskUserPosition = latestUserPosition
   if (continuesPriorTurn) {
@@ -4001,7 +4937,7 @@ export function selectAgentToolDefinitions(
       const message = state.messages[userIndexes[taskUserPosition]] ?? { role: 'user' as const, content: '' }
       const content = arenaUserAuthoredText(message)
       if (!isArenaCustomFeedbackMessage(message)
-        && !content.startsWith('[Harness operator action: Continue]')
+        && !isHarnessTaskContinuationContent(content)
         && !isExplicitTaskContinuation(content)) break
       taskUserPosition -= 1
     }
@@ -4079,11 +5015,19 @@ export function selectAgentToolDefinitions(
 
   const websiteIntent = /(?:build|create|implement|design|develop|test|verify|click|fill|preview|open|inspect|interact|复刻|创建|构建|实现|设计|开发|测试|验证|点击|填写|预览|打开|检查|操作)[\s\S]{0,120}(?:website|web app|webpage|landing page|frontend|user interface|browser|网站|网页|前端|界面|页面|浏览器)|(?:website|web app|webpage|landing page|frontend|user interface|browser|网站|网页|前端|界面|页面|浏览器)[\s\S]{0,120}(?:build|create|implement|design|develop|test|verify|click|fill|preview|open|inspect|interact|复刻|创建|构建|实现|设计|开发|测试|验证|点击|填写|预览|打开|检查|操作)/i.test(userText)
   const visualWebArtifactIntent = isVisualWebArtifactTask(taskMessages)
+  const visualStyleReference = visualWebArtifactIntent
+    ? visualWebStyleReferenceRequest(taskMessages)
+    : undefined
   const currentTaskStartedRunningWebsite = state.website.status === 'running'
     && taskMessages.some((message) => message.role === 'assistant' && message.tool_calls?.some((call) => (
       call.function.name === 'start_process' || call.function.name === 'build_and_start'
     )))
   if (websiteIntent || visualWebArtifactIntent || currentTaskStartedRunningWebsite) enabled.add('browser')
+  if (visualStyleReference) {
+    enabled.add('web_fetch')
+    enabled.add('record_reference_style')
+    enabled.add('verify_reference_style')
+  }
 
   const processIntent = /(?:list|inspect|show|stop|kill|restart|terminate|列出|查看|停止|终止|重启)[\s\S]{0,80}(?:process|server|进程|服务)|(?:process|server|进程|服务)[\s\S]{0,80}(?:list|inspect|show|stop|kill|restart|terminate|列出|查看|停止|终止|重启)/i.test(userText)
   if (processIntent) {
@@ -4216,7 +5160,7 @@ export function explicitDeliverableCompletionGap(
     const content = arenaUserAuthoredText(userMessages[taskStart])
     if (
       !isArenaCustomFeedbackMessage(userMessages[taskStart])
-      && !content.startsWith('[Harness operator action: Continue]')
+      && !isHarnessTaskContinuationContent(content)
       && !isExplicitTaskContinuation(content)
     ) break
     taskStart -= 1
@@ -4302,7 +5246,7 @@ export function singleArtifactPresentationCompletionGap(
   const taskText = activeTaskMessageSlice(messages)
     .filter((message) => {
       if (message.role !== 'user' || isArenaCustomFeedbackMessage(message)) return false
-      return !arenaUserAuthoredText(message).startsWith('[Harness operator action: Continue]')
+      return !isHarnessTaskContinuationContent(arenaUserAuthoredText(message))
     })
     .map(arenaUserAuthoredText)
     .join('\n')
@@ -4457,7 +5401,7 @@ export function pdfPresentVerificationGap(
   if (!/\.pdf$/i.test(path)) return undefined
   const taskMessages = activeTaskMessageSlice(messages)
   const taskText = taskMessages
-    .filter((message) => message.role === 'user' && !arenaUserAuthoredText(message).startsWith('[Harness operator action: Continue]'))
+    .filter((message) => message.role === 'user' && !isHarnessTaskContinuationContent(arenaUserAuthoredText(message)))
     .map(arenaUserAuthoredText)
     .join('\n')
   const pdfCreation = /\b(?:create|generate|build|prepare|produce|make|export|deliver)\b|创建|生成|制作|编制|导出|交付/iu.test(taskText)
@@ -4651,7 +5595,7 @@ function activeTaskMessageSlice(messages: readonly ModelMessage[]): readonly Mod
     const content = arenaUserAuthoredText(message)
     if (
       !isArenaCustomFeedbackMessage(message)
-      && !content.startsWith('[Harness operator action: Continue]')
+      && !isHarnessTaskContinuationContent(content)
       && !isExplicitTaskContinuation(content)
     ) break
     userPosition -= 1
@@ -4664,7 +5608,7 @@ function activeTaskMessageSlice(messages: readonly ModelMessage[]): readonly Mod
     // tool history still belongs to this task and must remain visible to
     // completion gates; treating Continue as a brand-new task discards the
     // durable preview/inspection chain.
-    if (content.startsWith('[Harness operator action: Continue]')) return messages
+    if (isHarnessTaskContinuationContent(content)) return messages
   }
   return messages.slice(userIndexes[userPosition])
 }
@@ -4704,12 +5648,241 @@ export function isVisualWebArtifactTask(messages: readonly ModelMessage[]): bool
   return english.test(taskText) || chinese.test(taskText)
 }
 
+interface VisualWebSlidePlan {
+  count: number
+  explicitlyRequested: boolean
+  targetBytes: number
+  schemaMaxCharacters: number
+}
+
+const ENGLISH_SLIDE_COUNT_ONES: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13,
+  fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18,
+  nineteen: 19,
+}
+const ENGLISH_SLIDE_COUNT_TENS: Record<string, number> = {
+  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70,
+  eighty: 80, ninety: 90,
+}
+const CHINESE_SLIDE_COUNT_DIGITS: Record<string, number> = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4,
+  五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+}
+
+function parseRequestedSlideCountToken(raw: string): number | undefined {
+  const normalizedDigits = raw.replace(/[０-９]/gu, (digit) => String(digit.charCodeAt(0) - 0xFF10)).trim()
+  if (/^\d{1,3}$/u.test(normalizedDigits)) {
+    const count = Number(normalizedDigits)
+    return count >= 3 ? count : undefined
+  }
+  const english = normalizedDigits.toLowerCase().replace(/-/gu, ' ').replace(/\s+/gu, ' ').trim()
+  if (ENGLISH_SLIDE_COUNT_ONES[english] !== undefined) {
+    const count = ENGLISH_SLIDE_COUNT_ONES[english]
+    return count >= 3 ? count : undefined
+  }
+  const [tens, ones, ...extra] = english.split(' ')
+  if (extra.length === 0 && ENGLISH_SLIDE_COUNT_TENS[tens] !== undefined) {
+    const count = ENGLISH_SLIDE_COUNT_TENS[tens] + (ones ? (ENGLISH_SLIDE_COUNT_ONES[ones] ?? Number.NaN) : 0)
+    return Number.isInteger(count) && count >= 3 ? count : undefined
+  }
+  if (/^[零〇一二两三四五六七八九十]+$/u.test(normalizedDigits)) {
+    const tenIndex = normalizedDigits.indexOf('十')
+    if (tenIndex < 0) {
+      const count = CHINESE_SLIDE_COUNT_DIGITS[normalizedDigits]
+      return count !== undefined && count >= 3 ? count : undefined
+    }
+    if (normalizedDigits.indexOf('十', tenIndex + 1) >= 0) return undefined
+    const tensDigit = tenIndex === 0 ? 1 : CHINESE_SLIDE_COUNT_DIGITS[normalizedDigits.slice(0, tenIndex)]
+    const onesDigit = tenIndex === normalizedDigits.length - 1
+      ? 0
+      : CHINESE_SLIDE_COUNT_DIGITS[normalizedDigits.slice(tenIndex + 1)]
+    const count = tensDigit !== undefined && onesDigit !== undefined ? tensDigit * 10 + onesDigit : undefined
+    return count !== undefined && count >= 3 ? count : undefined
+  }
+  return undefined
+}
+
+function requestedVisualWebSlideCount(messages: readonly ModelMessage[]): number | undefined {
+  const taskText = [
+    activeTaskMessageSlice(messages)
+      .filter((message) => message.role === 'user' && !isHarnessTaskContinuationContent(arenaUserAuthoredText(message)))
+      .map(arenaUserAuthoredText)
+      .join('\n'),
+    trustedArenaCompactionTaskContext(messages),
+  ].filter(Boolean).join('\n').replace(/https?:\/\/[^\s<>"'`]+/giu, ' ')
+  const numberToken = String.raw`(?:[0-9０-９]{1,3}|[零〇一二两三四五六七八九十]{1,4}|(?:three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[-\s](?:one|two|three|four|five|six|seven|eight|nine))?)`
+  const patterns = [
+    new RegExp(`\\b(${numberToken})\\s*(?:[-–—]\s*)?(?:slides?|pages?)\\b`, 'giu'),
+    new RegExp(`\\b(?:slides?|pages?)\\s*(?:count\\s*)?(?:of\\s*)?(?:is\\s*|=\\s*|[:：]\\s*)?(${numberToken})\\b`, 'giu'),
+    new RegExp(`(${numberToken})\\s*(?:页|张)(?:\\s*(?:幻灯片|演示文稿|slides?|deck))?`, 'giu'),
+    new RegExp(`(?:幻灯片|演示文稿|deck)\\s*(?:共|总共|要|为|做成|制作成|[:：])?\\s*(${numberToken})(?:\\s*(?:页|张))?`, 'giu'),
+  ]
+  const matches: Array<{ index: number; count: number }> = []
+  for (const pattern of patterns) {
+    for (const match of taskText.matchAll(pattern)) {
+      const count = parseRequestedSlideCountToken(match[1])
+      if (count !== undefined) matches.push({ index: match.index ?? 0, count })
+    }
+  }
+  return matches.sort((left, right) => left.index - right.index).at(-1)?.count
+}
+
+function exactReferenceHtmlBudgetForSlideCount(count: number): Pick<VisualWebSlidePlan, 'targetBytes' | 'schemaMaxCharacters'> {
+  const targetBytes = Math.min(
+    EXACT_REFERENCE_HTML_SOFT_TARGET_MAX_BYTES,
+    Math.max(EXACT_REFERENCE_HTML_MIN_TARGET_BYTES, count * EXACT_REFERENCE_HTML_BYTES_PER_SLIDE),
+  )
+  return {
+    targetBytes,
+    schemaMaxCharacters: Math.max(EXACT_REFERENCE_HTML_SCHEMA_MAX_CHARACTERS, targetBytes),
+  }
+}
+
+function visualWebSlidePlan(messages: readonly ModelMessage[]): VisualWebSlidePlan {
+  const requested = requestedVisualWebSlideCount(messages)
+  const count = requested ?? DEFAULT_VISUAL_WEB_SLIDE_COUNT
+  return {
+    count,
+    explicitlyRequested: requested !== undefined,
+    ...exactReferenceHtmlBudgetForSlideCount(count),
+  }
+}
+
+/** Resolve the requested deck size without replacing an explicit page count with the default. */
+export function visualWebArtifactSlideCount(messages: readonly ModelMessage[]): number {
+  return visualWebSlidePlan(messages).count
+}
+
+export interface VisualStyleReferenceRequest {
+  urls: string[]
+  strictness: ReferenceStrictness
+}
+
+/**
+ * Convert a concrete GitHub file URL to its raw source representation. For a
+ * directory-shaped reference (including legacy extensionless /blob/ links),
+ * prefer the repository convention used by template catalogs: template.html.
+ * The candidate remains a child of the user-scoped directory, so provenance
+ * checks do not broaden to sibling templates or the rest of the repository.
+ */
+export function preferredConcreteReferenceSourceUrl(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl)
+    url.hash = ''
+    const host = url.hostname.toLowerCase()
+    if (host === 'raw.githubusercontent.com') return url.toString()
+    if (host !== 'github.com') return undefined
+    const segments = url.pathname.split('/').filter(Boolean)
+    if (segments.length < 5) return undefined
+    const [owner, repository, route, revision, ...resourceSegments] = segments
+    if (!['blob', 'raw', 'tree'].includes(route.toLowerCase()) || resourceSegments.length === 0) return undefined
+    const finalSegment = resourceSegments.at(-1) ?? ''
+    const directoryShaped = route.toLowerCase() === 'tree'
+      || (route.toLowerCase() === 'blob' && !finalSegment.includes('.'))
+    const resourcePath = [...resourceSegments, ...(directoryShaped ? ['template.html'] : [])].join('/')
+    return new URL(
+      `https://raw.githubusercontent.com/${owner}/${repository.replace(/\.git$/iu, '')}/${revision}/${resourcePath}`,
+    ).toString()
+  } catch {
+    return undefined
+  }
+}
+
+function sameReferenceUrl(left: string, right: string): boolean {
+  try {
+    const a = new URL(left)
+    const b = new URL(right)
+    a.hash = ''
+    b.hash = ''
+    return a.toString().replace(/\/+$/u, '') === b.toString().replace(/\/+$/u, '')
+  } catch {
+    return false
+  }
+}
+
+function referenceSourceFetchUrl(
+  requestedUrl: string,
+  referenceRequest?: VisualStyleReferenceRequest,
+): string {
+  const directRaw = preferredConcreteReferenceSourceUrl(requestedUrl)
+  if (!directRaw) return requestedUrl.trim()
+  // A concrete GitHub file can always be represented as raw source. Only add
+  // the template.html directory candidate when the requested URL is one of the
+  // user's exact references; do not guess children for unrelated research.
+  const requestedIsUserReference = referenceRequest?.urls.some((url) => sameReferenceUrl(url, requestedUrl)) ?? false
+  try {
+    const input = new URL(requestedUrl)
+    const finalSegment = input.pathname.split('/').filter(Boolean).at(-1) ?? ''
+    const directoryShaped = input.hostname.toLowerCase() === 'github.com'
+      && (/\/(?:tree)\//iu.test(input.pathname) || !finalSegment.includes('.'))
+    return directoryShaped && !requestedIsUserReference ? requestedUrl.trim() : directRaw
+  } catch {
+    return requestedUrl.trim()
+  }
+}
+
+/**
+ * Treat an explicitly linked visual style as a separate hard dependency from
+ * content research. A news URL can ground claims; it cannot prove that the
+ * requested design source was ever read or implemented.
+ */
+export function visualWebStyleReferenceRequest(
+  messages: readonly ModelMessage[],
+): VisualStyleReferenceRequest | undefined {
+  const taskText = [
+    activeTaskMessageSlice(messages)
+      .filter((message) => message.role === 'user')
+      .map(arenaUserAuthoredText)
+      .join('\n'),
+    trustedArenaCompactionTaskContext(messages),
+  ].filter(Boolean).join('\n')
+  const referenceIntent = /\b(?:strict(?:ly)?\s+(?:follow|match|reference)|pixel[- ]perfect|match\s+(?:the\s+)?(?:style|design)|same\s+(?:style|design)|replicate\s+(?:the\s+)?(?:style|design)|style\s+(?:reference|inspired\s+by)|reference\s+(?:style|design|template)|based\s+on\s+(?:the\s+)?(?:style|design))\b|(?:严格|完全|精确).{0,12}(?:参考|按照|匹配|一致|复刻)|(?:风格|设计).{0,10}(?:严格参考|保持一致|完全一致|复刻)|(?:参考|按照).{0,12}(?:风格|设计|模板)|风格参考|设计参考|参考模板/iu
+  if (!referenceIntent.test(taskText)) {
+    const durable = latestSuccessfulReferenceStyleContract(activeTaskMessageSlice(messages))
+    return durable ? { urls: [durable.contract.sourceUrl], strictness: durable.contract.strictness } : undefined
+  }
+  const strictness: ReferenceStrictness = /\b(?:strict(?:ly)?|pixel[- ]perfect|match\s+exactly|same\s+(?:style|design)|replicate)\b|严格|完全一致|精确|复刻|一比一/iu.test(taskText)
+    ? 'exact'
+    : 'inspired'
+  const matches = [...taskText.matchAll(/https?:\/\/[^\s<>"'`，。；！？、（）【】]+/giu)]
+  const referenceUrls: string[] = []
+  for (const match of matches) {
+    const rawUrl = match[0].replace(/[),.;:!?，。；：！？、）】]+$/u, '')
+    const start = match.index ?? 0
+    const end = start + rawUrl.length
+    const before = taskText.slice(0, start)
+    const after = taskText.slice(end)
+    const previousBoundary = Math.max(
+      before.lastIndexOf('\n'), before.lastIndexOf('。'), before.lastIndexOf('；'),
+      before.lastIndexOf(';'), before.lastIndexOf('！'), before.lastIndexOf('？'),
+    )
+    const nextOffsets = ['\n', '。', '；', ';', '！', '？']
+      .map((boundary) => after.indexOf(boundary))
+      .filter((offset) => offset >= 0)
+    const nextBoundary = nextOffsets.length > 0 ? Math.min(...nextOffsets) : after.length
+    const local = taskText.slice(previousBoundary + 1, end + nextBoundary)
+    if (!referenceIntent.test(local) && matches.length > 1) continue
+    try {
+      const url = new URL(rawUrl)
+      url.hash = ''
+      referenceUrls.push(url.toString())
+    } catch {
+      // Invalid user text cannot establish a durable reference dependency.
+    }
+  }
+  const urls = [...new Set(referenceUrls)]
+  if (urls.length > 0) return { urls, strictness }
+  const durable = latestSuccessfulReferenceStyleContract(activeTaskMessageSlice(messages))
+  return durable ? { urls: [durable.contract.sourceUrl], strictness: durable.contract.strictness } : undefined
+}
+
 export function isPlanExplicitlyRequested(messages: readonly ModelMessage[]): boolean {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
     if (message.role !== 'user') continue
     const content = arenaUserAuthoredText(message)
-    if (content.startsWith('[Harness operator action: Continue]') || isArenaCustomFeedbackMessage(message)) continue
+    if (isHarnessTaskContinuationContent(content) || isArenaCustomFeedbackMessage(message)) continue
     return /\bplan\s+first\b|\b(?:create|write|draft|propose|show|give|prepare)\s+(?:me\s+)?(?:a\s+)?plan\b|\bplanning\s+(?:document|phase|step)\b|(?:先|首先)?(?:制定|创建|写|给出|提供|提交|展示).{0,8}(?:计划|方案)|(?:计划|方案).{0,8}(?:先|优先|第一步)/iu.test(content)
   }
   return false
@@ -4720,6 +5893,170 @@ function isCompleteHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { a
   const path = typeof call.arguments.path === 'string' ? call.arguments.path.trim() : ''
   const content = typeof call.arguments.content === 'string' ? call.arguments.content : ''
   return /\.html?$/i.test(path) && /<html\b/i.test(content) && /<\/html\s*>/i.test(content)
+}
+
+function atomicHtmlDocumentStructureGap(html: string): string | undefined {
+  const surface = html.replace(/<!--[\s\S]*?-->/gu, ' ')
+  const doctype = /<!doctype\s+html(?:\s[^>]*)?>/iu.exec(surface)
+  const htmlOpen = /<html(?:\s[^>]*)?>/iu.exec(surface)
+  const headOpen = /<head(?:\s[^>]*)?>/iu.exec(surface)
+  const headClose = /<\/head\s*>/iu.exec(surface)
+  const bodyOpen = /<body(?:\s[^>]*)?>/iu.exec(surface)
+  const bodyClose = /<\/body\s*>/iu.exec(surface)
+  const htmlClose = /<\/html\s*>/iu.exec(surface)
+  if (!doctype || !htmlOpen || !headOpen || !headClose || !bodyOpen || !bodyClose || !htmlClose) {
+    return 'The standalone document must contain closed doctype, html, head, and body structure in one write.'
+  }
+  const ordered = doctype.index <= htmlOpen.index
+    && htmlOpen.index < headOpen.index
+    && headOpen.index < headClose.index
+    && headClose.index < bodyOpen.index
+    && bodyOpen.index < bodyClose.index
+    && bodyClose.index < htmlClose.index
+  if (!ordered) return 'The standalone doctype/html/head/body boundaries are incomplete or out of order.'
+  if (surface.slice(htmlClose.index + htmlClose[0].length).trim()) {
+    return 'The standalone document has trailing partial content after its closing html tag.'
+  }
+  return undefined
+}
+
+function staticHtmlDomClassNames(html: string): Set<string> {
+  const surface = html
+    .replace(/<!--[\s\S]*?-->/gu, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/giu, ' ')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/giu, ' ')
+  const classes = new Set<string>()
+  for (const match of surface.matchAll(/\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')/giu)) {
+    for (const className of String(match[1] ?? match[2] ?? '').split(/\s+/u)) {
+      if (className) classes.add(className.toLowerCase())
+    }
+  }
+  return classes
+}
+
+function staticRenderableHtmlDomClassOccurrenceCount(html: string, targetClassName: string): number {
+  const surface = html
+    .replace(/<!--[\s\S]*?-->/gu, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/giu, ' ')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/giu, ' ')
+    // Template and noscript descendants are not part of the rendered slide
+    // collection and must not satisfy the deck-size contract.
+    .replace(/<(template|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/giu, ' ')
+  const normalizedTarget = targetClassName.toLowerCase()
+  let count = 0
+  for (const match of surface.matchAll(/<[a-z][\w:-]*\b[^>]*\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>/giu)) {
+    const classNames = String(match[1] ?? match[2] ?? '')
+      .split(/\s+/u)
+      .map((className) => className.toLowerCase())
+    if (classNames.includes(normalizedTarget)) count += 1
+  }
+  return count
+}
+
+function htmlHasRunnableInlineScript(html: string): boolean {
+  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/giu)) {
+    const attributes = match[1]
+    if (/\btype\s*=\s*(?:"application\/(?:ld\+)?json"|'application\/(?:ld\+)?json')/iu.test(attributes)) continue
+    const source = match[2]
+      .replace(/\/\*[\s\S]*?\*\//gu, ' ')
+      .replace(/(^|\s)\/\/[^\n\r]*/gu, '$1')
+      .trim()
+    if (source && /\b(?:addEventListener|querySelector(?:All)?|getElementById|function|const|let|var|classList|onclick|onkeydown|import)\b|=>/u.test(source)) {
+      return true
+    }
+  }
+  return false
+}
+
+function exactReferenceTaskRequiresInlineInteraction(messages: readonly ModelMessage[]): boolean {
+  if (isVisualWebArtifactTask(messages)) return true
+  const taskText = [
+    activeTaskMessageSlice(messages)
+      .filter((message) => message.role === 'user')
+      .map(arenaUserAuthoredText)
+      .join('\n'),
+    trustedArenaCompactionTaskContext(messages),
+  ].filter(Boolean).join('\n')
+  return /\b(?:interactive|carousel|slide\s*show|next\s*\/\s*previous|keyboard\s+navigation)\b|(?:交互|轮播|翻页|上一页|下一页|键盘导航)/iu.test(taskText)
+}
+
+/**
+ * An exact-reference deck may write temporary HTML fragments, but none can
+ * become the durable canonical artifact until it is one executable,
+ * source-grounded document carrying the required reference DOM skeleton.
+ */
+export function exactReferenceCanonicalHtmlWriteGap(
+  messages: readonly ModelMessage[],
+  html: string,
+  beforeMessageIndex = Number.POSITIVE_INFINITY,
+  durableOverride?: DurableReferenceStyleContract | null,
+): string | undefined {
+  const activeMessages = activeTaskMessageSlice(messages)
+  const boundary = Math.min(activeMessages.length, beforeMessageIndex)
+  const priorMessages = activeMessages.slice(0, boundary)
+  const referenceRequest = visualWebStyleReferenceRequest(priorMessages)
+  if (referenceRequest?.strictness !== 'exact') return undefined
+  const durableContract = durableOverride === null
+    ? undefined
+    : durableOverride ?? latestSuccessfulReferenceStyleContract(activeMessages, boundary)
+  if (!durableContract || durableContract.contract.strictness !== 'exact') {
+    return 'The exact reference StyleContract must be durably recorded before a canonical HTML path can be established.'
+  }
+  if (!durableContract.sourceProfile || !durableContract.renderProfile) {
+    return 'The exact reference StyleContract must include both source and browser render profiles before a canonical HTML path can be established.'
+  }
+  const structureGap = atomicHtmlDocumentStructureGap(html)
+  if (structureGap) return structureGap
+
+  const retrievedUrls = new Set(retrievedNonReferenceResearchSourceUrls(priorMessages))
+  const candidateCitationSurface = htmlResearchCitationSurface(html.replace(/<!--[\s\S]*?-->/gu, ' '))
+  const includesRetrievedUrl = urlsInText(candidateCitationSurface).some((url) => retrievedUrls.has(url))
+  const gaps: string[] = []
+  if (visualWebTaskRequiresResearch(priorMessages) && !includesRetrievedUrl) {
+    const examples = [...retrievedUrls].slice(0, 3).map((url) => JSON.stringify(url)).join(', ')
+    gaps.push(`The complete HTML must include at least one exact retrieved URL in its visible citation surface before it can become canonical.${examples ? ` Copy one verbatim, including its https:// scheme: ${examples}.` : ''}`)
+  }
+
+  const classes = staticHtmlDomClassNames(html)
+  const profileRequiredClasses = durableContract.sourceProfile?.dom
+    .filter((entry) => entry.required)
+    .map((entry) => entry.className.toLowerCase()) ?? []
+  const markerRequiredClasses = durableContract.contract.requiredMarkers.flatMap((marker) => (
+    [...marker.matchAll(/\.(-?[_a-z][\w-]*)/giu)].map((match) => match[1].toLowerCase())
+  ))
+  const requiredClasses = [...new Set(profileRequiredClasses.length > 0 ? profileRequiredClasses : markerRequiredClasses)]
+  const missingClasses = requiredClasses.filter((className) => !classes.has(className))
+  if (missingClasses.length > 0) {
+    gaps.push(`The complete HTML is missing required reference DOM classes: ${missingClasses.slice(0, 12).join(', ')}.`)
+  }
+  if (exactReferenceTaskRequiresInlineInteraction(priorMessages) && !htmlHasRunnableInlineScript(html)) {
+    gaps.push('The complete HTML must include one closed, non-empty inline script that implements the slide interaction.')
+  }
+  const slidePlan = visualWebSlidePlan(priorMessages)
+  const actualSlideCount = staticRenderableHtmlDomClassOccurrenceCount(html, 'slide')
+  if (actualSlideCount !== slidePlan.count) {
+    const countSource = slidePlan.explicitlyRequested ? 'explicitly requested' : 'default'
+    gaps.push(`The complete exact-reference HTML contains ${actualSlideCount} rendered .slide elements; it must contain exactly ${slidePlan.count} for the ${countSource} slide plan.`)
+  }
+  return gaps.length > 0 ? gaps.join(' ') : undefined
+}
+
+function exactReferenceHtmlArtifactRepairTarget(
+  occurrence: SuccessfulTaskToolOccurrence | undefined,
+): ExactReferenceHtmlArtifactRepair | undefined {
+  if (!occurrence || !isCompleteHtmlWrite(occurrence.call)) return undefined
+  const result = structuredToolResult(occurrence.result)
+  const canonicalGap = typeof result?.canonical_gap === 'string'
+    ? result.canonical_gap.trim()
+    : ''
+  if (result?.canonical_html !== false || !canonicalGap) return undefined
+  const match = /^The complete exact-reference HTML contains (\d+) rendered \.slide elements; it must contain exactly (\d+) for the (?:explicitly requested|default) slide plan\.$/u.exec(canonicalGap)
+  if (!match) return undefined
+  const actualSlideCount = Number(match[1])
+  const expectedSlideCount = Number(match[2])
+  const path = arenaWorkspacePathForVision(occurrence.call.arguments.path)
+  if (!path || !/\.html?$/iu.test(path) || actualSlideCount === expectedSlideCount) return undefined
+  return { path, canonicalGap, actualSlideCount, expectedSlideCount }
 }
 
 function isCompactedHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { arguments: { path: string } } {
@@ -4736,6 +6073,30 @@ function isCompactedHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { 
 
 function isCanonicalHtmlWrite(call: ToolCallRecord): call is ToolCallRecord & { arguments: { path: string } } {
   return isCompleteHtmlWrite(call) || isCompactedHtmlWrite(call)
+}
+
+function isDurableCanonicalHtmlWrite(
+  messages: readonly ModelMessage[],
+  occurrence: SuccessfulTaskToolOccurrence,
+): boolean {
+  if (
+    occurrence.call.name === 'edit_file'
+    && typeof occurrence.call.arguments.path === 'string'
+    && /\.html?$/iu.test(occurrence.call.arguments.path)
+  ) {
+    return structuredToolResult(occurrence.result)?.canonical_html === true
+  }
+  if (isCompactedHtmlWrite(occurrence.call)) {
+    const referenceRequest = visualWebStyleReferenceRequest(messages)
+    if (referenceRequest?.strictness !== 'exact') return true
+    return structuredToolResult(occurrence.result)?.canonical_html === true
+  }
+  if (!isCompleteHtmlWrite(occurrence.call)) return false
+  return exactReferenceCanonicalHtmlWriteGap(
+    messages,
+    occurrence.call.arguments.content,
+    occurrence.callMessageIndex,
+  ) === undefined
 }
 
 interface SuccessfulTaskToolOccurrence {
@@ -4777,6 +6138,18 @@ function retrievedResearchSourceUrls(
   return url ? [url] : []
 }
 
+/**
+ * Style-reference fetches establish design provenance, not factual research
+ * citations. Keep them out of the citation ledger so a template URL cannot
+ * accidentally ground a deck full of time-sensitive claims.
+ */
+function retrievedNonReferenceResearchSourceUrls(messages: readonly ModelMessage[]): string[] {
+  const referenceUrls = visualWebStyleReferenceRequest(messages)?.urls ?? []
+  return [...new Set(successfulTaskToolOccurrences(messages)
+    .flatMap(({ call, result }) => retrievedResearchSourceUrls(call, result))
+    .filter((url) => !referenceUrls.some((referenceUrl) => referenceUrlsAreRelated(referenceUrl, url))))]
+}
+
 function visualInspectionSection(result: ModelMessage): string {
   const content = typeof result.content === 'string' ? result.content : ''
   return content.match(
@@ -4785,7 +6158,96 @@ function visualInspectionSection(result: ModelMessage): string {
 }
 
 function visualInspectionPassed(result: ModelMessage): boolean {
-  return visualInspectionSection(result).toUpperCase() === 'NO DEFECTS'
+  const verdict = visualInspectionSection(result).toUpperCase().replace(/\r\n?/gu, '\n')
+  return verdict === 'NO DEFECTS' || verdict === 'NO DEFECTS\nREFERENCE MATCH'
+}
+
+function referenceVisualInspectionPassed(result: ModelMessage): boolean {
+  return visualInspectionSection(result).toUpperCase().replace(/\r\n?/gu, '\n') === 'NO DEFECTS\nREFERENCE MATCH'
+}
+
+function referenceInspectionPromptMatchesContract(
+  occurrence: SuccessfulTaskToolOccurrence,
+  reference: DurableReferenceStyleContract,
+  phase: VisualWebArtifactWorkflowPhase,
+): boolean {
+  if (occurrence.call.name !== 'inspect_image') return false
+  return occurrence.call.arguments.prompt === referenceVisualInspectionPrompt(reference, phase)
+}
+
+function inspectedImageSha256(result: ModelMessage): string | undefined {
+  const content = typeof result.content === 'string' ? result.content : ''
+  return content.match(/(?:^|\n)Image evidence SHA-256:\s*([0-9a-f]{64})(?:\n|$)/iu)?.[1]?.toLowerCase()
+}
+
+interface ExactReferenceComparisonEvidence {
+  candidateScreenshotSha256: string
+  referencePngSha256: string
+  sourceEvidenceSha256: string
+  renderProfileSha256: string
+  manifestSha256: string
+  fontManifestSha256?: string
+  phase: ReferenceRenderPhase
+  viewport: { width: number; height: number }
+  renderPageEpoch: number
+  candidateArtifactHash: string
+  comparisonDigestSha256: string
+}
+
+function exactReferenceComparisonEvidence(result: ModelMessage): ExactReferenceComparisonEvidence | undefined {
+  const content = typeof result.content === 'string' ? result.content : ''
+  const digest = (label: string) => content.match(
+    new RegExp(`(?:^|\\n)${label}:\\s*([0-9a-f]{64})(?:\\n|$)`, 'iu'),
+  )?.[1]?.toLowerCase()
+  const candidateScreenshotSha256 = digest('Candidate screenshot SHA-256')
+  const referencePngSha256 = digest('Reference PNG SHA-256')
+  const sourceEvidenceSha256 = digest('Source evidence SHA-256')
+  const renderProfileSha256 = digest('Render profile SHA-256')
+  const manifestSha256 = digest('Reference manifest SHA-256')
+  const fontManifestSha256 = digest('Font manifest SHA-256')
+  const comparisonDigestSha256 = digest('Comparison digest SHA-256')
+  const phase = content.match(/(?:^|\n)Reference comparison phase:\s*(cover|content|closing)(?:\n|$)/iu)?.[1]?.toLowerCase()
+  const pageEpochText = content.match(/(?:^|\n)Render page epoch:\s*(\d+)(?:\n|$)/iu)?.[1]
+  const candidateArtifactHash = content.match(/(?:^|\n)Candidate artifact hash:\s*([A-Za-z0-9_-]{43})(?:\n|$)/u)?.[1]
+  const viewportText = content.match(/(?:^|\n)Reference viewport:\s*([^\n]+)(?:\n|$)/iu)?.[1]
+  let viewport: { width: number; height: number } | undefined
+  try {
+    const parsed = JSON.parse(viewportText ?? '') as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const width = Number((parsed as Record<string, unknown>).width)
+      const height = Number((parsed as Record<string, unknown>).height)
+      if (Number.isInteger(width) && Number.isInteger(height)) viewport = { width, height }
+    }
+  } catch {
+    // Invalid machine evidence cannot satisfy the exact comparison gate.
+  }
+  const renderPageEpoch = Number(pageEpochText)
+  if (
+    !candidateScreenshotSha256
+    || !referencePngSha256
+    || !sourceEvidenceSha256
+    || !renderProfileSha256
+    || !manifestSha256
+    || !comparisonDigestSha256
+    || !['cover', 'content', 'closing'].includes(String(phase))
+    || !viewport
+    || !Number.isInteger(renderPageEpoch)
+    || renderPageEpoch <= 0
+    || !candidateArtifactHash
+  ) return undefined
+  return {
+    candidateScreenshotSha256,
+    referencePngSha256,
+    sourceEvidenceSha256,
+    renderProfileSha256,
+    manifestSha256,
+    ...(fontManifestSha256 ? { fontManifestSha256 } : {}),
+    phase: phase as ReferenceRenderPhase,
+    viewport,
+    renderPageEpoch,
+    candidateArtifactHash,
+    comparisonDigestSha256,
+  }
 }
 
 function isConcreteVisualDefectInspection(
@@ -4798,17 +6260,120 @@ function isConcreteVisualDefectInspection(
   if (!/\bNO\s+DEFECTS\b/iu.test(prompt) || !/\bdefects?\b|缺陷|问题/iu.test(prompt)) return false
   const section = visualInspectionSection(occurrence.result)
   if (!section || visualInspectionPassed(occurrence.result)) return false
-  return /\b(?:clip(?:s|ped|ping)?|cut\s+off|overlap(?:s|ped|ping)?|overflow(?:s|ed|ing)?|misalign(?:s|ed|ment)?|wrong|broken|unreadable|obscur(?:es|ed|ing)|crowded|outside|edge|spacing|missing|defects?|issues?|problems?)\b|截断|裁切|遮挡|重叠|溢出|错位|不对齐|错误|缺失|不可读|对比度|拥挤|间距|缺陷|问题/iu.test(section)
+  return /\b(?:clip(?:s|ped|ping)?|cut\s+off|overlap(?:s|ped|ping)?|overflow(?:s|ed|ing)?|misalign(?:s|ed|ment)?|mismatch(?:es|ed)?|fidelity|palette|typography|font|style|wrong|broken|unreadable|obscur(?:es|ed|ing)|crowded|outside|edge|spacing|missing|defects?|issues?|problems?)\b|截断|裁切|遮挡|重叠|溢出|错位|不对齐|不一致|参考|风格|配色|字体|错误|缺失|不可读|对比度|拥挤|间距|缺陷|问题/iu.test(section)
+}
+
+function structuredExecutionPayload(content: string | null | undefined): Record<string, unknown> | undefined {
+  if (typeof content !== 'string') return undefined
+  try {
+    const parsed = JSON.parse(content) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function payloadAllowsExecutedSuccess(payload: Record<string, unknown> | undefined): boolean {
+  if (!payload) return true
+  const status = typeof payload.status === 'string' ? payload.status.toLowerCase() : ''
+  if (['error', 'failed', 'verification_required', 'cancelled', 'timed_out'].includes(status)) return false
+  return payload.not_executed !== true && payload.notExecuted !== true
+}
+
+function reconcilePersistedNonExecutedToolResults(
+  messages: readonly ModelMessage[],
+  events: readonly SessionEvent[],
+): { messages: ModelMessage[]; repairedCallIds: string[]; changed: boolean } {
+  const durableResults = new Map<string, { result: string; notExecuted: boolean }>()
+  for (const event of events) {
+    if (!event.callId || !['tool.completed', 'tool.failed', 'tool.timed_out'].includes(event.type)) continue
+    const data = event.data as Record<string, unknown>
+    const result = typeof data.result === 'string' ? data.result : undefined
+    if (!result) continue
+    const notExecuted = data.notExecuted === true
+      || !payloadAllowsExecutedSuccess(structuredExecutionPayload(result))
+    if (notExecuted) durableResults.set(event.callId, { result, notExecuted })
+  }
+  if (durableResults.size === 0) return { messages: [...messages], repairedCallIds: [], changed: false }
+
+  const repairedCallIds: string[] = []
+  const repaired = messages.map((message) => {
+    if (message.role !== 'tool' || !message.tool_call_id || !toolResultProvesExecutedSuccess(message)) return message
+    const durable = durableResults.get(message.tool_call_id)
+    if (!durable?.notExecuted) return message
+    repairedCallIds.push(message.tool_call_id)
+    return {
+      ...message,
+      content: durable.result,
+      tool_result_status: structuredExecutionPayload(durable.result)?.status === 'error'
+        ? 'failed' as const
+        : message.tool_result_status,
+    }
+  })
+  return { messages: repaired, repairedCallIds, changed: repairedCallIds.length > 0 }
+}
+
+function collapseConsecutiveIdenticalToolCallTail(
+  messages: readonly ModelMessage[],
+  visualPhase?: VisualWebArtifactWorkflowPhase,
+): {
+  messages: ModelMessage[]
+  collapsedOccurrences: number
+  signature?: string
+} {
+  let cursor = messages.length
+  let signature: string | undefined
+  let occurrences = 0
+  let latestOccurrenceStart = messages.length
+  while (cursor >= 2) {
+    let assistantIndex = cursor - 1
+    while (assistantIndex >= 0 && messages[assistantIndex].role === 'tool') assistantIndex -= 1
+    const assistant = messages[assistantIndex]
+    const calls = assistant?.role === 'assistant' ? assistant.tool_calls ?? [] : []
+    const toolMessages = messages.slice(assistantIndex + 1, cursor)
+    const completeBatch = calls.length > 0
+      && toolMessages.length === calls.length
+      && toolMessages.every((message, index) => (
+        message.role === 'tool'
+        && Boolean(message.tool_call_id)
+        && message.tool_call_id === calls[index]?.id
+      ))
+    if (!completeBatch) break
+    const parsedCalls = calls.map((call) => ({
+      id: call.id,
+      name: call.function.name,
+      arguments: parseArguments(call.function.arguments),
+    }))
+    const candidate = visualPhase
+      ? `${visualToolCallSignature(parsedCalls, visualPhase)}\0${visualToolOutcomeDigest(toolMessages, visualPhase)}`
+      : stableJson(parsedCalls.map(({ name, arguments: callArguments }) => ({ name, arguments: callArguments })))
+    if (signature && candidate !== signature) break
+    signature ??= candidate
+    if (occurrences === 0) latestOccurrenceStart = assistantIndex
+    occurrences += 1
+    cursor = assistantIndex
+  }
+  if (occurrences < 2) return { messages: [...messages], collapsedOccurrences: 0, signature }
+  return {
+    messages: [
+      ...messages.slice(0, cursor),
+      ...messages.slice(latestOccurrenceStart),
+    ],
+    collapsedOccurrences: occurrences - 1,
+    signature,
+  }
+}
+
+function toolExecutionProvesExecutedSuccess(execution: ToolExecutionResult): boolean {
+  return !execution.isError && payloadAllowsExecutedSuccess(structuredExecutionPayload(execution.content))
 }
 
 function toolResultProvesExecutedSuccess(message: ModelMessage): boolean {
   if (message.role !== 'tool' || message.tool_result_status === 'failed') return false
   const payload = structuredToolResult(message)
-  if (payload) {
-    const status = typeof payload.status === 'string' ? payload.status.toLowerCase() : ''
-    if (['error', 'failed', 'verification_required', 'cancelled', 'timed_out'].includes(status)) return false
-    if (payload.not_executed === true || payload.notExecuted === true) return false
-  }
+  if (!payloadAllowsExecutedSuccess(payload)) return false
   return message.tool_result_status === 'succeeded' || isProvenSuccessfulToolResult(message)
 }
 
@@ -4850,26 +6415,65 @@ function successfulTaskToolOccurrences(messages: readonly ModelMessage[]): Succe
 }
 
 function successfulSingleArtifactCanonicalPath(messages: readonly ModelMessage[]): string | undefined {
-  const occurrence = successfulTaskToolOccurrences(messages).find(({ call }) => isCanonicalHtmlWrite(call))
-  return occurrence && isCanonicalHtmlWrite(occurrence.call)
-    ? arenaWorkspacePathForVision(occurrence.call.arguments.path)
+  const occurrence = successfulTaskToolOccurrences(messages).find((candidate) => (
+    isDurableCanonicalHtmlWrite(messages, candidate)
+  ))
+  const path = occurrence?.call.arguments.path
+  return typeof path === 'string' && /\.html?$/iu.test(path)
+    ? arenaWorkspacePathForVision(path)
     : undefined
 }
 
 export type VisualWebArtifactWorkflowPhase =
   | 'web_research'
+  | 'reference_acquisition'
+  | 'reference_contract'
   | 'html_artifact'
+  | 'reference_source_check'
+  | 'reference_implementation'
   | 'website_preview'
   | 'browser_open'
+  | 'reference_cover_screenshot'
+  | 'reference_cover_inspection'
   | 'navigation_check'
   | 'browser_screenshot'
   | 'visual_inspection'
   | 'visual_inspection_pass'
+  | 'reference_closing_navigation'
+  | 'reference_closing_screenshot'
+  | 'reference_closing_inspection'
   | 'present_file'
 
 export interface VisualWebArtifactCompletionGap {
   canonicalPath?: string
   missingPhases: VisualWebArtifactWorkflowPhase[]
+  referenceContract?: DurableReferenceStyleContract
+  referenceContinuation?: ReferenceStyleEvidenceContinuation
+  referenceVerification?: ReferenceStyleVerificationDiagnostics
+  htmlArtifactRepair?: ExactReferenceHtmlArtifactRepair
+  currentScreenshotPath?: string
+}
+
+export interface ExactReferenceHtmlArtifactRepair {
+  path: string
+  canonicalGap: string
+  actualSlideCount: number
+  expectedSlideCount: number
+}
+
+export interface ReferenceStyleVerificationDiagnostics {
+  score: number
+  missing: {
+    colors: string[]
+    fonts: string[]
+    markers: string[]
+  }
+  violations: {
+    colors: string[]
+    fonts: string[]
+    avoid: string[]
+    source: string[]
+  }
 }
 
 interface VisualWebArtifactCompletionOptions {
@@ -4877,8 +6481,16 @@ interface VisualWebArtifactCompletionOptions {
   forceTask?: boolean
   /** Preserve time-sensitive research intent across the same compaction. */
   requiresResearch?: boolean
+  /** Explicit style-reference dependency, kept distinct from content research. */
+  referenceRequest?: VisualStyleReferenceRequest
+  /** Server-private verifier state that survives semantic model compaction. */
+  referenceContract?: DurableReferenceStyleContract
+  /** A persisted integrity tombstone suppresses every historical record fallback. */
+  referenceContractInvalidated?: boolean
   /** Durable path learned from a previously successful complete HTML write. */
   canonicalPath?: string
+  /** Production exact-reference runs must carry server-private visual and font evidence. */
+  requirePrivateVisualEvidence?: boolean
 }
 
 function naturalLanguageResearchIntentSurface(value: string): string {
@@ -4915,6 +6527,40 @@ function visualWebTaskRequiresResearch(messages: readonly ModelMessage[]): boole
   return /\b(?:today|this\s+week|weekly|latest|current|recent|news|trends?|hot\s+topics?)\b|(?:今天|本日|本周|这周|每周|最新|当前|近期|新闻|趋势|热点)/iu.test(intentSurface)
 }
 
+function referenceStyleVerificationDiagnostics(
+  result: Record<string, unknown> | undefined,
+): ReferenceStyleVerificationDiagnostics | undefined {
+  if (result?.fidelity !== 'mismatch' || typeof result.score !== 'number' || !Number.isFinite(result.score)) {
+    return undefined
+  }
+  const list = (value: unknown): string[] => Array.isArray(value)
+    ? value
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .slice(0, 24)
+      .map((item) => boundedCompactText(item, 360))
+    : []
+  const missing = result.missing && typeof result.missing === 'object' && !Array.isArray(result.missing)
+    ? result.missing as Record<string, unknown>
+    : {}
+  const violations = result.violations && typeof result.violations === 'object' && !Array.isArray(result.violations)
+    ? result.violations as Record<string, unknown>
+    : {}
+  return {
+    score: result.score,
+    missing: {
+      colors: list(missing.colors),
+      fonts: list(missing.fonts),
+      markers: list(missing.markers),
+    },
+    violations: {
+      colors: list(violations.colors),
+      fonts: list(violations.fonts),
+      avoid: list(violations.avoid),
+      source: list(violations.source),
+    },
+  }
+}
+
 /**
  * A visual HTML presentation is complete only after the artifact has crossed
  * the same observable verification boundaries shown in Arena's Agent Mode:
@@ -4926,13 +6572,21 @@ export function visualWebArtifactCompletionGap(
   options: VisualWebArtifactCompletionOptions = {},
 ): VisualWebArtifactCompletionGap | undefined {
   if (!options.forceTask && !isVisualWebArtifactTask(messages)) return undefined
+  const activeMessages = activeTaskMessageSlice(messages)
   const occurrences = successfulTaskToolOccurrences(messages)
-  const completeCanonicalWrite = occurrences.find(({ call }) => isCanonicalHtmlWrite(call))
+  const completeCanonicalWrite = occurrences.find((occurrence) => (
+    isDurableCanonicalHtmlWrite(messages, occurrence)
+  ))
   const canonicalPath = options.canonicalPath ?? (
-    completeCanonicalWrite && isCanonicalHtmlWrite(completeCanonicalWrite.call)
+    completeCanonicalWrite
+      && typeof completeCanonicalWrite.call.arguments.path === 'string'
+      && /\.html?$/iu.test(completeCanonicalWrite.call.arguments.path)
       ? arenaWorkspacePathForVision(completeCanonicalWrite.call.arguments.path)
       : undefined
   )
+  const htmlArtifactRepair = !canonicalPath
+    ? exactReferenceHtmlArtifactRepairTarget([...occurrences].reverse().find(({ call }) => isCompleteHtmlWrite(call)))
+    : undefined
   const canonicalWrite = completeCanonicalWrite ?? (canonicalPath
     ? occurrences.find(({ call }) => (
       call.name === 'write_file'
@@ -4941,8 +6595,9 @@ export function visualWebArtifactCompletionGap(
     ))
     : undefined)
   const missing = new Set<VisualWebArtifactWorkflowPhase>()
+  let currentReferenceVerification: ReferenceStyleVerificationDiagnostics | undefined
 
-  if (!canonicalPath || (!canonicalWrite && !options.canonicalPath)) missing.add('html_artifact')
+  if (!canonicalPath || !canonicalWrite) missing.add('html_artifact')
   const mutationCandidates = canonicalPath
     ? occurrences.filter(({ call }) => (
       (call.name === 'write_file' || call.name === 'edit_file')
@@ -4953,13 +6608,140 @@ export function visualWebArtifactCompletionGap(
   const latestMutation = mutationCandidates.at(-1) ?? canonicalWrite
   const currentArtifactBoundary = latestMutation?.resultMessageIndex
     ?? (canonicalPath ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY)
+  const latestMutationHash = latestMutation
+    ? structuredToolResult(latestMutation.result)?.hash
+    : undefined
+
+  const referenceRequest = options.referenceRequest ?? visualWebStyleReferenceRequest(messages)
+  const referenceEvidence = referenceRequest
+    ? findReferenceStyleEvidence(activeMessages, referenceRequest.urls)
+    : undefined
+  const referenceContinuation = referenceRequest && !referenceEvidence
+    ? referenceStyleEvidenceContinuation(activeMessages, referenceRequest.urls)
+    : undefined
+  const durableReferenceContract = referenceRequest
+    ? options.referenceContract ?? (
+      options.referenceContractInvalidated
+        ? undefined
+        : latestSuccessfulReferenceStyleContract(activeMessages)
+    )
+    : undefined
+  const exactPrivateVisualEvidenceBound = exactReferenceVisualEvidenceBound(
+    durableReferenceContract,
+    Boolean(options.requirePrivateVisualEvidence),
+  )
+  const exactPrivateFontEvidenceBound = exactReferenceFontEvidenceBound(
+    durableReferenceContract,
+    Boolean(options.requirePrivateVisualEvidence),
+  )
+  // record_reference_style is executed server-side only after validating the
+  // raw reference body and persisting its URL/hash/byte provenance. Historical
+  // compaction may later remove that large fetch body; the compact durable
+  // contract must remain sufficient evidence instead of forcing a redundant
+  // refetch and degrading prompt-cache stability.
+  const referenceEvidenceEstablished = Boolean(
+    referenceRequest
+    && (
+      referenceEvidence
+      || (
+        durableReferenceContract
+        && (
+          durableReferenceContract.contract.strictness !== 'exact'
+          || Boolean(
+            durableReferenceContract.sourceProfile
+            && durableReferenceContract.renderProfile
+            && exactPrivateVisualEvidenceBound
+            && exactPrivateFontEvidenceBound
+          )
+        )
+        && referenceRequest.urls.some((url) => (
+          referenceUrlsAreRelated(url, durableReferenceContract.contract.sourceUrl)
+          || referenceUrlsAreRelated(url, durableReferenceContract.provenance.resolvedUrl)
+        ))
+      )
+    ),
+  )
+  const referenceContractGrounded = Boolean(
+    referenceRequest
+    && durableReferenceContract
+    && referenceEvidenceEstablished
+    && durableReferenceContract.contract.strictness === referenceRequest.strictness
+    && (
+      durableReferenceContract.contract.strictness !== 'exact'
+      || Boolean(
+        durableReferenceContract.sourceProfile
+        && durableReferenceContract.renderProfile
+        && exactPrivateVisualEvidenceBound
+        && exactPrivateFontEvidenceBound
+      )
+    )
+    && (!referenceEvidence || (
+      durableReferenceContract.provenance.evidenceSha256 === referenceEvidence.sha256
+      && durableReferenceContract.provenance.evidenceBytes === referenceEvidence.bytes
+      && referenceUrlsAreRelated(durableReferenceContract.provenance.resolvedUrl, referenceEvidence.resolvedUrl)
+    ))
+    && referenceRequest.urls.some((url) => (
+      referenceUrlsAreRelated(url, durableReferenceContract.contract.sourceUrl)
+      || referenceUrlsAreRelated(url, durableReferenceContract.provenance.resolvedUrl)
+    )),
+  )
+  if (referenceRequest && !referenceEvidenceEstablished) missing.add('reference_acquisition')
+  if (referenceRequest && !referenceContractGrounded) missing.add('reference_contract')
 
   if (options.requiresResearch ?? visualWebTaskRequiresResearch(messages)) {
     const research = occurrences.find(({ call, resultMessageIndex, result }) => (
-      retrievedResearchSourceUrls(call, result).length > 0
+      retrievedResearchSourceUrls(call, result).some((url) => (
+        !referenceRequest?.urls.some((referenceUrl) => referenceUrlsAreRelated(referenceUrl, url))
+      ))
       && resultMessageIndex < currentArtifactBoundary
     ))
     if (!research) missing.add('web_research')
+  }
+
+  let passingReferenceVerificationIndex: number | undefined
+  if (canonicalPath && canonicalWrite && referenceContractGrounded) {
+    const referenceVerification = [...occurrences].reverse().find(({ call, resultMessageIndex }) => (
+      call.name === 'verify_reference_style'
+      && typeof call.arguments.path === 'string'
+      && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+      && resultMessageIndex > currentArtifactBoundary
+    ))
+    if (!referenceVerification) {
+      missing.add('reference_source_check')
+    } else {
+      const result = structuredToolResult(referenceVerification.result)
+      const provenance = result?.provenance
+      const sourceProfileSha256 = durableReferenceContract?.sourceProfile
+        ? createHash('sha256').update(JSON.stringify(durableReferenceContract.sourceProfile)).digest('hex')
+        : undefined
+      const renderProfileSha256 = durableReferenceContract?.renderProfile
+        ? createHash('sha256').update(JSON.stringify(durableReferenceContract.renderProfile)).digest('hex')
+        : undefined
+      const fontManifestSha256 = durableReferenceContract?.contract.strictness === 'exact'
+        ? durableReferenceContract.fontEvidence?.manifestSha256
+        : undefined
+      const attested = result?.status === 'success'
+        && typeof latestMutationHash === 'string'
+        && result.artifact_hash === latestMutationHash
+        && result.reference_sha256 === durableReferenceContract?.provenance.evidenceSha256
+        && Boolean(
+          provenance
+          && typeof provenance === 'object'
+          && !Array.isArray(provenance)
+          && (provenance as Record<string, unknown>).resolvedUrl === durableReferenceContract?.provenance.resolvedUrl
+          && (provenance as Record<string, unknown>).evidenceSha256 === durableReferenceContract?.provenance.evidenceSha256
+          && (provenance as Record<string, unknown>).evidenceBytes === durableReferenceContract?.provenance.evidenceBytes
+        )
+        && (!sourceProfileSha256 || result.source_profile_sha256 === sourceProfileSha256)
+        && (!renderProfileSha256 || result.render_profile_sha256 === renderProfileSha256)
+        && (!fontManifestSha256 || result.reference_font_manifest_sha256 === fontManifestSha256)
+      if (!attested) missing.add('reference_source_check')
+      else if (result.fidelity !== 'pass' || result.score !== 100) {
+        currentReferenceVerification = referenceStyleVerificationDiagnostics(result)
+        missing.add('reference_implementation')
+      }
+      else passingReferenceVerificationIndex = referenceVerification.resultMessageIndex
+    }
   }
 
   const preview = occurrences.find(({ call, resultMessageIndex, result }) => {
@@ -4987,6 +6769,15 @@ export function visualWebArtifactCompletionGap(
     }
     return undefined
   }
+  const firstOccurrence = (
+    predicate: (occurrence: SuccessfulTaskToolOccurrence) => boolean,
+    after = currentArtifactBoundary,
+    before = Number.POSITIVE_INFINITY,
+  ): SuccessfulTaskToolOccurrence | undefined => occurrences.find((occurrence) => (
+    occurrence.resultMessageIndex > after
+    && occurrence.resultMessageIndex < before
+    && predicate(occurrence)
+  ))
   const isBrowserAction = (occurrence: SuccessfulTaskToolOccurrence, action: string): boolean => (
     occurrence.call.name === 'browser' && occurrence.call.arguments.action === action
   )
@@ -5008,6 +6799,45 @@ export function visualWebArtifactCompletionGap(
   const browserResultWorkspacePath = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => (
     browserUrlWorkspacePath(structuredToolResult(occurrence.result)?.url)
   )
+  const browserResultUrl = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => {
+    const value = structuredToolResult(occurrence.result)?.url
+    return typeof value === 'string' ? value : undefined
+  }
+  const browserResultPageEpoch = (occurrence: SuccessfulTaskToolOccurrence): number | undefined => {
+    const value = structuredToolResult(occurrence.result)?.pageEpoch
+    return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+  }
+  const deterministicRenderRequired = Boolean(
+    referenceContractGrounded
+    && durableReferenceContract?.contract.strictness === 'exact'
+    && durableReferenceContract.renderProfile,
+  )
+  const expectedInteriorSlideCount = Math.max(1, visualWebSlidePlan(messages).count - 2)
+  const contentInteriorAttestationPasses = (result: Record<string, unknown>): boolean => {
+    const variants = durableReferenceContract?.renderProfile?.interiorVariants
+    if (!variants || variants.length === 0) return true
+    const rawAttestation = result.render_interior_attestation
+    if (!rawAttestation || typeof rawAttestation !== 'object' || Array.isArray(rawAttestation)) return false
+    const attestation = rawAttestation as Record<string, unknown>
+    const slides = attestation.slides
+    if (!Array.isArray(slides)
+      || attestation.candidate_slides !== expectedInteriorSlideCount
+      || attestation.matched_slides !== expectedInteriorSlideCount
+      || attestation.reference_variants !== variants.length
+      || slides.length !== expectedInteriorSlideCount
+      || result.render_interior_attestation_sha256 !== createHash('sha256').update(JSON.stringify(attestation)).digest('hex')) return false
+    const validVariants = new Set(variants.map((variant) => variant.layoutSelector))
+    return slides.every((rawSlide, index) => {
+      if (!rawSlide || typeof rawSlide !== 'object' || Array.isArray(rawSlide)) return false
+      const slide = rawSlide as Record<string, unknown>
+      return slide.slide_index === index + 1
+        && slide.fidelity === 'pass'
+        && slide.score === 100
+        && typeof slide.layout_selector === 'string'
+        && validVariants.has(slide.layout_selector)
+        && slide.matched_variant === slide.layout_selector
+    })
+  }
   const browserOpenArgumentWorkspacePath = (occurrence: SuccessfulTaskToolOccurrence): string | undefined => {
     const rawPath = occurrence.call.arguments.path
     if (typeof rawPath !== 'string') return undefined
@@ -5017,6 +6847,15 @@ export function visualWebArtifactCompletionGap(
     isBrowserAction(occurrence, 'open')
     && browserOpenArgumentWorkspacePath(occurrence) === canonicalPath
     && browserResultWorkspacePath(occurrence) === canonicalPath
+    && (!deterministicRenderRequired || browserResultPageEpoch(occurrence) !== undefined)
+    && (!referenceContractGrounded || (
+      passingReferenceVerificationIndex !== undefined
+      && occurrence.resultMessageIndex > passingReferenceVerificationIndex
+    ))
+    && (!referenceContractGrounded || (
+      occurrence.call.arguments.width === durableReferenceContract?.contract.viewport.width
+      && occurrence.call.arguments.height === durableReferenceContract?.contract.viewport.height
+    ))
   )
   const browserNavigationTargetsCanonical = (occurrence: SuccessfulTaskToolOccurrence): boolean => (
     browserResultWorkspacePath(occurrence) === canonicalPath
@@ -5054,12 +6893,166 @@ export function visualWebArtifactCompletionGap(
   const isNavigationAfter = (
     open: SuccessfulTaskToolOccurrence,
     occurrence: SuccessfulTaskToolOccurrence,
-  ): boolean => isBrowserNavigation(occurrence) && browserResultChanged(open, occurrence)
+  ): boolean => isBrowserNavigation(occurrence)
+    && browserResultChanged(open, occurrence)
+    && browserResultWorkspacePath(open) === browserResultWorkspacePath(occurrence)
+    && (!deterministicRenderRequired || (
+      browserResultPageEpoch(open) !== undefined
+      && browserResultPageEpoch(open) === browserResultPageEpoch(occurrence)
+    ))
   const screenshotPathOf = (occurrence: SuccessfulTaskToolOccurrence): string => arenaWorkspacePathForVision(String(
     occurrence.call.arguments.screenshot_path
     || occurrence.call.arguments.path
     || 'browser-screenshot.png',
   ))
+  const screenshotPassesRenderedReference = (
+    occurrence: SuccessfulTaskToolOccurrence | undefined,
+    phase: ReferenceRenderPhase,
+  ): boolean => {
+    if (!deterministicRenderRequired) return true
+    if (!occurrence) return false
+    const result = structuredToolResult(occurrence.result)
+    const viewport = result?.render_viewport
+    const expectedViewport = durableReferenceContract?.renderProfile?.viewport
+    const screenshotSha256 = typeof result?.screenshot_sha256 === 'string'
+      ? result.screenshot_sha256.toLowerCase()
+      : ''
+    return result?.render_fidelity === 'pass'
+      && result.render_phase === phase
+      && typeof result.render_score === 'number'
+      && result.render_score === 100
+      && Array.isArray(result.render_violations)
+      && result.render_violations.length === 0
+      && result.render_violation_count === 0
+      && result.render_violation_sha256 === createHash('sha256').update('[]').digest('hex')
+      && (phase !== 'content' || contentInteriorAttestationPasses(result))
+      && typeof latestMutationHash === 'string'
+      && result.render_artifact_hash === latestMutationHash
+      && result.render_canonical_path === canonicalPath
+      && browserUrlWorkspacePath(result.render_page_url) === canonicalPath
+      && result.render_reference_sha256 === durableReferenceContract?.renderProfile?.evidenceSha256
+      && (!durableReferenceContract?.fontEvidence
+        || result.render_font_manifest_sha256 === durableReferenceContract.fontEvidence.manifestSha256)
+      && /^[0-9a-f]{64}$/u.test(screenshotSha256)
+      && typeof result.render_page_epoch === 'number'
+      && Number.isInteger(result.render_page_epoch)
+      && result.render_page_epoch > 0
+      && Boolean(
+        viewport
+        && typeof viewport === 'object'
+        && !Array.isArray(viewport)
+        && expectedViewport
+        && (viewport as Record<string, unknown>).width === expectedViewport.width
+        && (viewport as Record<string, unknown>).height === expectedViewport.height
+      )
+  }
+  const screenshotSharesBrowserEpoch = (
+    screenshotOccurrence: SuccessfulTaskToolOccurrence | undefined,
+    openOccurrence: SuccessfulTaskToolOccurrence | undefined,
+  ): boolean => {
+    if (!deterministicRenderRequired) return true
+    if (!screenshotOccurrence || !openOccurrence) return false
+    const screenshotResult = structuredToolResult(screenshotOccurrence.result)
+    if (!screenshotResult) return false
+    const openPath = browserResultWorkspacePath(openOccurrence)
+    const openEpoch = browserResultPageEpoch(openOccurrence)
+    return typeof openPath === 'string'
+      && openEpoch !== undefined
+      && browserUrlWorkspacePath(screenshotResult.render_page_url) === openPath
+      && screenshotResult?.render_page_epoch === openEpoch
+  }
+  const referenceContract = referenceContractGrounded
+    ? durableReferenceContract?.contract
+    : undefined
+  const inspectionTargetsRequiredContract = (
+    occurrence: SuccessfulTaskToolOccurrence,
+    phase: VisualWebArtifactWorkflowPhase,
+  ): boolean => occurrence.call.name === 'inspect_image'
+    && (!referenceContract || Boolean(
+      durableReferenceContract
+      && referenceInspectionPromptMatchesContract(occurrence, durableReferenceContract, phase)
+    ))
+  const inspectionVerdictPassesRequiredContract = (
+    occurrence: SuccessfulTaskToolOccurrence,
+    phase: VisualWebArtifactWorkflowPhase,
+  ): boolean => {
+    if (!inspectionTargetsRequiredContract(occurrence, phase)) return false
+    if (referenceContract && !referenceVisualInspectionPassed(occurrence.result)) return false
+    if (!referenceContract && !visualInspectionPassed(occurrence.result)) return false
+    return true
+  }
+  const inspectionMatchesScreenshotEvidence = (
+    occurrence: SuccessfulTaskToolOccurrence,
+    screenshotOccurrence?: SuccessfulTaskToolOccurrence,
+    workflowPhase?: VisualWebArtifactWorkflowPhase,
+  ): boolean => {
+    if (!deterministicRenderRequired) return true
+    if (!screenshotOccurrence) return false
+    const screenshotResult = structuredToolResult(screenshotOccurrence.result)
+    const screenshotSha256 = screenshotResult?.screenshot_sha256
+    if (typeof screenshotSha256 !== 'string'
+      || inspectedImageSha256(occurrence.result) !== screenshotSha256.toLowerCase()) return false
+
+    const manifest = durableReferenceContract?.visualEvidence
+    if (!manifest) return !options.requirePrivateVisualEvidence
+    const expectedPhase: ReferenceRenderPhase | undefined = workflowPhase === 'reference_cover_inspection'
+      ? 'cover'
+      : workflowPhase === 'visual_inspection'
+        ? 'content'
+        : workflowPhase === 'reference_closing_inspection'
+          ? 'closing'
+          : undefined
+    if (!expectedPhase || !durableReferenceContract?.renderProfile) return false
+    const evidence = exactReferenceComparisonEvidence(occurrence.result)
+    if (!evidence) return false
+    const renderProfileSha256 = createHash('sha256')
+      .update(JSON.stringify(durableReferenceContract.renderProfile))
+      .digest('hex')
+    const expectedViewport = durableReferenceContract.renderProfile.viewport
+    const comparison = visualInspectionSection(occurrence.result)
+    const expectedDigest = createHash('sha256').update(JSON.stringify({
+      version: 1,
+      candidate_screenshot_sha256: screenshotSha256.toLowerCase(),
+      reference_png_sha256: manifest.phases[expectedPhase].sha256,
+      source_evidence_sha256: durableReferenceContract.provenance.evidenceSha256,
+      render_profile_sha256: renderProfileSha256,
+      manifest_sha256: manifest.manifestSha256,
+      ...(durableReferenceContract.fontEvidence ? {
+        font_manifest_sha256: durableReferenceContract.fontEvidence.manifestSha256,
+      } : {}),
+      phase: expectedPhase,
+      viewport: expectedViewport,
+      render_page_epoch: screenshotResult?.render_page_epoch,
+      candidate_artifact_hash: screenshotResult?.render_artifact_hash,
+      comparison,
+    })).digest('hex')
+    return evidence.candidateScreenshotSha256 === screenshotSha256.toLowerCase()
+      && evidence.referencePngSha256 === manifest.phases[expectedPhase].sha256
+      && evidence.sourceEvidenceSha256 === durableReferenceContract.provenance.evidenceSha256
+      && evidence.renderProfileSha256 === renderProfileSha256
+      && evidence.manifestSha256 === manifest.manifestSha256
+      && (!durableReferenceContract.fontEvidence
+        || evidence.fontManifestSha256 === durableReferenceContract.fontEvidence.manifestSha256)
+      && evidence.phase === expectedPhase
+      && evidence.viewport.width === expectedViewport.width
+      && evidence.viewport.height === expectedViewport.height
+      && evidence.renderPageEpoch === screenshotResult?.render_page_epoch
+      && evidence.candidateArtifactHash === screenshotResult?.render_artifact_hash
+      && evidence.candidateArtifactHash === latestMutationHash
+      && evidence.comparisonDigestSha256 === expectedDigest
+  }
+  const inspectionPassesRequiredContract = (
+    occurrence: SuccessfulTaskToolOccurrence,
+    phase: VisualWebArtifactWorkflowPhase,
+    screenshotOccurrence?: SuccessfulTaskToolOccurrence,
+  ): boolean => inspectionVerdictPassesRequiredContract(occurrence, phase)
+    && inspectionMatchesScreenshotEvidence(occurrence, screenshotOccurrence, phase)
+  const presentationAttestsCurrentArtifact = (occurrence: SuccessfulTaskToolOccurrence): boolean => {
+    const result = structuredToolResult(occurrence.result)
+    return typeof latestMutationHash === 'string'
+      && result?.status === 'success'
+      && result.artifact_hash === latestMutationHash
+  }
 
   // A repair can legitimately produce several preview/inspection cycles. A
   // prior defective inspection must not pin the gate forever once a later,
@@ -5076,22 +7069,28 @@ export function visualWebArtifactCompletionGap(
     && occurrence.call.name === 'present_file'
     && typeof occurrence.call.arguments.path === 'string'
     && arenaWorkspacePathForVision(occurrence.call.arguments.path) === canonicalPath
+    && presentationAttestsCurrentArtifact(occurrence)
   )).reverse()
-  for (const candidatePresentation of presentations) {
-    const passingInspections = occurrences.filter((occurrence) => (
+  // The newest current-hash presentation is authoritative. Likewise, once a
+  // newest content inspection can be paired to its screenshot, do not skip a
+  // failed/stale verdict and resurrect an older pass for the same artifact.
+  for (const candidatePresentation of presentations.slice(0, 1)) {
+    const candidateInspections = occurrences.filter((occurrence) => (
       occurrence.resultMessageIndex > currentArtifactBoundary
       && occurrence.resultMessageIndex < candidatePresentation.resultMessageIndex
-      && occurrence.call.name === 'inspect_image'
+      && inspectionTargetsRequiredContract(occurrence, 'visual_inspection')
       && typeof occurrence.call.arguments.path === 'string'
-      && visualInspectionPassed(occurrence.result)
     )).reverse()
-    for (const candidateInspection of passingInspections) {
+    for (const candidateInspection of candidateInspections) {
       const inspectedPath = arenaWorkspacePathForVision(String(candidateInspection.call.arguments.path))
       const candidateScreenshot = lastOccurrence(
-        (occurrence) => isBrowserAction(occurrence, 'screenshot') && screenshotPathOf(occurrence) === inspectedPath,
+        (occurrence) => isBrowserAction(occurrence, 'screenshot')
+          && screenshotPathOf(occurrence) === inspectedPath
+          && screenshotPassesRenderedReference(occurrence, 'content'),
         candidateInspection.resultMessageIndex,
       )
       if (!candidateScreenshot) continue
+      if (!inspectionPassesRequiredContract(candidateInspection, 'visual_inspection', candidateScreenshot)) break
       // The last Browser open before this screenshot defines its page epoch.
       // Reject the whole chain when that epoch targets a competing HTML file;
       // searching directly for a canonical open would incorrectly jump across it.
@@ -5099,7 +7098,8 @@ export function visualWebArtifactCompletionGap(
         (occurrence) => isBrowserAction(occurrence, 'open'),
         candidateScreenshot.resultMessageIndex,
       )
-      if (!candidateOpen || !browserOpenTargetsCanonical(candidateOpen)) continue
+      if (!candidateOpen || !browserOpenTargetsCanonical(candidateOpen)) break
+      if (!screenshotSharesBrowserEpoch(candidateScreenshot, candidateOpen)) break
       const candidateNavigation = lastOccurrence(
         isBrowserNavigationAttempt,
         candidateScreenshot.resultMessageIndex,
@@ -5109,7 +7109,7 @@ export function visualWebArtifactCompletionGap(
         !candidateNavigation
         || !isNavigationAfter(candidateOpen, candidateNavigation)
         || !browserNavigationTargetsCanonical(candidateNavigation)
-      ) continue
+      ) break
       browserOpen = candidateOpen
       navigation = candidateNavigation
       screenshot = candidateScreenshot
@@ -5126,10 +7126,25 @@ export function visualWebArtifactCompletionGap(
   if (!presentation) {
     const latestOpen = lastOccurrence((occurrence) => isBrowserAction(occurrence, 'open'))
     browserOpen = latestOpen && browserOpenTargetsCanonical(latestOpen) ? latestOpen : undefined
+    // End starts the closing-state lane. It is an upper bound for the
+    // representative-content screenshot and inspection, not another content
+    // navigation. Without this boundary the newest closing screenshot was
+    // repeatedly reclassified as content evidence, making the next required
+    // End move forever after its own inspection.
+    const firstClosingBoundary = browserOpen
+      ? firstOccurrence(
+        (occurrence) => occurrence.call.name === 'browser'
+          && occurrence.call.arguments.action === 'press'
+          && String(occurrence.call.arguments.key || '').trim().toLowerCase() === 'end'
+          && browserNavigationTargetsCanonical(occurrence),
+        browserOpen.resultMessageIndex,
+      )
+      : undefined
+    const contentLaneBefore = firstClosingBoundary?.resultMessageIndex ?? Number.POSITIVE_INFINITY
     const latestNavigationAttempt = browserOpen
       ? lastOccurrence(
-        isBrowserNavigationAttempt,
-        Number.POSITIVE_INFINITY,
+        isBrowserNavigation,
+        contentLaneBefore,
         browserOpen.resultMessageIndex,
       )
       : undefined
@@ -5142,7 +7157,7 @@ export function visualWebArtifactCompletionGap(
     screenshot = navigation
       ? lastOccurrence(
         (occurrence) => isBrowserAction(occurrence, 'screenshot'),
-        Number.POSITIVE_INFINITY,
+        contentLaneBefore,
         navigation.resultMessageIndex,
       )
       : undefined
@@ -5150,9 +7165,10 @@ export function visualWebArtifactCompletionGap(
     inspection = screenshot
       ? lastOccurrence(
         (occurrence) => occurrence.call.name === 'inspect_image'
+          && inspectionTargetsRequiredContract(occurrence, 'visual_inspection')
           && typeof occurrence.call.arguments.path === 'string'
           && arenaWorkspacePathForVision(occurrence.call.arguments.path) === screenshotPath,
-        Number.POSITIVE_INFINITY,
+        contentLaneBefore,
         screenshot.resultMessageIndex,
       )
       : undefined
@@ -5160,35 +7176,222 @@ export function visualWebArtifactCompletionGap(
       ? lastOccurrence(
         (occurrence) => occurrence.call.name === 'present_file'
           && typeof occurrence.call.arguments.path === 'string'
-          && arenaWorkspacePathForVision(occurrence.call.arguments.path) === canonicalPath,
+          && arenaWorkspacePathForVision(occurrence.call.arguments.path) === canonicalPath
+          && presentationAttestsCurrentArtifact(occurrence),
         Number.POSITIVE_INFINITY,
         inspection.resultMessageIndex,
       )
       : undefined
   }
 
+  let referenceCoverScreenshot: SuccessfulTaskToolOccurrence | undefined
+  let referenceCoverInspection: SuccessfulTaskToolOccurrence | undefined
+  let referenceClosingNavigation: SuccessfulTaskToolOccurrence | undefined
+  let referenceClosingScreenshot: SuccessfulTaskToolOccurrence | undefined
+  let referenceClosingInspection: SuccessfulTaskToolOccurrence | undefined
+  if (referenceContract && browserOpen) {
+    const contentNavigationBoundary = navigation?.resultMessageIndex ?? Number.POSITIVE_INFINITY
+    referenceCoverScreenshot = lastOccurrence(
+      (occurrence) => isBrowserAction(occurrence, 'screenshot'),
+      contentNavigationBoundary,
+      browserOpen.resultMessageIndex,
+    )
+    const coverPath = referenceCoverScreenshot ? screenshotPathOf(referenceCoverScreenshot) : undefined
+    referenceCoverInspection = referenceCoverScreenshot && coverPath
+      ? lastOccurrence(
+        (occurrence) => inspectionTargetsRequiredContract(occurrence, 'reference_cover_inspection')
+          && typeof occurrence.call.arguments.path === 'string'
+          && arenaWorkspacePathForVision(occurrence.call.arguments.path) === coverPath,
+        contentNavigationBoundary,
+        referenceCoverScreenshot.resultMessageIndex,
+      )
+      : undefined
+
+    const closingBefore = presentation?.resultMessageIndex ?? Number.POSITIVE_INFINITY
+    const closingAfter = inspection?.resultMessageIndex
+      ?? screenshot?.resultMessageIndex
+      ?? navigation?.resultMessageIndex
+      ?? browserOpen.resultMessageIndex
+    // The first valid End after the passing representative inspection owns the
+    // closing lane. Later redundant End presses must not move this boundary and
+    // invalidate an already captured closing screenshot/inspection pair.
+    referenceClosingNavigation = firstOccurrence(
+      (occurrence) => {
+        if (occurrence.call.name !== 'browser' || occurrence.call.arguments.action !== 'press') return false
+        const key = String(occurrence.call.arguments.key || '').trim().toLowerCase()
+        return key === 'end'
+          && browserNavigationTargetsCanonical(occurrence)
+          && Boolean(navigation && browserResultChanged(navigation, occurrence))
+          && Boolean(
+            navigation
+            && browserResultWorkspacePath(navigation) === browserResultWorkspacePath(occurrence)
+            && browserResultPageEpoch(navigation) !== undefined
+            && browserResultPageEpoch(navigation) === browserResultPageEpoch(occurrence)
+          )
+      },
+      closingAfter,
+      closingBefore,
+    )
+    referenceClosingScreenshot = referenceClosingNavigation
+      ? lastOccurrence(
+        (occurrence) => isBrowserAction(occurrence, 'screenshot'),
+        closingBefore,
+        referenceClosingNavigation.resultMessageIndex,
+      )
+      : undefined
+    const closingPath = referenceClosingScreenshot ? screenshotPathOf(referenceClosingScreenshot) : undefined
+    referenceClosingInspection = referenceClosingScreenshot && closingPath
+      ? lastOccurrence(
+        (occurrence) => inspectionTargetsRequiredContract(occurrence, 'reference_closing_inspection')
+          && typeof occurrence.call.arguments.path === 'string'
+          && arenaWorkspacePathForVision(occurrence.call.arguments.path) === closingPath,
+        closingBefore,
+        referenceClosingScreenshot.resultMessageIndex,
+      )
+      : undefined
+  }
+
+  if (
+    referenceContract
+    && referenceCoverScreenshot
+    && screenshot
+    && referenceClosingScreenshot
+  ) {
+    const coveragePaths = [
+      screenshotPathOf(referenceCoverScreenshot),
+      screenshotPathOf(screenshot),
+      screenshotPathOf(referenceClosingScreenshot),
+    ]
+    const coverageSha256 = [
+      structuredToolResult(referenceCoverScreenshot.result)?.screenshot_sha256,
+      structuredToolResult(screenshot.result)?.screenshot_sha256,
+      structuredToolResult(referenceClosingScreenshot.result)?.screenshot_sha256,
+    ].map((value) => typeof value === 'string' ? value.toLowerCase() : '')
+    const duplicateScreenshotBytes = deterministicRenderRequired
+      && coverageSha256.every((value) => /^[0-9a-f]{64}$/u.test(value))
+      && new Set(coverageSha256).size !== coverageSha256.length
+    if (new Set(coveragePaths).size !== coveragePaths.length || duplicateScreenshotBytes) {
+      // Reusing one path overwrites earlier evidence; copying identical bytes
+      // into distinct paths is equally incapable of proving three rendered
+      // states. Invalidate the Browser chain and capture independent cover,
+      // content, and closing evidence again.
+      browserOpen = undefined
+      navigation = undefined
+      screenshot = undefined
+      inspection = undefined
+      referenceCoverScreenshot = undefined
+      referenceCoverInspection = undefined
+      referenceClosingNavigation = undefined
+      referenceClosingScreenshot = undefined
+      referenceClosingInspection = undefined
+      presentation = undefined
+    }
+  }
+
+  const referenceCoverScreenshotNeedsRepair = Boolean(
+    referenceCoverScreenshot
+    && (
+      !screenshotPassesRenderedReference(referenceCoverScreenshot, 'cover')
+      || !screenshotSharesBrowserEpoch(referenceCoverScreenshot, browserOpen)
+    )
+  )
+  const contentScreenshotNeedsRepair = Boolean(
+    screenshot
+    && (
+      !screenshotPassesRenderedReference(screenshot, 'content')
+      || !screenshotSharesBrowserEpoch(screenshot, browserOpen)
+    )
+  )
+  const referenceClosingScreenshotNeedsRepair = Boolean(
+    referenceClosingScreenshot
+    && (
+      !screenshotPassesRenderedReference(referenceClosingScreenshot, 'closing')
+      || !screenshotSharesBrowserEpoch(referenceClosingScreenshot, browserOpen)
+    )
+  )
+
   if (!browserOpen) missing.add('browser_open')
+  if (referenceContract && !referenceCoverScreenshot) missing.add('reference_cover_screenshot')
+  // A deterministic render mismatch is already a concrete defect verdict.
+  // Vision cannot make invalid bytes valid, and inspecting them first creates
+  // a phase/tool contradiction with the canonical read/edit repair lane.
+  if (referenceContract && !referenceCoverInspection && !referenceCoverScreenshotNeedsRepair) {
+    missing.add('reference_cover_inspection')
+  }
   if (!navigation) missing.add('navigation_check')
   if (!screenshot) missing.add('browser_screenshot')
-  if (!inspection) missing.add('visual_inspection')
-  if (inspection && !visualInspectionPassed(inspection.result)) {
+  if (!inspection && !contentScreenshotNeedsRepair) missing.add('visual_inspection')
+  if (inspection && !inspectionVerdictPassesRequiredContract(inspection, 'visual_inspection')) {
     missing.add('visual_inspection_pass')
+  } else if (inspection && !inspectionMatchesScreenshotEvidence(inspection, screenshot, 'visual_inspection')) {
+    missing.add('visual_inspection')
   }
+  if (referenceCoverInspection && !inspectionVerdictPassesRequiredContract(
+    referenceCoverInspection, 'reference_cover_inspection',
+  )) {
+    missing.add('visual_inspection_pass')
+  } else if (referenceCoverInspection && !inspectionMatchesScreenshotEvidence(
+    referenceCoverInspection, referenceCoverScreenshot, 'reference_cover_inspection',
+  )) {
+    missing.add('reference_cover_inspection')
+  }
+  if (referenceCoverScreenshotNeedsRepair || contentScreenshotNeedsRepair) missing.add('visual_inspection_pass')
+  if (referenceContract && !referenceClosingNavigation) missing.add('reference_closing_navigation')
+  if (referenceContract && !referenceClosingScreenshot) missing.add('reference_closing_screenshot')
+  if (referenceContract && !referenceClosingInspection && !referenceClosingScreenshotNeedsRepair) {
+    missing.add('reference_closing_inspection')
+  }
+  if (referenceClosingInspection && !inspectionVerdictPassesRequiredContract(
+    referenceClosingInspection, 'reference_closing_inspection',
+  )) {
+    missing.add('visual_inspection_pass')
+  } else if (referenceClosingInspection && !inspectionMatchesScreenshotEvidence(
+    referenceClosingInspection, referenceClosingScreenshot, 'reference_closing_inspection',
+  )) {
+    missing.add('reference_closing_inspection')
+  }
+  if (referenceClosingScreenshotNeedsRepair) missing.add('visual_inspection_pass')
   if (!presentation) missing.add('present_file')
 
-  return missing.size > 0 ? { canonicalPath, missingPhases: [...missing] } : undefined
+  const currentScreenshotPath = missing.has('reference_cover_inspection') && referenceCoverScreenshot
+    ? screenshotPathOf(referenceCoverScreenshot)
+    : missing.has('visual_inspection') && screenshot
+      ? screenshotPathOf(screenshot)
+      : missing.has('reference_closing_inspection') && referenceClosingScreenshot
+        ? screenshotPathOf(referenceClosingScreenshot)
+        : undefined
+  return missing.size > 0
+    ? {
+      canonicalPath,
+      missingPhases: [...missing],
+      ...(durableReferenceContract && referenceContractGrounded ? { referenceContract: durableReferenceContract } : {}),
+      ...(referenceContinuation ? { referenceContinuation } : {}),
+      ...(currentReferenceVerification ? { referenceVerification: currentReferenceVerification } : {}),
+      ...(htmlArtifactRepair ? { htmlArtifactRepair } : {}),
+      ...(currentScreenshotPath ? { currentScreenshotPath } : {}),
+    }
+    : undefined
 }
 
 function visualWebArtifactRecoveryPrompt(gap: VisualWebArtifactCompletionGap): string {
   const phaseGuidance: Record<VisualWebArtifactWorkflowPhase, string> = {
     web_research: 'search the Web for the time-sensitive facts before the final artifact mutation and retain real source URLs',
-    html_artifact: 'write one complete canonical self-contained HTML presentation',
+    reference_acquisition: 'retrieve the concrete style-bearing design specification or template source behind the visual reference URL; a directory listing is discovery only',
+    reference_contract: 'record one compact source-grounded StyleContract; put one concrete CSS color token per colors item, one family per fonts item, and one literal selector/variable/layout identifier per required_markers item, with layout grammar, components, viewport, signature, and forbidden substitutions in their own fields',
+    html_artifact: 'write one complete canonical self-contained HTML presentation; in exact-reference mode retain the retrieved template controlling CSS, structural selectors, chrome, geometry, and decoration while omitting unused demo slides/components so the complete write fits one response',
+    reference_source_check: 'run the deterministic reference-style verifier on the canonical HTML',
+    reference_implementation: 'repair the exact palette, typography, or distinctive reference markers reported missing by the style verifier',
     website_preview: 'start the canonical HTML as a managed Website preview',
     browser_open: 'open the current canonical HTML in the Browser',
+    reference_cover_screenshot: 'save a Browser screenshot of the reference-critical cover state before navigating',
+    reference_cover_inspection: 'inspect the cover screenshot against the durable StyleContract for both render health and reference fidelity',
     navigation_check: 'perform exactly one forward navigation action and verify the changed slide state from its fresh snapshot',
     browser_screenshot: 'save exactly one current post-navigation Browser screenshot to a workspace-relative PNG path',
-    visual_inspection: 'inspect that exact screenshot with inspect_image',
-    visual_inspection_pass: 'fix the concrete visual defects, repeat the current preview check, and obtain an inspection result containing exactly NO DEFECTS',
+    visual_inspection: 'inspect that exact screenshot with inspect_image, including the durable reference-fidelity contract when one exists',
+    visual_inspection_pass: 'fix the concrete render or reference-fidelity defects, repeat the current preview checks, and obtain every required pass verdict',
+    reference_closing_navigation: 'press End to verify the closing/source slide and preserve the canonical Browser page epoch',
+    reference_closing_screenshot: 'save a Browser screenshot of the closing/source slide',
+    reference_closing_inspection: 'inspect the closing/source screenshot against the durable StyleContract for both render health and reference fidelity',
     present_file: 'present the verified canonical HTML file',
   }
   const actions = gap.missingPhases.map((phase) => phaseGuidance[phase]).join('; ')
@@ -5201,48 +7404,821 @@ function nextVisualWebArtifactPhase(
   if (!gap) return undefined
   const dependencyOrder: VisualWebArtifactWorkflowPhase[] = [
     'web_research',
+    'reference_acquisition',
+    'reference_contract',
     'html_artifact',
+    'reference_source_check',
+    'reference_implementation',
     'website_preview',
     'browser_open',
+    'reference_cover_screenshot',
+    'visual_inspection_pass',
+    'reference_cover_inspection',
     'navigation_check',
     'browser_screenshot',
     'visual_inspection',
-    'visual_inspection_pass',
+    'reference_closing_navigation',
+    'reference_closing_screenshot',
+    'reference_closing_inspection',
     'present_file',
   ]
   return dependencyOrder.find((phase) => gap.missingPhases.includes(phase))
 }
 
-function visualWebArtifactRequiredToolNames(
+const VISUAL_BROWSER_PHASE_ACTIONS: Partial<Record<VisualWebArtifactWorkflowPhase, readonly string[]>> = {
+  browser_open: ['open'],
+  reference_cover_screenshot: ['screenshot'],
+  // Keep exact-reference captures in a neutral pointer state. A click leaves
+  // Chromium's mouse over the navigation control, so the immediately
+  // following screenshot can faithfully capture the template's :hover rule
+  // and then falsely report it as source drift. Keyboard navigation proves
+  // the same interaction without contaminating deterministic visual evidence.
+  navigation_check: ['press'],
+  browser_screenshot: ['screenshot'],
+  reference_closing_navigation: ['press'],
+  reference_closing_screenshot: ['screenshot'],
+}
+
+const REFERENCE_INSPECTION_PROJECTION_MAX_CHARACTERS = 1_400
+const REFERENCE_INSPECTION_PROMPT_MAX_CHARACTERS = 2_000
+
+/**
+ * Compact model-authored prose without ever leaving a dangling UTF-16 high
+ * surrogate at the boundary. The core StyleContract verifier remains strict;
+ * this helper is only for safe phase-local argument repair and prompt
+ * projection, where spending another model call would add no information.
+ */
+function boundedUtf16Text(value: string, maximum: number): string {
+  if (value.length <= maximum) return value
+  let end = maximum
+  const lastCodeUnit = value.charCodeAt(end - 1)
+  if (lastCodeUnit >= 0xD800 && lastCodeUnit <= 0xDBFF) end -= 1
+  return value.slice(0, end).trimEnd()
+}
+
+function boundedCompactText(value: string, maximum: number): string {
+  return boundedUtf16Text(value.replace(/\s+/gu, ' ').trim(), maximum)
+}
+
+function boundedReferenceItems(
+  values: readonly string[],
+  maximumItems: number,
+  maximumCharactersPerItem: number,
+): string {
+  return values
+    .slice(0, maximumItems)
+    .map((value) => boundedCompactText(value, maximumCharactersPerItem))
+    .filter(Boolean)
+    .join(' | ')
+}
+
+function referenceSourceProfileProjection(
+  sourceProfile: DurableReferenceStyleContract['sourceProfile'],
+  phase: VisualWebArtifactWorkflowPhase | undefined,
+): string {
+  if (!sourceProfile) return ''
+  const stagePattern = phase === 'reference_cover_inspection'
+    ? /cover|dots?|accent|hero|brand|header/iu
+    : phase === 'reference_closing_inspection'
+      ? /closing|source|footer|nav|progress|counter|hint/iu
+      : /metric|bar|split|step|card|tile|label|panel|chart|stat/iu
+  const rankedRules = sourceProfile.rules
+    .map((rule, index) => ({ rule, index, stage: stagePattern.test(rule.selector) }))
+    .sort((left, right) => Number(right.stage) - Number(left.stage) || left.index - right.index)
+  const cues = [
+    ...rankedRules.map(({ rule }) => {
+      const declarations = rule.declarations
+        .slice(0, 4)
+        .map((entry) => `${entry.property}:${entry.value}`)
+      if (rule.effectiveFontFamily && !rule.declarations.some((entry) => entry.property === 'font-family')) {
+        declarations.push(`effective-font:${rule.effectiveFontFamily}`)
+      }
+      return `${rule.selector}{${declarations.join(',')}}`
+    }),
+    ...sourceProfile.dom.flatMap((entry) => (entry.inlineStyleVariants ?? []).map((variant) => (
+      `.${entry.className}[${variant.property}:${variant.values.join('/')}]`
+    ))),
+  ]
+  let projection = ''
+  for (const cue of cues) {
+    const boundedCue = boundedCompactText(cue, 120)
+    const candidate = projection ? `${projection} | ${boundedCue}` : boundedCue
+    if (candidate.length > 520) continue
+    projection = candidate
+  }
+  return projection
+}
+
+export function referenceInteriorStructureProjection(
+  reference: DurableReferenceStyleContract | undefined,
+  maximumCharacters = 1_600,
+): string {
+  const variants = reference?.renderProfile?.interiorVariants ?? []
+  let projection = ''
+  for (const variant of variants.slice(0, 16)) {
+    const prefix = `${variant.layoutSelector} `
+    const anchors = variant.profile.anchors
+      .filter((anchor) => anchor.selector.startsWith(prefix))
+      .slice(0, 12)
+      .map((anchor) => `${anchor.selector.slice(prefix.length)}×${anchor.count}`)
+    if (anchors.length === 0) continue
+    const cue = `${variant.layoutSelector}{${anchors.join(',')}}`
+    const candidate = projection ? `${projection} | ${cue}` : cue
+    if (candidate.length > maximumCharacters) continue
+    projection = candidate
+  }
+  return projection
+}
+
+/**
+ * One stable, priority-ordered StyleContract projection is shared by the
+ * provider-visible tool schema and the actual Vision prompt. Exact palette,
+ * font, and marker cues come first; verbose prose fields consume only the
+ * remaining bounded budget.
+ */
+function referenceInspectionContractProjection(
+  contract: ReferenceStyleContract,
+  sourceProfile?: DurableReferenceStyleContract['sourceProfile'],
+  phase?: VisualWebArtifactWorkflowPhase,
+  maximumCharacters = REFERENCE_INSPECTION_PROJECTION_MAX_CHARACTERS,
+): string {
+  const segments = [
+    `strictness=${contract.strictness}`,
+    `viewport=${contract.viewport.width}x${contract.viewport.height}`,
+    `colors=${contract.colors.map((value) => boundedCompactText(value, 48)).join(',')}`,
+    `fonts=${contract.fonts.map((value) => boundedCompactText(value, 56)).join(',')}`,
+    `markers=${contract.requiredMarkers.map((value) => boundedCompactText(value, 40)).join(',')}`,
+    `source-rules=${referenceSourceProfileProjection(sourceProfile, phase)}`,
+    `layout=${boundedReferenceItems(contract.layout, 3, 84)}`,
+    `components=${boundedReferenceItems(contract.components, 4, 72)}`,
+    `signature=${boundedCompactText(contract.signature, 180)}`,
+    `avoid=${boundedReferenceItems(contract.avoid, 3, 72)}`,
+  ]
+  let projection = ''
+  for (const segment of segments) {
+    if (!segment.slice(segment.indexOf('=') + 1)) continue
+    const candidate = projection ? `${projection}; ${segment}` : segment
+    if (candidate.length > maximumCharacters) continue
+    projection = candidate
+  }
+  return projection
+}
+
+function referenceVerificationRepairInstruction(
+  diagnostics: ReferenceStyleVerificationDiagnostics | undefined,
+  reference?: DurableReferenceStyleContract,
+): string {
+  const structure = referenceInteriorStructureProjection(reference)
+  const structureRule = structure
+    ? ` Preserve these exact existing interior DOM anchor counts: ${structure}. Reclassify or restyle one of those existing visible anchors to consume a missing semantic color; never append a duplicate child or change a listed count.`
+    : ''
+  if (!diagnostics) {
+    return `Use only the most recent verify_reference_style result; never retry a correction that a later verifier no longer reports.${structureRule}`
+  }
+  const exactGap = JSON.stringify({
+    score: diagnostics.score,
+    missing: diagnostics.missing,
+    violations: diagnostics.violations,
+  })
+  const connectedColorRule = diagnostics.missing.colors.length > 0
+    ? ' Each missing color must be consumed by a real visible DOM-connected reference selector/state; a :root-only declaration, comment, script string, hidden element, or unused class does not count.'
+    : ''
+  return `Fresh verifier diagnostics (authoritative and newer than every earlier mismatch): ${exactGap}.${connectedColorRule} Fix exactly this complete current list. Never retry a selector/value correction absent from this list, even if an older verifier reported it.${structureRule}`
+}
+
+/** Narrow the provider-visible Browser schema to the one durable phase. */
+export function constrainVisualWebArtifactPhaseToolDefinitions(
+  definitions: readonly ToolDefinition[],
+  phase: VisualWebArtifactWorkflowPhase | undefined,
+  canonicalPath?: string,
+  referenceContract?: DurableReferenceStyleContract,
+  slideCount = DEFAULT_VISUAL_WEB_SLIDE_COUNT,
+  referenceVerification?: ReferenceStyleVerificationDiagnostics,
+  htmlArtifactRepair?: ExactReferenceHtmlArtifactRepair,
+): ToolDefinition[] {
+  const actions = phase ? VISUAL_BROWSER_PHASE_ACTIONS[phase] : undefined
+  const referenceInspection = Boolean(
+    referenceContract
+    && ['reference_cover_inspection', 'visual_inspection', 'reference_closing_inspection'].includes(String(phase)),
+  )
+  const exactHtmlArtifact = phase === 'html_artifact' && referenceContract?.contract.strictness === 'exact'
+  const exactHtmlRepair = phase === 'html_artifact' && htmlArtifactRepair !== undefined
+  const referenceAcquisition = phase === 'reference_acquisition'
+  const referenceImplementation = phase === 'reference_implementation'
+  const htmlBudget = exactReferenceHtmlBudgetForSlideCount(slideCount)
+  const exactRequiredPalette = exactHtmlArtifact && Array.isArray(referenceContract?.contract.colors)
+    ? referenceContract.contract.colors.join(', ')
+    : 'the complete recorded StyleContract palette'
+  if (!actions && !referenceInspection && !exactHtmlArtifact && !exactHtmlRepair && !referenceAcquisition && !referenceImplementation) return [...definitions]
+  return definitions.map((definition) => {
+    if (referenceAcquisition && definition.function.name === 'fetch_page') {
+      const parameters = definition.function.parameters
+      const properties = parameters.properties && typeof parameters.properties === 'object'
+        ? parameters.properties as Record<string, unknown>
+        : {}
+      const format = properties.format && typeof properties.format === 'object'
+        ? properties.format as Record<string, unknown>
+        : { type: 'string' }
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          description: `${definition.function.description}\n\nCurrent phase: retrieve the exact textual template/design source with format raw. Start at chunkIndex 0; when hasMore is true, continue the same URL and format with the next chunkIndex.`,
+          parameters: {
+            ...parameters,
+            properties: {
+              ...properties,
+              format: {
+                ...format,
+                enum: ['raw'],
+                default: 'raw',
+                description: 'Required in this phase so HTML, CSS, selectors, and DOM structure are preserved verbatim.',
+              },
+            },
+            required: [...new Set([
+              ...(Array.isArray(parameters.required)
+                ? parameters.required.filter((value): value is string => typeof value === 'string')
+                : []),
+              'format',
+            ])],
+          },
+        },
+      }
+    }
+    if (exactHtmlArtifact && definition.function.name === 'write_file') {
+      const parameters = definition.function.parameters
+      const properties = parameters.properties && typeof parameters.properties === 'object'
+        ? parameters.properties as Record<string, unknown>
+        : {}
+      const content = properties.content && typeof properties.content === 'object'
+        ? properties.content as Record<string, unknown>
+        : { type: 'string' }
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          description: `${definition.function.description}\n\nCurrent phase: write exactly one complete, closed, minified ${slideCount}-slide HTML document near ${htmlBudget.targetBytes.toLocaleString('en-US')} UTF-8 bytes. ${visualWebSlideCompositionInstruction(slideCount)} Preserve the user's explicit page count, required reference CSS/DOM, cover/content/closing geometry, navigation, interaction, and task-required visible retrieved source URLs. Preserve every exact StyleContract color through a real visible DOM-connected reference selector/state, including semantic status colors; declarations used only by :root, comments, scripts, hidden elements, or unused classes do not count. Exact required palette: ${exactRequiredPalette}. Minify whitespace, not the reference's exact numeric font sizes, gaps, padding, rows, or letter-spacing. Visible source/citation text must reuse the existing reference typography for its chosen layout; shortening a label never permits a new smaller font-size, line-height, letter-spacing, or color override. Keep no CSS for unused layouts or optional variants; shorten body copy and source labels; use at most two or three short content blocks per slide. Never create part1/part2 files.`,
+          parameters: {
+            ...parameters,
+            properties: {
+              ...properties,
+              content: {
+                ...content,
+                maxLength: htmlBudget.schemaMaxCharacters,
+                description: `One complete standalone ${slideCount}-slide HTML document, minified near ${htmlBudget.targetBytes.toLocaleString('en-US')} UTF-8 bytes. It must contain 1 cover + ${slideCount - 2} content + 1 closing rendered .slide elements total; an agenda counts as content. Preserve required reference fidelity; omit unused layout CSS, shorten copy/source labels, and do not split into parts or append an extra slide for a missing marker.`,
+              },
+            },
+          },
+        },
+      }
+    }
+    if (exactHtmlRepair && htmlArtifactRepair && definition.function.name === 'edit_file') {
+      const parameters = definition.function.parameters
+      const properties = parameters.properties && typeof parameters.properties === 'object'
+        ? parameters.properties as Record<string, unknown>
+        : {}
+      const path = properties.path && typeof properties.path === 'object'
+        ? properties.path as Record<string, unknown>
+        : { type: 'string' }
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          description: `${definition.function.description}\n\nCurrent exact-reference draft repair: edit only ${JSON.stringify(htmlArtifactRepair.path)} and resolve this sole canonical gap without a full-file rewrite: ${htmlArtifactRepair.canonicalGap}`,
+          parameters: {
+            ...parameters,
+            properties: {
+              ...properties,
+              path: {
+                ...path,
+                enum: [htmlArtifactRepair.path],
+                default: htmlArtifactRepair.path,
+              },
+            },
+          },
+        },
+      }
+    }
+    if (referenceInspection && definition.function.name === 'inspect_image' && referenceContract) {
+      const projection = referenceInspectionContractProjection(
+        referenceContract.contract,
+        referenceContract.sourceProfile,
+        phase,
+      )
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          description: `${definition.function.description}\n\nCurrent phase: REFERENCE FIDELITY inspection. Use this bounded durable StyleContract key projection: ${projection}. Ask for exactly two verdict lines only when render integrity and reference fidelity both pass:\nNO DEFECTS\nREFERENCE MATCH\nOtherwise ask for at most three concrete visible mismatches.`,
+        },
+      }
+    }
+    if (referenceImplementation && definition.function.name === 'edit_file') {
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          description: `${definition.function.description}\n\nCurrent exact-reference repair phase. ${referenceVerificationRepairInstruction(referenceVerification, referenceContract)}`,
+        },
+      }
+    }
+    if (definition.function.name !== 'browser') return definition
+    if (!actions) return definition
+    const parameters = definition.function.parameters
+    const properties = parameters.properties && typeof parameters.properties === 'object'
+      ? parameters.properties as Record<string, unknown>
+      : {}
+    const action = properties.action && typeof properties.action === 'object'
+      ? properties.action as Record<string, unknown>
+      : { type: 'string' }
+    const phaseInstruction = phase === 'browser_open'
+      ? `Current phase: open ${JSON.stringify(canonicalPath || 'the canonical HTML')} exactly once. No other Browser action is valid yet.`
+      : phase === 'navigation_check'
+        ? 'Current phase: perform one forward click using a fresh ref, or press ArrowRight. Do not guess visible text.'
+        : phase === 'reference_closing_navigation'
+          ? 'Current phase: press End once to reach the closing/source slide. No other key or Browser action is valid.'
+          : phase === 'reference_cover_screenshot'
+            ? 'Current phase: save one cover-state viewport screenshot before navigating. No other Browser action is valid.'
+            : phase === 'reference_closing_screenshot'
+              ? 'Current phase: save one closing/source-state viewport screenshot. No other Browser action is valid.'
+              : 'Current phase: save one post-navigation representative-content viewport screenshot. No other Browser action is valid.'
+    const required = new Set(Array.isArray(parameters.required)
+      ? parameters.required.filter((value): value is string => typeof value === 'string')
+      : [])
+    if (phase === 'browser_open') required.add('path')
+    return {
+      ...definition,
+      function: {
+        ...definition.function,
+        description: `${definition.function.description}\n\n${phaseInstruction}`,
+        parameters: {
+          ...parameters,
+          properties: {
+            ...properties,
+            action: { ...action, enum: [...actions] },
+          },
+          required: [...required],
+        },
+      },
+    }
+  })
+}
+
+/**
+ * Prefix only a scheme-less URL that the model already placed on the visible
+ * citation surface and that canonicalizes to retrieved evidence. This is a
+ * bounded spelling repair, not citation invention: arbitrary domains and
+ * URLs hidden in script/style content remain untouched.
+ */
+function repairVisibleRetrievedCitationUrl(
+  html: string,
+  retrievedCitationUrls: readonly string[],
+): string {
+  const citationSurface = htmlResearchCitationSurface(html.replace(/<!--[\s\S]*?-->/gu, ' '))
+  const exactVisibleUrls = new Set(urlsInText(citationSurface))
+  for (const rawUrl of [...new Set(retrievedCitationUrls)]) {
+    const canonicalUrl = canonicalCitationUrl(rawUrl)
+    if (!canonicalUrl || exactVisibleUrls.has(canonicalUrl)) continue
+    const schemeLess = canonicalUrl.replace(/^https?:\/\//iu, '')
+    const candidates = [...new Set([
+      schemeLess,
+      ...(schemeLess.endsWith('/') ? [schemeLess.slice(0, -1)] : []),
+    ].filter(Boolean))]
+    const visibleCandidate = candidates.find((candidate) => citationSurface.includes(candidate))
+    if (!visibleCandidate) continue
+
+    let cursor = 0
+    let repaired = ''
+    let changed = false
+    while (cursor < html.length) {
+      const index = html.indexOf(visibleCandidate, cursor)
+      if (index < 0) {
+        repaired += html.slice(cursor)
+        break
+      }
+      repaired += html.slice(cursor, index)
+      const prefix = html.slice(Math.max(0, index - 12), index)
+      if (/https?:\/\/$/iu.test(prefix)) {
+        repaired += visibleCandidate
+      } else {
+        repaired += canonicalUrl
+        changed = true
+      }
+      cursor = index + visibleCandidate.length
+    }
+    if (
+      changed
+      && urlsInText(htmlResearchCitationSurface(repaired)).includes(canonicalUrl)
+    ) return repaired
+  }
+  return html
+}
+
+/**
+ * Repair phase-local tool drift before it consumes a failed execution step.
+ * Browser-only phases can replace a stale action without broadening authority;
+ * the StyleContract and HTML phases only normalize bounded prose, an
+ * unambiguous `file` -> `path` alias, or the missing scheme on a visibly
+ * authored URL that exactly matches retrieved evidence. Recording every
+ * repair keeps the durable conversation and result aligned.
+ */
+export function repairVisualWebArtifactPhaseToolCalls(
+  toolCalls: NonNullable<ModelMessage['tool_calls']>,
+  phase: VisualWebArtifactWorkflowPhase | undefined,
+  canonicalPath?: string,
+  referenceContract?: DurableReferenceStyleContract,
+  currentScreenshotPath?: string,
+  referenceRequest?: VisualStyleReferenceRequest,
+  referenceContinuation?: ReferenceStyleEvidenceContinuation,
+  retrievedCitationUrls?: readonly string[],
+  htmlArtifactRepair?: ExactReferenceHtmlArtifactRepair,
+): {
+  toolCalls: NonNullable<ModelMessage['tool_calls']>
+  repairs: Array<{ callId: string; fromTool?: string; fromAction?: string; toAction: string }>
+} {
+  const referenceInspection = Boolean(
+    phase
+    && referenceContract
+    && ['reference_cover_inspection', 'visual_inspection', 'reference_closing_inspection'].includes(phase),
+  )
+  const phaseArgumentRepair = phase === 'reference_acquisition'
+    || phase === 'web_research'
+    || phase === 'reference_contract'
+    || phase === 'html_artifact'
+    || phase === 'reference_source_check'
+  if (!phase || (!VISUAL_BROWSER_PHASE_ACTIONS[phase] && !referenceInspection && !phaseArgumentRepair)) {
+    return { toolCalls, repairs: [] }
+  }
+  const repairs: Array<{ callId: string; fromTool?: string; fromAction?: string; toAction: string }> = []
+  const repaired = toolCalls.map((call) => {
+    const args = parseArguments(call.function.arguments)
+    const fromTool = call.function.name
+    const fromAction = typeof args.action === 'string' ? args.action : undefined
+    const referenceRelatedResearchFetch = phase === 'web_research'
+      && typeof args.url === 'string'
+      && referenceRequest?.urls.some((url) => referenceUrlsAreRelated(url, args.url as string)) === true
+    if (
+      (phase === 'reference_acquisition' || referenceRelatedResearchFetch)
+      && typeof args.url === 'string'
+      && args.url.trim()
+    ) {
+      const matchedRequestedReference = referenceRequest?.urls.find((url) => (
+        referenceUrlsAreRelated(url, args.url as string)
+      ))
+      const preferredRequestedSource = matchedRequestedReference
+        ? preferredConcreteReferenceSourceUrl(matchedRequestedReference)
+        : undefined
+      const chunkIndex = phase === 'reference_acquisition' && referenceContinuation
+        ? referenceContinuation.nextChunkIndex
+        : Number.isInteger(args.chunkIndex) && Number(args.chunkIndex) >= 0
+          ? Number(args.chunkIndex)
+          : 0
+      const normalizedArguments = JSON.stringify({
+        url: phase === 'reference_acquisition' && referenceContinuation
+          ? referenceContinuation.url
+          : preferredRequestedSource ?? referenceSourceFetchUrl(args.url.trim(), referenceRequest),
+        chunkIndex,
+        format: phase === 'reference_acquisition' && referenceContinuation
+          ? referenceContinuation.format
+          : 'raw',
+      })
+      if (fromTool === 'fetch_page' && call.function.arguments === normalizedArguments) return call
+      repairs.push({
+        callId: call.id,
+        ...(fromTool !== 'fetch_page' ? { fromTool } : {}),
+        toAction: 'fetch_page',
+      })
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          name: 'fetch_page',
+          arguments: normalizedArguments,
+        },
+      }
+    }
+    if (phase === 'reference_source_check' && canonicalPath) {
+      const normalizedArguments = JSON.stringify({ path: canonicalPath })
+      if (fromTool === 'verify_reference_style' && call.function.arguments === normalizedArguments) return call
+      repairs.push({
+        callId: call.id,
+        ...(fromTool !== 'verify_reference_style' ? { fromTool } : {}),
+        toAction: 'verify_reference_style',
+      })
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          name: 'verify_reference_style',
+          arguments: normalizedArguments,
+        },
+      }
+    }
+    if (phase === 'reference_contract' && fromTool === 'record_reference_style') {
+      const nextArgs = { ...args }
+      let changed = false
+      const boundedLists: Array<[keyof typeof args, number]> = [
+        ['colors', 12],
+        ['fonts', 5],
+        ['layout', 8],
+        ['components', 10],
+        ['avoid', 8],
+      ]
+      for (const [field, maximumItems] of boundedLists) {
+        const value = args[field]
+        if (!Array.isArray(value) || value.length <= maximumItems) continue
+        let bounded = value.slice(0, maximumItems)
+        if (field === 'components') {
+          const priority = (item: unknown): number => {
+            const text = typeof item === 'string' ? item : ''
+            if (/layout-cover|cover-(?:decoration|dots?)/iu.test(text)) return 0
+            if (/nav-(?:controls|btn)|progress-bar|slide-counter|keyboard-hint/iu.test(text)) return 1
+            if (/layout-closing|closing-decoration/iu.test(text)) return 2
+            if (/accent-(?:line|dot)/iu.test(text)) return 3
+            return 10
+          }
+          bounded = value
+            .map((item, index) => ({ item, index, priority: priority(item) }))
+            .sort((left, right) => left.priority - right.priority || left.index - right.index)
+            .slice(0, maximumItems)
+            .map(({ item }) => item)
+        }
+        nextArgs[field] = bounded
+        changed = true
+      }
+      if (typeof args.signature === 'string' && args.signature.trim()) {
+        const signature = boundedCompactText(args.signature, 600)
+        if (signature !== args.signature) {
+          nextArgs.signature = signature
+          changed = true
+        }
+      }
+      if (Array.isArray(args.required_markers)) {
+        let markers = [...new Set(args.required_markers.flatMap((value) => {
+          if (typeof value !== 'string') return []
+          const token = value.match(
+            /(?:[.#](?:layout|cover|closing|nav|progress|slide|metric|accent|card|tag|cta|step|bar|insight|split|keyboard)[a-z0-9_.-]*|\b(?:layout|cover|closing|nav|progress|slide|metric|accent|card|tag|cta|step|bar|insight|split|keyboard)[a-z0-9_.-]{2,}|--[a-z][\w-]+)/iu,
+          )?.[0]
+          return token ? [token] : []
+        }))]
+        if (markers.length > 10) {
+          const priority = (marker: string): number => {
+            if (/layout-cover|cover-(?:decoration|dots?)/iu.test(marker)) return 0
+            if (/nav-(?:controls|btn)|progress-bar|slide-counter|keyboard-hint/iu.test(marker)) return 1
+            if (/layout-closing|closing-decoration/iu.test(marker)) return 2
+            if (/slide\.(?:active|prev)/iu.test(marker)) return 3
+            if (/^--(?:bg|primary)$/iu.test(marker)) return 4
+            return 10
+          }
+          markers = markers
+            .map((marker, index) => ({ marker, index, priority: priority(marker) }))
+            .sort((left, right) => left.priority - right.priority || left.index - right.index)
+            .slice(0, 10)
+            .map(({ marker }) => marker)
+        }
+        if (markers.length >= 2 && stableJson(markers) !== stableJson(args.required_markers)) {
+          nextArgs.required_markers = markers
+          changed = true
+        }
+      }
+      if (!changed) return call
+      repairs.push({ callId: call.id, toAction: 'record_reference_style' })
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          arguments: JSON.stringify(nextArgs),
+        },
+      }
+    }
+    if (phase === 'html_artifact' && htmlArtifactRepair && fromTool === 'edit_file') {
+      const authoredPath = typeof args.path === 'string'
+        ? arenaWorkspacePathForVision(args.path)
+        : ''
+      if (authoredPath === htmlArtifactRepair.path) return call
+      repairs.push({ callId: call.id, toAction: 'edit_file' })
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          arguments: JSON.stringify({ ...args, path: htmlArtifactRepair.path }),
+        },
+      }
+    }
+    if (phase === 'html_artifact' && fromTool === 'write_file') {
+      const aliasPath = typeof args.file === 'string' ? args.file.trim() : ''
+      const authoredPath = typeof args.path === 'string' ? args.path.trim() : ''
+      if (typeof args.content !== 'string' || !/<html\b[\s\S]*<\/html\s*>/iu.test(args.content)) return call
+      const rest = { ...args }
+      let changed = false
+      if (!authoredPath) {
+        rest.path = aliasPath || canonicalPath?.trim() || 'presentation.html'
+        delete rest.file
+        changed = true
+      }
+      const citationRepair = repairVisibleRetrievedCitationUrl(args.content, retrievedCitationUrls ?? [])
+      if (citationRepair !== args.content) {
+        rest.content = citationRepair
+        changed = true
+      }
+      if (!changed) return call
+      repairs.push({ callId: call.id, toAction: 'write_file' })
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          arguments: JSON.stringify(rest),
+        },
+      }
+    }
+    if (referenceInspection && referenceContract) {
+      const suffixPath = canonicalPath
+        ? canonicalPath.replace(/\.html?$/iu, '') + (
+          phase === 'reference_cover_inspection'
+            ? '-reference-cover.png'
+            : phase === 'reference_closing_inspection'
+              ? '-reference-closing.png'
+              : '.png'
+        )
+        : 'visual-verification.png'
+      const expectedPath = currentScreenshotPath ?? suffixPath
+      const expectedPrompt = referenceVisualInspectionPrompt(referenceContract, phase)
+      if (
+        fromTool === 'inspect_image'
+        && typeof args.path === 'string'
+        && arenaWorkspacePathForVision(args.path) === arenaWorkspacePathForVision(expectedPath)
+        && args.prompt === expectedPrompt
+      ) return call
+      repairs.push({
+        callId: call.id,
+        ...(fromTool !== 'inspect_image' ? { fromTool } : {}),
+        toAction: 'inspect_image',
+      })
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          name: 'inspect_image',
+          arguments: JSON.stringify({ path: expectedPath, prompt: expectedPrompt }),
+        },
+      }
+    }
+    let nextArgs: Record<string, unknown> | undefined
+    if (phase === 'browser_open' && canonicalPath) {
+      if (
+        fromTool !== 'browser'
+        || fromAction !== 'open'
+        || typeof args.path !== 'string'
+        || arenaWorkspacePathForVision(args.path) !== canonicalPath
+      ) {
+        const viewport = referenceContract?.contract.viewport ?? { width: 1440, height: 900 }
+        nextArgs = { action: 'open', path: canonicalPath, width: viewport.width, height: viewport.height }
+      }
+    } else if (phase === 'navigation_check') {
+      const forwardPress = fromAction === 'press'
+        && ['arrowright', 'pagedown'].includes(String(args.key || '').trim().toLowerCase())
+      if (fromTool !== 'browser' || !forwardPress) {
+        nextArgs = { action: 'press', key: 'ArrowRight' }
+      }
+    } else if (phase === 'reference_closing_navigation') {
+      if (fromTool !== 'browser' || fromAction !== 'press' || String(args.key || '').trim().toLowerCase() !== 'end') {
+        nextArgs = { action: 'press', key: 'End' }
+      }
+    } else if (['reference_cover_screenshot', 'browser_screenshot', 'reference_closing_screenshot'].includes(phase)) {
+      const requestedPath = typeof args.screenshot_path === 'string'
+        ? args.screenshot_path
+        : typeof args.path === 'string' ? args.path : ''
+      const suffix = phase === 'reference_cover_screenshot'
+        ? '-reference-cover.png'
+        : phase === 'reference_closing_screenshot'
+          ? '-reference-closing.png'
+          : '.png'
+      const screenshotPath = canonicalPath
+        ? canonicalPath.replace(/\.html?$/iu, '') + suffix
+        : phase === 'reference_cover_screenshot'
+          ? 'reference-cover.png'
+          : phase === 'reference_closing_screenshot'
+            ? 'reference-closing.png'
+            : 'visual-verification.png'
+      if (
+        fromTool !== 'browser'
+        || fromAction !== 'screenshot'
+        || arenaWorkspacePathForVision(requestedPath) !== arenaWorkspacePathForVision(screenshotPath)
+      ) {
+        nextArgs = { action: 'screenshot', screenshot_path: screenshotPath }
+      }
+    }
+    if (!nextArgs) return call
+    repairs.push({
+      callId: call.id,
+      ...(fromTool !== 'browser' ? { fromTool } : {}),
+      ...(fromAction ? { fromAction } : {}),
+      toAction: String(nextArgs.action),
+    })
+    return {
+      ...call,
+      function: { ...call.function, name: 'browser', arguments: JSON.stringify(nextArgs) },
+    }
+  })
+  return { toolCalls: repaired, repairs }
+}
+
+function referenceVisualInspectionPrompt(
+  reference: DurableReferenceStyleContract,
+  phase: VisualWebArtifactWorkflowPhase,
+): string {
+  const contract = reference.contract
+  const stage = phase === 'reference_cover_inspection'
+    ? 'cover slide'
+    : phase === 'reference_closing_inspection'
+      ? 'closing/source slide'
+      : 'representative content slide'
+  const prefix = `REFERENCE FIDELITY check — ${stage}. Compare visible screenshot geometry and styling with these source-grounded StyleContract keys: `
+  const suffix = '. Audit render integrity (clipping, overlap, contrast, spacing, readability) and reference fidelity (palette, typography, composition, components, decoration, navigation chrome). Browser snapshot evidence is authoritative for exact text/control state; ignore OCR or pagination semantics. PASS: output exactly these two lines only when both audits pass:\nNO DEFECTS\nREFERENCE MATCH\nFAIL: output 1–3 concise visible defects or mismatches and neither pass line.'
+  const projection = referenceInspectionContractProjection(
+    contract,
+    reference.sourceProfile,
+    phase,
+    Math.max(0, REFERENCE_INSPECTION_PROMPT_MAX_CHARACTERS - prefix.length - suffix.length),
+  )
+  return `${prefix}${projection}${suffix}`
+}
+
+export function visualWebArtifactRequiredToolNames(
   gap: VisualWebArtifactCompletionGap,
 ): ReadonlySet<string> | undefined {
   const phase = nextVisualWebArtifactPhase(gap)
   switch (phase) {
     case 'web_research': return new Set(['web_search', 'web_fetch', 'fetch_page'])
-    case 'html_artifact': return new Set(['write_file'])
+    case 'reference_acquisition': return new Set(['fetch_page'])
+    case 'reference_contract': return new Set(['record_reference_style'])
+    case 'html_artifact': return new Set([gap.htmlArtifactRepair ? 'edit_file' : 'write_file'])
+    case 'reference_source_check': return new Set(['verify_reference_style'])
+    case 'reference_implementation': return new Set(['edit_file'])
     case 'website_preview': return new Set(['start_process', 'build_and_start'])
     case 'browser_open':
+    case 'reference_cover_screenshot':
     case 'navigation_check':
-    case 'browser_screenshot': return new Set(['browser'])
-    case 'visual_inspection': return new Set(['inspect_image'])
+    case 'browser_screenshot':
+    case 'reference_closing_navigation':
+    case 'reference_closing_screenshot': return new Set(['browser'])
+    case 'reference_cover_inspection':
+    case 'visual_inspection':
+    case 'reference_closing_inspection': return new Set(['inspect_image'])
     case 'visual_inspection_pass': return new Set(['edit_file'])
     case 'present_file': return new Set(['present_file'])
     default: return undefined
   }
 }
 
-function visualWebArtifactPhaseInstruction(
+export function visualWebArtifactPhaseInstruction(
   gap: VisualWebArtifactCompletionGap | undefined,
+  slideCount = DEFAULT_VISUAL_WEB_SLIDE_COUNT,
+  referenceRequest?: VisualStyleReferenceRequest,
 ): string {
+  const htmlBudget = exactReferenceHtmlBudgetForSlideCount(slideCount)
   switch (nextVisualWebArtifactPhase(gap)) {
     case 'web_research': return 'issue one bounded parallel batch of at most three complementary web_search calls'
-    case 'html_artifact': return 'write the one complete canonical self-contained HTML presentation using exact retrieved source URLs'
+    case 'reference_acquisition': {
+      const continuation = gap?.referenceContinuation
+      const preferredSource = referenceRequest?.urls
+        .map(preferredConcreteReferenceSourceUrl)
+        .find((url): url is string => Boolean(url))
+      if (continuation) {
+        return `continue the incomplete concrete reference source with fetch_page from ${JSON.stringify(continuation.url)}, format ${continuation.format}, chunkIndex ${continuation.nextChunkIndex}${continuation.totalChunks === undefined ? '' : ` of ${continuation.totalChunks}`}; do not restart at chunk 0 or change URL/format`
+      }
+      return `retrieve the concrete style-bearing reference source now with fetch_page format raw${preferredSource ? ` from ${JSON.stringify(preferredSource)}` : ' on its concrete design.md/template.json/template.html URL'}, chunkIndex 0. Whenever hasMore is true, continue the same URL and raw format with the exact next chunkIndex. A GitHub directory listing is not the design; do not infer a style from the repository or template name`
+    }
+    case 'reference_contract': return 'call record_reference_style once with an exact source-grounded compact contract: one CSS color token per colors item (up to 12 when the source defines a larger palette), one actual family per fonts item, one literal selector/variable/layout identifier per required_markers item, plus layout grammar, components, signature, forbidden substitutions, and the reference viewport; keep prose descriptions out of token fields'
+    case 'html_artifact': {
+      const repair = gap?.htmlArtifactRepair
+      if (repair) {
+        const delta = Math.abs(repair.actualSlideCount - repair.expectedSlideCount)
+        const correction = repair.actualSlideCount > repair.expectedSlideCount
+          ? `delete exactly ${delta} surplus top-level .slide element${delta === 1 ? '' : 's'} (an agenda counts as content), choosing redundant content rather than the cover or closing slide`
+          : `add exactly ${delta} missing top-level content .slide element${delta === 1 ? '' : 's'} by reusing one existing reference layout`
+        return `repair the existing complete HTML at ${JSON.stringify(repair.path)} with exactly one targeted edit_file call; do not regenerate or overwrite the document. The only canonical gap is: ${repair.canonicalGap} ${correction}. Match one exact unique HTML block with old_text and replace or remove it with new_text, then count the literal top-level rendered .slide elements; preserve the reference CSS, required DOM anchors, navigation, citations, and all other current bytes.`
+      }
+      const structure = referenceInteriorStructureProjection(gap?.referenceContract)
+      return gap?.referenceContract?.contract.strictness === 'exact'
+        ? `write the one complete canonical self-contained closed minified ${slideCount}-slide HTML now by calling write_file: ${visualWebSlideCompositionInstruction(slideCount)} Do not search again or add new facts; stay near ${htmlBudget.targetBytes.toLocaleString('en-US')} UTF-8 bytes while preserving reference fidelity and the user's explicit page count; retain required template variables, structural selectors, navigation chrome, cover/content/closing geometry, decorations, interaction, and task-required exact retrieved source URLs; minify whitespace but copy exact numeric font sizes, gaps, padding, grid rows, and letter-spacing without shrinking them; omit comments, whitespace, unused layout/demo CSS, and optional variants; shorten body copy and visible source labels, with at most two or three short content blocks per slide; never split it into part files or continue a truncated call.${structure ? ` For every interior reference layout you choose, preserve all of its exact DOM anchor counts: ${structure}. Reuse those required elements as visible semantic color carriers instead of appending duplicate children beyond the listed counts.` : ''}`
+        : 'write the one complete canonical self-contained HTML presentation using exact retrieved source URLs'
+    }
+    case 'reference_source_check': return 'call verify_reference_style exactly once on the canonical HTML before any further edit or preview; do not issue another edit until this fresh result identifies remaining violations'
+    case 'reference_implementation': return `apply one coherent targeted edit covering every color, font, marker, avoid, and source declaration violation reported by the latest verify_reference_style result; fix the full current list rather than only its first item, preferably with one compact exact CSS/DOM replacement; preserve exact numeric font sizes, gaps, padding, rows, and letter-spacing instead of shrinking them; do not weaken or replace the StyleContract. ${referenceVerificationRepairInstruction(gap?.referenceVerification, gap?.referenceContract)}`
     case 'website_preview': return 'start one managed Website preview for the canonical HTML'
-    case 'browser_open': return 'open the canonical HTML once in Browser at the desktop viewport'
-    case 'navigation_check': return 'perform exactly one forward Browser click or keypress and verify the changed slide state'
-    case 'browser_screenshot': return 'save exactly one screenshot of the current post-navigation Browser state'
-    case 'visual_inspection': return 'inspect that exact current screenshot and request exactly NO DEFECTS or at most three concrete defects'
-    case 'visual_inspection_pass': return 'apply one targeted edit for the concrete visual defects already reported'
+    case 'browser_open': return `open the canonical HTML once in Browser at ${gap?.referenceContract ? `${gap.referenceContract.contract.viewport.width}×${gap.referenceContract.contract.viewport.height}` : 'the desktop viewport'}`
+    case 'reference_cover_screenshot': return 'save the untouched cover state to the required reference-cover screenshot path before navigating'
+    case 'reference_cover_inspection': return 'inspect the exact cover screenshot against the durable StyleContract; request exactly NO DEFECTS then REFERENCE MATCH on two lines only when both render health and fidelity pass'
+    case 'navigation_check': return 'press ArrowRight exactly once and verify the changed slide state; do not click navigation controls because pointer hover would contaminate the deterministic screenshot'
+    case 'browser_screenshot': return 'save exactly one screenshot of the current post-navigation representative-content state'
+    case 'visual_inspection': return gap?.referenceContract
+      ? 'inspect that exact representative-content screenshot against the durable StyleContract; request exactly NO DEFECTS then REFERENCE MATCH on two lines only when both checks pass'
+      : 'inspect that exact current screenshot and request exactly NO DEFECTS or at most three concrete defects'
+    case 'visual_inspection_pass': return 'apply one targeted edit for the concrete render-health or reference-fidelity defects already reported'
+    case 'reference_closing_navigation': return 'press End exactly once and verify that the Browser changed to the closing/source slide'
+    case 'reference_closing_screenshot': return 'save exactly one screenshot of the current closing/source slide state'
+    case 'reference_closing_inspection': return 'inspect the exact closing/source screenshot against the durable StyleContract; request exactly NO DEFECTS then REFERENCE MATCH on two lines only when both checks pass'
     case 'present_file': return 'call present_file exactly once for the verified canonical HTML'
     default: return 'continue the next missing durable phase'
   }
@@ -5321,22 +8297,59 @@ export function visualArtifactDefectRepairPhase(
     && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
   )).at(-1)
   const boundary = latestMutation?.resultMessageIndex ?? Number.NEGATIVE_INFINITY
-  const inspection = occurrences.filter((occurrence) => (
-    occurrence.resultMessageIndex > boundary
-    && isConcreteVisualDefectInspection(occurrence)
-  )).at(-1)
-  if (!inspection) return undefined
-  const inspectedPath = arenaWorkspacePathForVision(String(inspection.call.arguments.path || ''))
-  if (!inspectedPath || inspectedPath.startsWith('uploads/')) return undefined
-  const screenshot = occurrences.filter(({ call, resultMessageIndex }) => (
-    call.name === 'browser'
-    && call.arguments.action === 'screenshot'
-    && resultMessageIndex > boundary
-    && resultMessageIndex < inspection.resultMessageIndex
-    && arenaWorkspacePathForVision(String(
-      call.arguments.screenshot_path || call.arguments.path || 'browser-screenshot.png',
-    )) === inspectedPath
-  )).at(-1)
+  // A later audit of the same screenshot path supersedes an earlier defect;
+  // likewise, a later deterministic pass for one render phase supersedes its
+  // prior mismatch. Without phase/path-local supersession, recovered evidence
+  // could be complete while this repair router kept forcing read/edit forever.
+  const latestInspectionByPath = new Map<string, SuccessfulTaskToolOccurrence>()
+  const latestRenderedScreenshotByPhase = new Map<string, SuccessfulTaskToolOccurrence>()
+  for (const occurrence of occurrences) {
+    if (occurrence.resultMessageIndex <= boundary) continue
+    if (occurrence.call.name === 'inspect_image') {
+      const prompt = typeof occurrence.call.arguments.prompt === 'string'
+        ? occurrence.call.arguments.prompt
+        : ''
+      const path = typeof occurrence.call.arguments.path === 'string'
+        ? arenaWorkspacePathForVision(occurrence.call.arguments.path)
+        : ''
+      if (
+        path
+        && !path.startsWith('uploads/')
+        && /\bNO\s+DEFECTS\b/iu.test(prompt)
+        && /\bdefects?\b|缺陷|问题/iu.test(prompt)
+      ) latestInspectionByPath.set(path, occurrence)
+    }
+    if (occurrence.call.name === 'browser' && occurrence.call.arguments.action === 'screenshot') {
+      const phase = structuredToolResult(occurrence.result)?.render_phase
+      if (typeof phase === 'string') latestRenderedScreenshotByPhase.set(phase, occurrence)
+    }
+  }
+  const inspection = [...latestInspectionByPath.values()]
+    .filter(isConcreteVisualDefectInspection)
+    .sort((left, right) => left.resultMessageIndex - right.resultMessageIndex)
+    .at(-1)
+  const renderedMismatch = [...latestRenderedScreenshotByPhase.values()]
+    .filter((occurrence) => structuredToolResult(occurrence.result)?.render_fidelity === 'mismatch')
+    .sort((left, right) => left.resultMessageIndex - right.resultMessageIndex)
+    .at(-1)
+  if (!inspection && !renderedMismatch) return undefined
+  const inspectedPath = inspection
+    ? arenaWorkspacePathForVision(String(inspection.call.arguments.path || ''))
+    : undefined
+  if (inspection && (!inspectedPath || inspectedPath.startsWith('uploads/'))) return undefined
+  const screenshot = renderedMismatch && (
+    !inspection || renderedMismatch.resultMessageIndex > inspection.resultMessageIndex
+  )
+    ? renderedMismatch
+    : occurrences.filter(({ call, resultMessageIndex }) => (
+      call.name === 'browser'
+      && call.arguments.action === 'screenshot'
+      && resultMessageIndex > boundary
+      && resultMessageIndex < (inspection?.resultMessageIndex ?? Number.POSITIVE_INFINITY)
+      && arenaWorkspacePathForVision(String(
+        call.arguments.screenshot_path || call.arguments.path || 'browser-screenshot.png',
+      )) === inspectedPath
+    )).at(-1)
   if (!screenshot) return undefined
   const latestBrowserOpen = occurrences.filter(({ call, resultMessageIndex }) => (
     call.name === 'browser'
@@ -5345,11 +8358,43 @@ export function visualArtifactDefectRepairPhase(
     && resultMessageIndex < screenshot.resultMessageIndex
   )).at(-1)
   if (!latestBrowserOpen || !browserOpenOccurrenceTargetsCanonical(latestBrowserOpen, canonicalPath)) return undefined
+  const defectBoundary = Math.max(
+    renderedMismatch?.resultMessageIndex ?? Number.NEGATIVE_INFINITY,
+    inspection?.resultMessageIndex ?? Number.NEGATIVE_INFINITY,
+  )
   const currentReadCompleted = occurrences.some(({ call, resultMessageIndex }) => (
     call.name === 'read_file'
     && typeof call.arguments.path === 'string'
     && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
-    && resultMessageIndex > inspection.resultMessageIndex
+    && resultMessageIndex > defectBoundary
+  ))
+  return currentReadCompleted ? 'edit' : 'read'
+}
+
+export function referenceStyleArtifactRepairPhase(
+  messages: readonly ModelMessage[],
+  canonicalPath: string,
+): CanonicalArtifactRepairPhase | undefined {
+  const occurrences = successfulTaskToolOccurrences(messages)
+  const latestMutation = occurrences.filter(({ call }) => (
+    ['write_file', 'edit_file', 'apply_patch'].includes(call.name)
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+  )).at(-1)
+  const boundary = latestMutation?.resultMessageIndex ?? Number.NEGATIVE_INFINITY
+  const failedVerification = occurrences.filter(({ call, result, resultMessageIndex }) => (
+    call.name === 'verify_reference_style'
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+    && resultMessageIndex > boundary
+    && structuredToolResult(result)?.fidelity === 'mismatch'
+  )).at(-1)
+  if (!failedVerification) return undefined
+  const currentReadCompleted = occurrences.some(({ call, resultMessageIndex }) => (
+    call.name === 'read_file'
+    && typeof call.arguments.path === 'string'
+    && arenaWorkspacePathForVision(call.arguments.path) === canonicalPath
+    && resultMessageIndex > failedVerification.resultMessageIndex
   ))
   return currentReadCompleted ? 'edit' : 'read'
 }
@@ -5522,31 +8567,6 @@ function usageEventMatchesSettlement(event: SessionEvent, settlement: DurableUsa
     && data.model === settlement.model
     && stableJson(data.lastCall) === stableJson(settlement.usage)
     && stableJson(data.metering) === stableJson(settlement.metering)
-}
-
-function limitEventMatchesSettlement(event: SessionEvent, settlement: DurableUsageSettlement): boolean {
-  if (
-    event.type !== 'session.limit.reached'
-    || event.turnId !== settlement.turnId
-    || event.stepId !== settlement.stepId
-    || event.callId !== settlement.callId
-  ) return false
-  const data = event.data as Record<string, unknown>
-  return data.code === 'session_token_limit'
-}
-
-function limitAtDurableSettlement(summary: SessionSummary, settlement: DurableUsageSettlement) {
-  const current = summary.limits?.sessionTokens
-  if (!current) return undefined
-  const usedTokens = settlement.cumulativeUsageAfter.totalTokens
-  const reached = usedTokens >= current.maxTokens
-  return {
-    ...current,
-    usedTokens,
-    remainingTokens: Math.max(0, current.maxTokens - usedTokens),
-    reached,
-    ...(reached && settlement.reachedAt ? { reachedAt: settlement.reachedAt } : {}),
-  }
 }
 
 function parseArguments(raw: string): Record<string, unknown> {
@@ -5975,6 +8995,96 @@ function repeatedToolCallGuardMode(state: ConsecutiveToolCallState | undefined):
   return undefined
 }
 
+export interface VisualNoProgressObservation {
+  phase: VisualWebArtifactWorkflowPhase
+  callSignature: string
+  callNames: string[]
+  outcomeDigest: string
+  phaseAdvanced: boolean
+}
+
+export function advanceVisualNoProgressState(
+  previous: DurableVisualNoProgressState | undefined,
+  observation: VisualNoProgressObservation,
+): {
+  state?: DurableVisualNoProgressState
+  action: 'clear' | 'track' | 'recover_phase' | 'fail'
+} {
+  if (observation.phaseAdvanced) return { action: 'clear' }
+  const validPrevious = previous?.schemaVersion === 1
+    && typeof previous.phase === 'string'
+    && typeof previous.callSignature === 'string'
+    && Array.isArray(previous.callNames)
+    && typeof previous.outcomeDigest === 'string'
+    && Number.isInteger(previous.consecutiveCount)
+    && previous.consecutiveCount > 0
+    && typeof previous.recoveryAttempted === 'boolean'
+    ? previous
+    : undefined
+  const sameOutcome = validPrevious?.phase === observation.phase
+    && validPrevious.callSignature === observation.callSignature
+    && validPrevious.outcomeDigest === observation.outcomeDigest
+  const state: DurableVisualNoProgressState = {
+    schemaVersion: 1,
+    phase: observation.phase,
+    callSignature: observation.callSignature,
+    callNames: [...observation.callNames],
+    outcomeDigest: observation.outcomeDigest,
+    consecutiveCount: sameOutcome ? validPrevious.consecutiveCount + 1 : 1,
+    recoveryAttempted: sameOutcome ? validPrevious.recoveryAttempted : false,
+  }
+  if (sameOutcome && validPrevious.recoveryAttempted) return { state, action: 'fail' }
+  const recoveryLimit = observation.phase === 'html_artifact'
+    ? VISUAL_HTML_ARTIFACT_NO_PROGRESS_OUTCOME_LIMIT
+    : VISUAL_NO_PROGRESS_IDENTICAL_OUTCOME_LIMIT
+  if (state.consecutiveCount >= recoveryLimit) {
+    state.recoveryAttempted = true
+    return { state, action: 'recover_phase' }
+  }
+  return { state, action: 'track' }
+}
+
+export function visualToolCallSignature(
+  calls: readonly ToolCallRecord[],
+  phase?: VisualWebArtifactWorkflowPhase,
+): string {
+  return createHash('sha256').update(stableJson(calls.map((call) => ({
+    name: call.name,
+    arguments: phase === 'html_artifact' && call.name === 'write_file'
+      ? { path: call.arguments.path }
+      : call.arguments,
+  })))).digest('hex')
+}
+
+export function visualToolOutcomeDigest(
+  messages: readonly ModelMessage[],
+  phase?: VisualWebArtifactWorkflowPhase,
+): string {
+  const outcomes = messages.map((message) => {
+    let content = message.content
+    try {
+      const parsed = JSON.parse(String(message.content ?? '')) as unknown
+      if (phase === 'html_artifact' && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const payload = parsed as Record<string, unknown>
+        content = stableJson({
+          status: payload.status,
+          path: payload.path,
+          canonical_html: payload.canonical_html,
+          canonical_gap: payload.canonical_gap,
+          error: payload.error ?? payload.message,
+          not_executed: payload.not_executed,
+        })
+      } else {
+        content = stableJson(parsed)
+      }
+    } catch {
+      // Plain text remains byte-sensitive.
+    }
+    return { content, status: message.tool_result_status }
+  })
+  return createHash('sha256').update(stableJson(outcomes)).digest('hex')
+}
+
 function toolExecutionResultSignature(result: ToolExecutionResult): string {
   let normalizedContent = result.content
   try {
@@ -6019,7 +9129,6 @@ function displayModelName(model: string): string {
     .join(' ')
 }
 
-const WEB_CITATION_REPAIR_PREFIX = '[Harness source-integrity correction]'
 const MAX_WEB_CITATION_RECOVERIES = 1
 const MAX_VISUAL_WEB_ARTIFACT_RECOVERIES = 2
 const WEB_CITATION_BUFFER_MAX_BYTES = 64_000
@@ -6047,10 +9156,56 @@ function canonicalCitationUrl(raw: string): string | undefined {
   }
 }
 
+const CITATION_URL_OPENERS = new Set(['(', '（', '“', '‘', '「', '『', '《', '【'])
+const CITATION_URL_CLOSER_TO_OPENER = new Map([
+  [')', '('],
+  ['）', '（'],
+  ['”', '“'],
+  ['’', '‘'],
+  ['」', '「'],
+  ['』', '『'],
+  ['》', '《'],
+  ['】', '【'],
+])
+const CITATION_URL_SENTENCE_BOUNDARIES = new Set(['，', '。', '；', '：', '！', '？', '、'])
+
+/**
+ * Stop a text-extracted URL at prose/Markdown delimiters without destroying
+ * balanced parentheses that legitimately belong to the URL path. This also
+ * handles mixed closers such as `](url)）`, which previously became
+ * `url)%EF%BC%89` and was falsely rejected as an unsupported citation.
+ */
+function trimCitationUrlCandidate(raw: string): string {
+  const depths = new Map<string, number>()
+  let end = raw.length
+  for (let index = 0; index < raw.length;) {
+    const character = String.fromCodePoint(raw.codePointAt(index)!)
+    if (CITATION_URL_SENTENCE_BOUNDARIES.has(character)) {
+      end = index
+      break
+    }
+    if (CITATION_URL_OPENERS.has(character)) {
+      depths.set(character, (depths.get(character) ?? 0) + 1)
+    } else {
+      const opener = CITATION_URL_CLOSER_TO_OPENER.get(character)
+      if (opener) {
+        const depth = depths.get(opener) ?? 0
+        if (depth === 0) {
+          end = index
+          break
+        }
+        depths.set(opener, depth - 1)
+      }
+    }
+    index += character.length
+  }
+  return raw.slice(0, end).replace(/[.,;:!?]+$/u, '')
+}
+
 function urlsInText(value: string): string[] {
   const urls: string[] = []
   for (const match of value.matchAll(/https?:\/\/[^\s<>{}\[\]"']+/giu)) {
-    const trimmed = match[0].replace(/[),.;:!?]+$/u, '')
+    const trimmed = trimCitationUrlCandidate(match[0])
     const canonical = canonicalCitationUrl(trimmed)
     if (canonical) urls.push(canonical)
   }
@@ -6063,7 +9218,7 @@ function currentTaskMessages(messages: ModelMessage[]): ModelMessage[] {
     const message = messages[index]
     if (message.role !== 'user' || typeof message.content !== 'string') continue
     const authored = arenaUserAuthoredText(message)
-    if (authored.startsWith('[Harness operator action: Continue]') || authored.startsWith(WEB_CITATION_REPAIR_PREFIX)) continue
+    if (isHarnessTaskContinuationContent(authored)) continue
     start = index
     break
   }
@@ -6105,11 +9260,15 @@ function webResearchCitationEvidence(messages: ModelMessage[]): WebResearchCitat
     }
   }
   const sourceUrls = new Set<string>()
+  const referenceUrls = visualWebStyleReferenceRequest(taskMessages)?.urls ?? []
   for (const message of taskMessages) {
     if (message.role !== 'tool' || !message.tool_call_id || message.tool_result_status === 'failed') continue
     const call = toolNames.get(message.tool_call_id)
     if (!call) continue
-    for (const url of retrievedResearchSourceUrls(call, message)) sourceUrls.add(url)
+    for (const url of retrievedResearchSourceUrls(call, message)) {
+      if (referenceUrls.some((referenceUrl) => referenceUrlsAreRelated(referenceUrl, url))) continue
+      sourceUrls.add(url)
+    }
   }
   const allowedUrls = new Set(sourceUrls)
   for (const message of taskMessages) {
@@ -6335,7 +9494,7 @@ export function exactFinalOutputRequest(messages: ModelMessage[]): string | unde
     const message = messages[index]
     if (message.role !== 'user' || typeof message.content !== 'string') continue
     const content = arenaUserAuthoredText(message)
-    if (content.startsWith('[Harness operator action: Continue]')) continue
+    if (isHarnessTaskContinuationContent(content)) continue
     if (EXACT_FINAL_OUTPUT_PATTERNS.some((pattern) => pattern.test(content))) return content
     return undefined
   }
@@ -6392,7 +9551,7 @@ export function assertAgentModelFinishReason(result: Pick<ModelResult, 'finishRe
 }
 
 export function estimateModelMessageSurfaceTokens(messages: ModelMessage[]): number {
-  return estimateSerializedTokens(JSON.stringify(messages.map(providerVisibleMessage)))
+  return estimateSerializedTokens(JSON.stringify(projectProviderMessages(messages)))
 }
 
 export function estimateSystemPromptSurfaceTokens(systemPrompt: string): number {
@@ -6412,7 +9571,7 @@ export function estimateProviderContextTokens(
   return estimateSerializedTokens(JSON.stringify({
     messages: [
       { role: 'system', content: effectiveSystemPrompt },
-      ...messages.map(providerVisibleMessage),
+      ...projectProviderMessages(messages),
     ],
     ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
   }))
@@ -6432,7 +9591,7 @@ function compactionRequestJson(messages: ModelMessage[]): string {
       { role: 'system', content: COMPACTION_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: `Create the checkpoint from these earlier conversation records:\n${JSON.stringify(messages.map(providerVisibleMessage))}`,
+        content: `Create the checkpoint from these earlier conversation records:\n${JSON.stringify(projectProviderMessages(messages))}`,
       },
     ],
   })
@@ -6469,23 +9628,6 @@ export function projectContextPressureTokens(
     )
   }
   return estimateProviderContextTokens(messages, tools, effectiveSystemPrompt)
-}
-
-function providerVisibleMessage(message: ModelMessage): Record<string, unknown> {
-  const {
-    tool_result_status: _privateStatus,
-    tool_content_parts: toolContentParts,
-    arena_system_messages: _privateArenaSystemMessages,
-    ...provider
-  } = message
-  if (!toolContentParts?.length) return provider
-  return {
-    ...provider,
-    content: toolContentParts.map((part) => ({
-      type: 'image_url',
-      image_url: { url: `data:${part.mediaType};base64,${part.data}` },
-    })),
-  }
 }
 
 /**
@@ -6536,6 +9678,63 @@ export function compactHistoricalToolPayloads(
       ...unconsumedReadFilePaginationCallIds(messages, lastAssistantIndex),
       ...unconsumedListFilesPaginationCallIds(messages, lastAssistantIndex),
     ])
+  const activeMessages = activeTaskMessageSlice(messages)
+  const pendingReferenceRequest = visualWebStyleReferenceRequest(messages)
+  const durableReferenceContract = pendingReferenceRequest
+    ? latestSuccessfulReferenceStyleContract(activeMessages)
+    : undefined
+  const protectedReferenceEvidenceCalls = new Set<string>()
+  const protectedReferenceContractCalls = new Set<string>()
+  for (const message of activeMessages) {
+    if (message.role !== 'assistant') continue
+    for (const call of message.tool_calls ?? []) {
+      if (call.function.name === 'record_reference_style') {
+        // A successful record result is the only durable carrier for the
+        // server-derived contract provenance and exact source profile after
+        // the much larger raw reference body is compacted. Its schema and
+        // source-profile extractor are independently bounded, so retain this
+        // small semantic checkpoint verbatim under context pressure.
+        protectedReferenceContractCalls.add(call.id)
+      }
+    }
+  }
+  const canonicalHtmlAlreadyWritten = durableReferenceContract?.contract.strictness === 'exact'
+    && successfulTaskToolOccurrences(activeMessages).some((occurrence) => (
+      isDurableCanonicalHtmlWrite(activeMessages, occurrence)
+    ))
+  if (durableReferenceContract?.contract.strictness === 'exact' && !canonicalHtmlAlreadyWritten) {
+    const evidence = findReferenceStyleEvidence(
+      activeMessages,
+      [durableReferenceContract.provenance.resolvedUrl],
+    )
+    if (
+      evidence
+      && evidence.bytes === durableReferenceContract.provenance.evidenceBytes
+      && evidence.sha256.toLowerCase() === durableReferenceContract.provenance.evidenceSha256.toLowerCase()
+      && referenceUrlsAreRelated(evidence.resolvedUrl, durableReferenceContract.provenance.resolvedUrl)
+    ) {
+      // An exact contract is a compact verifier fingerprint, not a substitute
+      // for the concrete template while the first artifact is still being
+      // authored. Keep only the server-provenanced source that produced it;
+      // sibling design/catalog fetches remain compactable. Release the source
+      // immediately after the first successful canonical HTML write so later
+      // verification steps retain a stable, cache-friendly compact prefix.
+      for (const callId of evidence.callIds) protectedReferenceEvidenceCalls.add(callId)
+    }
+  }
+  if (pendingReferenceRequest && !durableReferenceContract) {
+    for (const message of activeMessages) {
+      if (message.role !== 'assistant') continue
+      for (const call of message.tool_calls ?? []) {
+        if (!['fetch_page', 'web_fetch'].includes(call.function.name)) continue
+        const url = parseArguments(call.function.arguments).url
+        if (
+          typeof url === 'string'
+          && pendingReferenceRequest.urls.some((referenceUrl) => referenceUrlsAreRelated(referenceUrl, url))
+        ) protectedReferenceEvidenceCalls.add(call.id)
+      }
+    }
+  }
   const successfulCalls = new Set(messages
     .map((message, index) => ({ message, index }))
     .filter(({ message, index }) => (
@@ -6566,6 +9765,11 @@ export function compactHistoricalToolPayloads(
     if (
       !laterAssistantExists
       || (message.tool_call_id !== undefined && protectedPaginationCalls.has(message.tool_call_id))
+      || (message.tool_call_id !== undefined && protectedReferenceContractCalls.has(message.tool_call_id))
+      // A failed/invalid contract attempt remains retryable. After validation,
+      // inspired/sibling evidence compacts normally; only the provenance-
+      // matched exact template stays live through its first canonical write.
+      || (message.tool_call_id !== undefined && protectedReferenceEvidenceCalls.has(message.tool_call_id))
       || typeof message.content !== 'string'
       || Buffer.byteLength(message.content) <= 6_000
     ) {

@@ -944,8 +944,8 @@ try {
   await setConversationScroll(page, 'bottom')
   await capture('timed-out-desktop')
 
-  await selectDesktopSession(sessions.limited.title)
-  await expectSessionRoute(sessions.limited.id, sessions.limited.title)
+  await selectDesktopSession(sessions.highUsage.title)
+  await expectSessionRoute(sessions.highUsage.id, sessions.highUsage.title)
   await setConversationScroll(page, 'bottom')
   await capture('token-limit-desktop')
 

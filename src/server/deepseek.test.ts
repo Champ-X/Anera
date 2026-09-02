@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DeepSeekClient } from './deepseek.js'
+import type { ModelMessage } from '../shared/types.js'
+import { DeepSeekClient, projectProviderMessages } from './deepseek.js'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -35,6 +36,44 @@ describe('DeepSeek client', () => {
     expect(submitted?.temperature).toBe(0)
     expect(submitted).not.toHaveProperty('tools')
     expect(submitted).not.toHaveProperty('tool_choice')
+  })
+
+  it('uses a stable provider tool surface without changing the caller authorization surface', async () => {
+    let submitted: Record<string, unknown> | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response([
+        'data: {"choices":[{"delta":{"content":"done"},"finish_reason":null}]}',
+        '',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }))
+    const activeTools = [{
+      type: 'function' as const,
+      function: { name: 'edit_file', description: 'Edit.', parameters: { type: 'object', properties: {} } },
+    }]
+    const providerTools = [
+      ...activeTools,
+      {
+        type: 'function' as const,
+        function: { name: 'browser', description: 'Browse.', parameters: { type: 'object', properties: {} } },
+      },
+    ]
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192 })
+
+    await client.stream({
+      messages: [{ role: 'user', content: 'Continue.' }],
+      tools: activeTools,
+      providerTools,
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })
+
+    expect(submitted).toMatchObject({ tools: providerTools, tool_choice: 'auto' })
   })
 
   it('parses CRLF SSE blocks and a final event without a blank-line terminator', async () => {
@@ -523,6 +562,78 @@ describe('DeepSeek client', () => {
     expect(JSON.stringify(submitted)).not.toContain('arena_system_messages')
   })
 
+  it('projects only record_reference_style results in the actual deterministic provider request', async () => {
+    const durableReferenceResult = referenceStyleToolResultContent()
+    const sameShapeFromAnotherTool = referenceStyleToolResultContent()
+    const messages: ModelMessage[] = [
+      { role: 'user', content: 'Follow the exact linked reference.' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'reference-call',
+            type: 'function',
+            function: { name: 'record_reference_style', arguments: '{}' },
+          },
+          {
+            id: 'unrelated-call',
+            type: 'function',
+            function: { name: 'read_file', arguments: '{}' },
+          },
+        ],
+      },
+      {
+        role: 'tool', tool_call_id: 'reference-call', content: durableReferenceResult,
+        tool_result_status: 'succeeded',
+      },
+      {
+        role: 'tool', tool_call_id: 'unrelated-call', content: sameShapeFromAnotherTool,
+        tool_result_status: 'succeeded',
+      },
+    ]
+    const durableSnapshot = structuredClone(messages)
+    const submitted: Array<Record<string, unknown>> = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return streamResponse('Reference projection accepted.')
+    }))
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+    })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await client.stream({
+        messages, tools: [], signal: new AbortController().signal,
+        onContent: () => {}, onReasoning: () => {},
+      })
+    }
+
+    const firstProviderMessages = submitted[0].messages as Array<Record<string, unknown>>
+    const secondProviderMessages = submitted[1].messages as Array<Record<string, unknown>>
+    const projectedPayload = JSON.parse(String(firstProviderMessages[2].content)) as Record<string, unknown>
+    expect(projectedPayload).not.toHaveProperty('source_profile')
+    expect(projectedPayload).not.toHaveProperty('render_profile')
+    expect(projectedPayload).toMatchObject({
+      source_profile_attestation: {
+        version: 1,
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+      render_profile_attestation: {
+        version: 1,
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        evidenceSha256: 'a'.repeat(64),
+        viewport: { width: 1440, height: 900 },
+      },
+    })
+    expect(firstProviderMessages[2].content).toBe(secondProviderMessages[2].content)
+    expect(firstProviderMessages[2].content).toBe(projectProviderMessages(messages)[2].content)
+    expect(firstProviderMessages[3].content).toBe(sameShapeFromAnotherTool)
+    expect(JSON.parse(String(firstProviderMessages[3].content))).toHaveProperty('source_profile')
+    expect(JSON.parse(String(firstProviderMessages[3].content))).toHaveProperty('render_profile')
+    expect(messages).toEqual(durableSnapshot)
+  })
+
   it('translates Arena image-data tool results into provider multimodal content', async () => {
     let submitted: Record<string, unknown> | undefined
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
@@ -859,6 +970,36 @@ describe('DeepSeek client', () => {
     expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 6, totalTokens: 16, cachedPromptTokens: 0 })
   })
 
+  it('stops continuation immediately when a length response is trapped in exact repetition', async () => {
+    const repeatedParagraph = 'Let me try the same browser action again even though it has already failed and no new evidence is available.'
+    const repeated = Array.from({ length: 40 }, () => repeatedParagraph).join('\n\n')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse(repeated))
+      .mockResolvedValueOnce(streamResponse('must not spend another provider call'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxLengthContinuations: 5,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Use the browser once, then finish.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(result).toMatchObject({
+      content: repeated,
+      finishReason: 'length',
+      modelCallCount: 1,
+      modelRequestCount: 1,
+      degenerateRepetition: true,
+    })
+  })
+
   it('keeps a partial answer truncated when bounded continuation attempts end in empty stops', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(lengthResponse('Partial prefix.'))
@@ -1093,6 +1234,64 @@ function streamResponse(content: string): Response {
     'data: [DONE]',
     '',
   ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function referenceStyleToolResultContent(): string {
+  const evidenceSha256 = 'a'.repeat(64)
+  const anchor = (selector: string) => ({
+    selector,
+    count: 1,
+    geometry: 'strict',
+    rects: [{ x: 0, y: 0, width: 1, height: 1 }],
+    styles: [{ display: 'block', position: 'relative', opacity: '1' }],
+    occlusion: [1],
+  })
+  const phase = (selector: string) => ({
+    anchors: [anchor(selector), anchor('.nav-controls')],
+    overlayProbes: [],
+  })
+  return JSON.stringify({
+    status: 'success',
+    contract: {
+      source_url: 'https://example.com/reference/template.html',
+      strictness: 'exact',
+      colors: ['#fdfae7', '#1e2bfa', '#111111'],
+      fonts: ['Inter'],
+      layout: ['cream canvas', 'diagonal cover geometry'],
+      components: ['circular navigation', 'fixed progress indicator'],
+      required_markers: ['.layout-cover', '.nav-controls'],
+      signature: 'Warm cream canvas with restrained cobalt geometry.',
+      avoid: ['dark gradient cover'],
+      viewport: { width: 1440, height: 900 },
+    },
+    provenance: {
+      resolvedUrl: 'https://example.com/reference/template.html',
+      evidenceSha256,
+      evidenceBytes: 4_096,
+    },
+    source_profile: {
+      version: 1,
+      rules: [{
+        selector: '.layout-cover',
+        declarations: [
+          { property: 'display', value: 'grid' },
+          { property: 'background', value: '#fdfae7' },
+        ],
+        requiredInDom: true,
+      }],
+      dom: [{ className: 'layout-cover', occurrences: 1, required: true }],
+    },
+    render_profile: {
+      version: 1,
+      evidenceSha256,
+      viewport: { width: 1440, height: 900 },
+      phases: {
+        cover: phase('.layout-cover'),
+        content: phase('.layout-content'),
+        closing: phase('.layout-closing'),
+      },
+    },
+  })
 }
 
 function emptyCompletionResponse(): Response {

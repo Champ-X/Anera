@@ -4889,6 +4889,8 @@ export function projectTimeline(
       const final = finalsByMessageEvent.get(String(data.messageEventId || ''))
       if (final) final.feedback = data.value === 'upvote' || data.value === 'downvote' ? data.value : null
     } else if (event.type === 'error') {
+      const legacySessionTokenLimit = data.code === 'session_token_limit' || data.category === 'session_token_limit'
+      if (legacySessionTokenLimit && !snapshot.session.limits?.sessionTokens) continue
       beginVisibleActivity()
       items.push({ kind: 'error', key: event.id, content: String(data.message || 'Run failed'), cancelled: Boolean(data.cancelled) })
     }
@@ -5105,9 +5107,12 @@ function applyEventToSummary(summary: SessionSummary, event: SessionEvent): Sess
   if (event.type === 'usage.updated' && data.usage) return {
     ...summary,
     usage: data.usage,
-    ...(data.limit ? { limits: { sessionTokens: data.limit } } : {}),
+    limits: undefined,
   }
-  if (event.type === 'session.limit.reached' && data.limit) return { ...summary, limits: { sessionTokens: data.limit } }
+  // Legacy limit events remain in the event stream for audit, but cumulative
+  // token usage is no longer an admission policy and must not recreate an
+  // obsolete blocking state during snapshot replay or SSE reconciliation.
+  if (event.type === 'session.limit.reached') return { ...summary, limits: undefined }
   return summary
 }
 

@@ -3,7 +3,6 @@ import { mkdir, stat } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import archiver from 'archiver'
 import {
-  SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
   type AgentCustomFeedbackArm,
   type ArtifactRecord,
   type PlanState,
@@ -20,7 +19,7 @@ export interface VisualFixtureSessions {
   timedOut: { id: string; title: string }
   approval: { id: string; title: string }
   hitl: { id: string; title: string }
-  limited: { id: string; title: string }
+  highUsage: { id: string; title: string }
   completed: { id: string; title: string }
   taskCompletion: { id: string; title: string }
   review: { id: string; title: string }
@@ -56,18 +55,18 @@ export async function seedVisualFixtureSessions(store: SessionStore): Promise<Vi
   const timedOut = await seedTimedOut(store)
   const approval = await seedApproval(store)
   const hitl = await seedHitl(store)
-  const limited = await seedLimited(store)
+  const highUsage = await seedHighUsage(store)
   const completed = await seedCompleted(store)
   const taskCompletion = await seedVisualTaskCompletionFixture(store)
   const review = await seedVisualTaskReviewFixture(store, 'Visual Task Review', { customFeedbackArm: 'treatment-1' })
   const coding = await seedCoding(store)
-  const historyOrder = [completed, taskCompletion, review, coding, limited, hitl, approval, timedOut, free, empty]
+  const historyOrder = [completed, taskCompletion, review, coding, highUsage, hitl, approval, timedOut, free, empty]
   for (let index = 0; index < historyOrder.length; index += 1) {
     await store.update(historyOrder[index].id, () => {}, {
       updatedAt: new Date(Date.parse('2026-08-28T00:00:00.000Z') + (historyOrder.length - index) * 1_000).toISOString(),
     })
   }
-  return { empty, free, timedOut, approval, hitl, limited, completed, taskCompletion, review, coding }
+  return { empty, free, timedOut, approval, hitl, highUsage, completed, taskCompletion, review, coding }
 }
 
 export async function seedVisualRunningFixture(store: SessionStore): Promise<VisualRunningFixture> {
@@ -703,20 +702,12 @@ async function seedApproval(store: SessionStore): Promise<{ id: string; title: s
   return { id, title }
 }
 
-async function seedLimited(store: SessionStore): Promise<{ id: string; title: string }> {
-  const title = 'Visual Token Limit'
+async function seedHighUsage(store: SessionStore): Promise<{ id: string; title: string }> {
+  const title = 'Visual High Token Usage'
   const session = await store.create()
   const id = session.summary.id
-  const turnId = 'turn_visual_token_limit'
-  const stepId = 'step_visual_token_limit'
-  const tokenLimit = {
-    maxTokens: 100_000,
-    usedTokens: 100_240,
-    remainingTokens: 0,
-    reached: true,
-    message: SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
-    reachedAt: '2026-08-28T00:00:04.000Z',
-  }
+  const turnId = 'turn_visual_high_token_usage'
+  const stepId = 'step_visual_high_token_usage'
   await store.append(id, 'turn.started', {
     content: 'Summarize the completed workspace before this long session ends.',
     attachments: [],
@@ -726,16 +717,9 @@ async function seedLimited(store: SessionStore): Promise<{ id: string; title: st
   await store.append(id, 'usage.updated', {
     usage: usage({ modelCalls: 18, toolCalls: 15, totalTokens: 100_240, estimatedCostUsd: 0.0198, durationMs: 42_312 }),
     source: 'agent',
-    limit: tokenLimit,
-  }, { turnId, stepId })
-  await store.append(id, 'session.limit.reached', {
-    code: 'session_token_limit',
-    category: 'session_token_limit',
-    message: SESSION_TOKEN_LIMIT_ERROR_MESSAGE,
-    limit: tokenLimit,
   }, { turnId, stepId })
   await store.append(id, 'assistant.final', {
-    content: 'The workspace summary is complete. Start a new chat for additional work.',
+    content: 'The workspace summary is complete. You can continue in this chat.',
     finishReason: 'stop',
   }, { turnId, stepId })
   await store.append(id, 'turn.completed', { status: 'completed' }, { turnId, stepId })
@@ -746,7 +730,6 @@ async function seedLimited(store: SessionStore): Promise<{ id: string; title: st
     state.summary.status = 'completed'
     state.summary.lastMessage = 'Summarize the completed workspace before this long session ends.'
     state.summary.usage = usage({ modelCalls: 18, toolCalls: 15, totalTokens: 100_240, estimatedCostUsd: 0.0198, durationMs: 42_312 })
-    state.summary.limits = { sessionTokens: tokenLimit }
   })
   return { id, title }
 }

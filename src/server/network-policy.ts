@@ -1,7 +1,7 @@
 import type { LookupAddress } from 'node:dns'
 import { lookup } from 'node:dns/promises'
 import { request as httpRequest, type ClientRequest, type IncomingMessage, type RequestOptions } from 'node:http'
-import { request as httpsRequest } from 'node:https'
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
 import { BlockList, isIP, type LookupFunction, type Socket } from 'node:net'
 import { Readable } from 'node:stream'
 
@@ -56,6 +56,8 @@ interface PublicFetchDependencies {
   resolveAddresses?: PublicAddressResolver
   /** Test seam for loopback integration tests; production always uses isPublicIp. */
   isAddressAllowed?: PublicAddressPredicate
+  /** Trusted process-level outbound proxy configuration; false disables it. */
+  proxyEnv?: NodeJS.ProcessEnv | false
 }
 
 function normalizedIp(address: string): string {
@@ -197,8 +199,16 @@ export function pinnedRequestOptions(
   request: Request,
   resolved: ResolvedPublicUrl,
   headers: Headers,
-): RequestOptions & { servername?: string } {
-  const options: RequestOptions & { servername?: string } = {
+): RequestOptions & {
+  servername?: string
+  autoSelectFamily?: boolean
+  autoSelectFamilyAttemptTimeout?: number
+} {
+  const options: RequestOptions & {
+    servername?: string
+    autoSelectFamily?: boolean
+    autoSelectFamilyAttemptTimeout?: number
+  } = {
     protocol: resolved.url.protocol,
     hostname: resolved.hostname,
     port: resolved.url.port || undefined,
@@ -206,6 +216,14 @@ export function pinnedRequestOptions(
     method: request.method,
     headers: Object.fromEntries(headers.entries()),
     lookup: createPinnedLookup(resolved),
+    // Node's default single-address path can stall for the entire OS connect
+    // timeout when DNS lists an unreachable IPv6 address before a healthy
+    // IPv4 address. Happy Eyeballs remains SSRF-safe here: the custom lookup
+    // can return only the already resolved and policy-admitted addresses, and
+    // verifyConnectedAddress rechecks the winning socket against that set.
+    autoSelectFamily: resolved.addresses.some(({ family }) => family === 4)
+      && resolved.addresses.some(({ family }) => family === 6),
+    autoSelectFamilyAttemptTimeout: 250,
     // Do not let a later request reuse a socket admitted under an earlier DNS
     // answer. A new connection consumes only this request's pinned set.
     agent: false,
@@ -218,12 +236,39 @@ export function pinnedRequestOptions(
   return options
 }
 
+export function pinnedHttpsProxyRequestOptions(
+  request: Request,
+  resolved: ResolvedPublicUrl,
+  headers: Headers,
+  proxyEnvironment: NodeJS.ProcessEnv,
+): ReturnType<typeof pinnedRequestOptions> {
+  if (resolved.url.protocol !== 'https:') {
+    throw new TypeError('Pinned proxy requests are supported only for HTTPS URLs')
+  }
+  const options = pinnedRequestOptions(request, resolved, headers)
+  // A CONNECT proxy must receive a concrete address from the DNS result that
+  // was already admitted by policy. Keep the original Host and TLS SNI so the
+  // destination still has to prove the identity the caller requested.
+  const pinnedAddress = resolved.addresses.find(({ family }) => family === 4)
+    ?? resolved.addresses[0]
+  options.hostname = normalizedIp(pinnedAddress.address)
+  options.headers = {
+    ...options.headers,
+    host: resolved.url.host,
+  }
+  delete options.lookup
+  options.autoSelectFamily = false
+  options.agent = new HttpsAgent({ proxyEnv: proxyEnvironment } as never)
+  return options
+}
+
 async function sendPinnedRequest(
   request: Request,
   resolved: ResolvedPublicUrl,
   body: Buffer | undefined,
   isAddressAllowed: PublicAddressPredicate,
   redirected: boolean,
+  proxyEnvironment?: NodeJS.ProcessEnv,
 ): Promise<Response> {
   const headers = new Headers(request.headers)
   // Host is always derived from the admitted URL; callers cannot decouple
@@ -232,19 +277,31 @@ async function sendPinnedRequest(
   if (body && !headers.has('content-length')) headers.set('content-length', String(body.length))
   return await new Promise<Response>((resolve, reject) => {
     const factory = resolved.url.protocol === 'https:' ? httpsRequest : httpRequest
+    const hasHttpsProxy = Boolean(
+      resolved.url.protocol === 'https:'
+      && proxyEnvironment
+      && (proxyEnvironment.HTTPS_PROXY || proxyEnvironment.https_proxy
+        || proxyEnvironment.HTTP_PROXY || proxyEnvironment.http_proxy
+        || proxyEnvironment.ALL_PROXY || proxyEnvironment.all_proxy),
+    )
+    const requestOptions = hasHttpsProxy && proxyEnvironment
+      ? pinnedHttpsProxyRequestOptions(request, resolved, headers, proxyEnvironment)
+      : pinnedRequestOptions(request, resolved, headers)
     let nodeRequest: ClientRequest
     try {
-      nodeRequest = factory(pinnedRequestOptions(request, resolved, headers), (message) => {
+      nodeRequest = factory(requestOptions, (message) => {
         resolve(responseFromMessage(message, resolved.url, redirected, request.method))
       })
     } catch (error) {
       reject(error)
       return
     }
-    nodeRequest.once('socket', (socket) => {
-      if (socket.connecting) socket.once('connect', () => verifyConnectedAddress(socket, resolved, isAddressAllowed))
-      else verifyConnectedAddress(socket, resolved, isAddressAllowed)
-    })
+    if (!hasHttpsProxy) {
+      nodeRequest.once('socket', (socket) => {
+        if (socket.connecting) socket.once('connect', () => verifyConnectedAddress(socket, resolved, isAddressAllowed))
+        else verifyConnectedAddress(socket, resolved, isAddressAllowed)
+      })
+    }
     nodeRequest.once('error', reject)
     if (body) nodeRequest.end(body)
     else nodeRequest.end()
@@ -273,6 +330,10 @@ function redirectedRequest(previous: Request, location: string, status: number):
 export function createPublicFetch(dependencies: PublicFetchDependencies = {}): typeof fetch {
   const resolveAddresses = dependencies.resolveAddresses ?? resolveSystemAddresses
   const isAddressAllowed = dependencies.isAddressAllowed ?? isPublicIp
+  const customPolicy = dependencies.resolveAddresses !== undefined || dependencies.isAddressAllowed !== undefined
+  const proxyEnvironment = dependencies.proxyEnv === false
+    ? undefined
+    : dependencies.proxyEnv ?? (customPolicy ? undefined : process.env)
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     let request = new Request(input, init)
     let redirected = false
@@ -281,7 +342,14 @@ export function createPublicFetch(dependencies: PublicFetchDependencies = {}): t
       const body = request.body && !['GET', 'HEAD'].includes(request.method)
         ? Buffer.from(await request.clone().arrayBuffer())
         : undefined
-      const response = await sendPinnedRequest(request, resolved, body, isAddressAllowed, redirected)
+      const response = await sendPinnedRequest(
+        request,
+        resolved,
+        body,
+        isAddressAllowed,
+        redirected,
+        proxyEnvironment,
+      )
       if (!REDIRECT_STATUSES.has(response.status)) return response
       if (request.redirect === 'manual') return response
       if (request.redirect === 'error') {

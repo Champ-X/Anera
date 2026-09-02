@@ -23,6 +23,13 @@ export interface StaticDeploymentSnapshot {
   contentHash: string
 }
 
+export interface StaticDeploymentSnapshotOptions {
+  /** Workspace-relative HTML entry whose verified bytes must be delivered. */
+  sourceEntryPath?: string
+  /** Derive an immutable, self-contained delivery copy of the HTML entry. */
+  transformEntryHtml?: (html: string) => string
+}
+
 interface StaticDeploymentManifest {
   schemaVersion: 'anera-static-deployment/1'
   snapshot: StaticDeploymentSnapshot
@@ -32,10 +39,11 @@ export async function createStaticDeploymentSnapshot(
   workspace: string,
   target: string,
   signal: AbortSignal,
+  options: StaticDeploymentSnapshotOptions = {},
 ): Promise<StaticDeploymentSnapshot> {
   const manifestPath = deploymentSnapshotManifestPath(target)
   await removeDeploymentManifestSidecars(target)
-  const selected = await selectStaticSource(workspace, signal)
+  const selected = await selectStaticSource(workspace, signal, options.sourceEntryPath)
   const source = resolveWorkspacePath(workspace, selected.sourceDirectory)
   await assertNoSymlinkTraversal(workspace, source)
   const files: Array<{ absolute: string; path: string; bytes: number }> = []
@@ -75,7 +83,10 @@ export async function createStaticDeploymentSnapshot(
       signal.throwIfAborted()
       const destination = resolve(target, file.path)
       await mkdir(dirname(destination), { recursive: true })
-      const content = await readFile(file.absolute)
+      let content = await readFile(file.absolute)
+      if (file.path === selected.entryPath && options.transformEntryHtml) {
+        content = Buffer.from(options.transformEntryHtml(content.toString('utf8')), 'utf8')
+      }
       if (content.length > MAX_DEPLOYMENT_FILE_BYTES) throw new Error(`Deployment file exceeds ${MAX_DEPLOYMENT_FILE_BYTES} bytes: ${file.path}`)
       copiedBytes += content.length
       if (copiedBytes > MAX_DEPLOYMENT_BYTES) throw new Error(`Deployment exceeds ${MAX_DEPLOYMENT_BYTES} bytes`)
@@ -198,7 +209,20 @@ async function removeDeploymentManifestSidecars(target: string): Promise<void> {
   ])
 }
 
-async function selectStaticSource(workspace: string, signal: AbortSignal): Promise<{ sourceDirectory: string; entryPath: string }> {
+async function selectStaticSource(
+  workspace: string,
+  signal: AbortSignal,
+  requiredEntryPath?: string,
+): Promise<{ sourceDirectory: string; entryPath: string }> {
+  if (requiredEntryPath !== undefined) {
+    signal.throwIfAborted()
+    if (!/\.html?$/iu.test(requiredEntryPath)) throw new Error('Required deployment entry must be an HTML file')
+    const requiredEntry = resolveWorkspacePath(workspace, requiredEntryPath)
+    await assertNoSymlinkTraversal(workspace, requiredEntry)
+    if (!(await stat(requiredEntry)).isFile()) throw new Error('Required deployment entry is not a file')
+    const sourceDirectory = dirname(requiredEntryPath).split(sep).join('/') || '.'
+    return { sourceDirectory, entryPath: basename(requiredEntryPath) }
+  }
   for (const sourceDirectory of ['dist', 'build', 'out']) {
     signal.throwIfAborted()
     const entry = resolveWorkspacePath(workspace, `${sourceDirectory}/index.html`)

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, resolve } from 'node:path'
-import type { ArtifactRecord, CodingRepositoryState, CodingSessionStatus, DeploymentState, ModelToolImageDataPart, PlanItem, PlanItemStatus, ProcessPortRecord, ProcessRecord, SessionEvent, SpeechProviderMetering, ToolCallRecord, WebProviderMetering, WebProviderName, WebProviderRequestMetering } from '../shared/types.js'
+import type { ArtifactRecord, CodingRepositoryState, CodingSessionStatus, DeploymentState, ModelMessage, ModelToolImageDataPart, PlanItem, PlanItemStatus, ProcessPortRecord, ProcessRecord, SessionEvent, SpeechProviderMetering, ToolCallRecord, WebProviderMetering, WebProviderName, WebProviderRequestMetering } from '../shared/types.js'
 import {
   ARENA_WORKSPACE_IGNORED_DIR_NAMES,
   ARENA_WORKSPACE_IGNORED_FILE_PATH_SUFFIXES,
@@ -22,9 +22,26 @@ import {
 import { createId } from './ids.js'
 import { fetchPublicUrl, validatePublicUrl, stripHtml } from './network-policy.js'
 import { detectCommandPort, ProcessManager, runCommand } from './process-manager.js'
+import { injectMaterializedReferenceFonts, materializeReferenceFonts } from './reference-fonts.js'
 import { findSensitiveValues } from './redaction.js'
-import type { SessionStore } from './session-store.js'
-import { imageDimensions, type VisionResult } from './vision.js'
+import {
+  contractIsGroundedInEvidence,
+  extractReferenceStyleSourceProfile,
+  findReferenceStyleEvidence,
+  latestSuccessfulReferenceStyleContract,
+  normalizeReferenceStyleContract,
+  normalizeReferenceStyleContractAgainstEvidence,
+  referenceStyleGroundingGaps,
+  verifyHtmlAgainstReferenceStyle,
+} from './reference-style.js'
+import type {
+  ReferenceFontEvidenceManifest,
+  ReferenceVisualEvidenceManifest,
+  ReferenceVisualEvidencePhase,
+  SessionStore,
+  StoredSession,
+} from './session-store.js'
+import { imageDimensions, type VisionComparisonResult, type VisionResult } from './vision.js'
 import {
   combineSpeechProviderMetering,
   normalizeSpeechAudio,
@@ -90,6 +107,12 @@ export interface ToolModelUsage {
 
 export interface VisionInspector {
   inspect(path: string, prompt: string, signal: AbortSignal): Promise<VisionResult>
+  compare?(
+    referencePath: string,
+    candidatePath: string,
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<VisionComparisonResult>
 }
 
 export type ToolHitlKind = 'ask_user' | 'propose_plan' | 'add_voice' | 'generate_image'
@@ -194,6 +217,8 @@ const ARENA_STRUCTURED_RESULT_TOOLS = new Set<string>([
   'ask_user',
   'compact',
   'fetch_page',
+  'record_reference_style',
+  'verify_reference_style',
   'generate_speech',
   'get_process_output',
   'image_search',
@@ -526,11 +551,44 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'fetch_page',
-      description: 'Retrieve a web page as Markdown. If hasMore is true, call again with the same URL and next chunkIndex.',
+      description: 'Retrieve a web page as Markdown, or preserve the original textual response body with format raw. If hasMore is true, call again with the same URL, format, and next chunkIndex.',
       parameters: objectSchema({
         url: { type: 'string' },
         chunkIndex: { type: 'integer', minimum: 0 },
+        format: { type: 'string', enum: ['markdown', 'raw'], default: 'markdown' },
       }, ['url']),
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_reference_style',
+      description: 'Record a compact, source-grounded visual StyleContract after reading the concrete reference design source. This is a durable completion boundary: copy exact colors, font families, distinctive source markers, layout grammar, components, signature, forbidden substitutions, and the reference viewport from retrieved evidence. In exact mode, colors, fonts, and markers must come from CSS rules that match the real, non-inert DOM. Ignore a custom-property value that is merely declared (including in :root) but is never consumed by a DOM-connected rule. Do not infer fields from a template name or directory listing.',
+      parameters: objectSchema({
+        source_url: { type: 'string', format: 'uri', maxLength: 2_000 },
+        strictness: { type: 'string', enum: ['exact', 'inspired'] },
+        colors: { type: 'array', minItems: 2, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 180, description: 'One exact CSS color token. In exact mode include it only when a real DOM-connected rule consumes it directly or through a referenced custom property; omit values from unused variable declarations. A short source label/description may surround it and will be normalized away.' } },
+        fonts: { type: 'array', minItems: 1, maxItems: 5, items: { type: 'string', minLength: 1, maxLength: 220, description: 'One exact font-family name consumed by a real DOM-connected rule in exact mode; weights or a short role description may follow it.' } },
+        layout: { type: 'array', minItems: 2, maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 300 } },
+        components: { type: 'array', minItems: 2, maxItems: 10, items: { type: 'string', minLength: 1, maxLength: 300 } },
+        required_markers: { type: 'array', minItems: 2, maxItems: 10, items: { type: 'string', minLength: 1, maxLength: 300, description: 'One distinctive literal selector, consumed CSS variable, or layout identifier from the source. In exact mode the selector must match a real DOM relationship; compound selectors are valid only when their identifiers occur in that relationship. A short explanation may follow it.' } },
+        signature: { type: 'string', minLength: 1, maxLength: 600 },
+        avoid: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 240 } },
+        viewport: objectSchema({
+          width: { type: 'integer', minimum: 800, maximum: 2_560 },
+          height: { type: 'integer', minimum: 450, maximum: 1_440 },
+        }, ['width', 'height']),
+      }, ['source_url', 'strictness', 'colors', 'fonts', 'layout', 'components', 'required_markers', 'signature', 'avoid', 'viewport']),
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verify_reference_style',
+      description: 'Statically verify the canonical HTML against the durable StyleContract. Returns fidelity=pass only when the required palette, typography, and distinctive source markers meet the strictness thresholds and the active CSS introduces no unapproved chromatic palette, primary font, or prohibited card-shadow treatment; otherwise returns exact missing tokens and violations for one targeted repair.',
+      parameters: objectSchema({
+        path: { type: 'string', description: 'Canonical HTML path under /home/user' },
+      }, ['path']),
     },
   },
   {
@@ -1107,8 +1165,22 @@ const ANERA_RUNTIME_LIST_FILES_DEFINITION: ToolDefinition = {
   },
 }
 
+const ANERA_RUNTIME_FETCH_PAGE_DEFINITION: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'fetch_page',
+    description: "Retrieve the text content of a web page as markdown by default. Set format to raw only when exact HTML/CSS/source text is required; raw bypasses content extraction and preserves the direct textual response body. Content may be returned in chunks. If hasMore is true, call again with the same url and format and the next chunkIndex to continue reading. PDFs are parsed up to 30 pages in markdown mode; content beyond that won't be returned.",
+    parameters: objectSchema({
+      url: { type: 'string', format: 'uri', description: 'The URL of the page to fetch' },
+      chunkIndex: { type: 'integer', minimum: 0, default: 0, description: 'Which chunk to return (0-indexed). Omit or pass 0 for the first chunk.' },
+      format: { type: 'string', enum: ['markdown', 'raw'], default: 'markdown', description: 'Use raw only to preserve exact HTML/CSS/source text from the direct response; keep the same format for every continuation chunk.' },
+    }, ['url']),
+  },
+}
+
 const ANERA_RUNTIME_TOOL_DEFINITION_OVERRIDES: Readonly<Record<string, ToolDefinition>> = {
   ...ACTIVE_TOOL_DEFINITION_OVERRIDES,
+  fetch_page: ANERA_RUNTIME_FETCH_PAGE_DEFINITION,
   list_files: ANERA_RUNTIME_LIST_FILES_DEFINITION,
   read_file: ANERA_RUNTIME_READ_FILE_DEFINITION,
 }
@@ -1128,6 +1200,9 @@ export const EXTENSION_TOOL_NAMES = [
   'inspect_image',
   'install_npm_packages',
   'list_processes',
+  'web_fetch',
+  'record_reference_style',
+  'verify_reference_style',
   'http_request',
   'browser',
   'deploy_project',
@@ -1147,6 +1222,206 @@ function requiredString(args: Record<string, unknown>, name: string): string {
   const value = args[name]
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} must be a non-empty string`)
   return value
+}
+
+function exactReferenceInspectionPhase(
+  args: Record<string, unknown>,
+  prompt: string,
+): ReferenceVisualEvidencePhase {
+  const explicit = args.phase
+  if (
+    explicit !== undefined
+    && explicit !== 'cover'
+    && explicit !== 'content'
+    && explicit !== 'closing'
+  ) {
+    throw new Error('Exact reference inspection phase must be cover, content, or closing')
+  }
+
+  const labeledStage = prompt.match(
+    /\bREFERENCE\s+FIDELITY\s+check\s*(?:—|–|-|:)\s*(cover slide|representative content slide|closing\/source slide)\b/iu,
+  )?.[1]?.toLowerCase()
+  const labeledPhase: ReferenceVisualEvidencePhase | undefined = labeledStage === 'cover slide'
+    ? 'cover'
+    : labeledStage === 'representative content slide'
+      ? 'content'
+      : labeledStage === 'closing/source slide'
+        ? 'closing'
+        : undefined
+  if (explicit && labeledPhase && explicit !== labeledPhase) {
+    throw new Error('Exact reference inspection phase conflicts with the phase named in the prompt')
+  }
+  if (explicit) return explicit
+  if (labeledPhase) return labeledPhase
+
+  // The workflow normally emits the labeled prompt above. These bounded
+  // fallbacks support concise phase-local prompts without scanning the later
+  // StyleContract projection, whose component list may mention all phases.
+  const stageWindow = prompt.slice(0, 320)
+  const inferred = new Set<ReferenceVisualEvidencePhase>()
+  if (/\b(?:exact\s+)?cover(?:[- ]state)?(?:\s+slide)?\s+screenshot\b/iu.test(stageWindow)) inferred.add('cover')
+  if (/\b(?:exact\s+)?representative[- ]content(?:\s+slide)?\s+screenshot\b/iu.test(stageWindow)) inferred.add('content')
+  if (/\b(?:exact\s+)?closing(?:\/source)?(?:\s+slide)?\s+screenshot\b/iu.test(stageWindow)) inferred.add('closing')
+  if (inferred.size !== 1) {
+    throw new Error('Exact reference inspection prompt must identify exactly one phase: cover, content, or closing')
+  }
+  return [...inferred][0]
+}
+
+function exactReferenceAttestedComparisonPrompt(
+  prompt: string,
+  typographyTextAlignAttested: boolean,
+): string {
+  return `${prompt}\n\nHarness-grounded deterministic evidence for this phase (authoritative): the candidate screenshot already passed the source-bound render-profile verifier with score 100. Every required phase DOM anchor was present and its computed style, geometry, occlusion, viewport, and private-font binding were attested. Do not claim that an attested component or decoration is missing. [ATTESTED_FACT: pagination_copy_not_a_defect] Slide totals, counter copy, and pagination labels are task content and may intentionally differ from the longer reference deck; never report their text or numbers as a defect.${typographyTextAlignAttested ? ' [ATTESTED_FACT: typography_text_align_matches] The reference and candidate computed text-align values for the visible phase typography match exactly; never report a left/center/right text-alignment mismatch.' : ''} Vision remains responsible for concrete visible raster differences such as clipping, overlap, contrast, readability, or a material reference-style mismatch that is not contradicted by those measurements.`
+}
+
+interface ExactCandidateRenderAttestation {
+  pageEpoch: number
+  artifactHash: string
+}
+
+function withVisionComparisonAccounting(
+  error: unknown,
+  result: VisionComparisonResult,
+): Error {
+  const target = error instanceof Error ? error : new Error(String(error))
+  return Object.assign(target, {
+    modelUsage: result.usage,
+    ...(result.estimatedCostUsd !== undefined ? { estimatedCostUsd: result.estimatedCostUsd } : {}),
+    modelRequestCount: result.modelRequestCount ?? result.modelCallCount ?? 1,
+    modelCallCount: result.modelCallCount ?? 1,
+  })
+}
+
+function latestExactCandidateRenderAttestation(
+  messages: readonly ModelMessage[],
+  candidatePath: string,
+  candidateSha256: string,
+  phase: ReferenceVisualEvidencePhase,
+  viewport: { width: number; height: number },
+  referenceEvidenceSha256: string,
+  referenceFontManifestSha256: string,
+): ExactCandidateRenderAttestation {
+  const calls = new Map<string, { name: string; args: Record<string, unknown> }>()
+  for (const message of messages) {
+    for (const call of message.tool_calls ?? []) {
+      let args: unknown
+      try { args = JSON.parse(call.function.arguments) } catch { continue }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) continue
+      calls.set(call.id, { name: call.function.name, args: args as Record<string, unknown> })
+    }
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== 'tool' || !message.tool_call_id || message.tool_result_status !== 'succeeded') continue
+    const call = calls.get(message.tool_call_id)
+    if (!call || call.name !== 'browser' || call.args.action !== 'screenshot') continue
+    const rawPath = typeof call.args.screenshot_path === 'string'
+      ? call.args.screenshot_path
+      : typeof call.args.path === 'string'
+        ? call.args.path
+        : 'browser-screenshot.png'
+    let screenshotPath: string
+    try { screenshotPath = arenaWorkspacePath(rawPath) } catch { continue }
+    if (screenshotPath !== candidatePath) continue
+
+    let result: unknown
+    try { result = JSON.parse(message.content ?? '') } catch { result = undefined }
+    if (!result || typeof result !== 'object' || Array.isArray(result)) continue
+    const payload = result as Record<string, unknown>
+    if (payload.status !== 'success') continue
+    const renderViewport = payload.render_viewport
+    const viewportMatches = Boolean(
+      renderViewport
+      && typeof renderViewport === 'object'
+      && !Array.isArray(renderViewport)
+      && (renderViewport as Record<string, unknown>).width === viewport.width
+      && (renderViewport as Record<string, unknown>).height === viewport.height
+    )
+    const pageEpoch = payload.render_page_epoch
+    const artifactHash = payload.render_artifact_hash
+    const screenshotSha256 = typeof payload.screenshot_sha256 === 'string'
+      ? payload.screenshot_sha256.toLowerCase()
+      : ''
+    if (
+      payload.render_fidelity !== 'pass'
+      || payload.render_score !== 100
+      || payload.render_phase !== phase
+      || !Array.isArray(payload.render_violations)
+      || payload.render_violations.length !== 0
+      || payload.render_violation_count !== 0
+      || payload.render_reference_sha256 !== referenceEvidenceSha256
+      || payload.render_font_manifest_sha256 !== referenceFontManifestSha256
+      || screenshotSha256 !== candidateSha256
+      || !viewportMatches
+      || typeof pageEpoch !== 'number'
+      || !Number.isInteger(pageEpoch)
+      || pageEpoch <= 0
+      || typeof artifactHash !== 'string'
+      || !/^[A-Za-z0-9_-]{43}$/u.test(artifactHash)
+    ) {
+      throw new Error('Latest candidate screenshot does not carry a matching exact render attestation')
+    }
+    return { pageEpoch, artifactHash }
+  }
+  throw new Error('Exact reference inspection requires a successful browser screenshot render attestation for the candidate path')
+}
+
+/**
+ * Recover the exact HTML entry only from the latest successful verifier
+ * boundary. A process root or directory listing is not authoritative for an
+ * exact-reference task: the user preview and Browser gate must both open the
+ * same App-served, font-materialized artifact.
+ */
+function verifiedExactReferenceEntryPath(state: StoredSession): string | undefined {
+  const reference = state.activeReferenceStyleContract
+  if (reference?.contract.strictness !== 'exact') return undefined
+  const fontManifestSha256 = reference.fontEvidence?.manifestSha256
+  if (!fontManifestSha256) return undefined
+
+  for (let resultIndex = state.messages.length - 1; resultIndex >= 0; resultIndex -= 1) {
+    const resultMessage = state.messages[resultIndex]
+    if (resultMessage.role !== 'tool'
+      || !resultMessage.tool_call_id
+      || resultMessage.tool_result_status !== 'succeeded') continue
+    let payload: Record<string, unknown> | undefined
+    try {
+      const parsed = JSON.parse(resultMessage.content ?? '') as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>
+      }
+    } catch {
+      continue
+    }
+    if (payload?.status !== 'success'
+      || payload.fidelity !== 'pass'
+      || payload.score !== 100
+      || payload.reference_sha256 !== reference.provenance.evidenceSha256
+      || payload.reference_font_manifest_sha256 !== fontManifestSha256
+      || typeof payload.artifact_hash !== 'string'
+      || !/^[A-Za-z0-9_-]{43}$/u.test(payload.artifact_hash)) continue
+
+    for (let callIndex = resultIndex - 1; callIndex >= 0; callIndex -= 1) {
+      const callMessage = state.messages[callIndex]
+      const call = callMessage.tool_calls?.find((candidate) => candidate.id === resultMessage.tool_call_id)
+      if (!call) continue
+      if (call.function.name !== 'verify_reference_style') break
+      let args: unknown
+      try { args = JSON.parse(call.function.arguments) } catch { break }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) break
+      const rawPath = (args as Record<string, unknown>).path
+      if (typeof rawPath !== 'string') break
+      try {
+        const path = arenaWorkspacePath(rawPath)
+        if (/\.html?$/iu.test(path) && (payload.path === undefined || payload.path === path)) return path
+      } catch {
+        // Invalid persisted paths cannot become delivery entries.
+      }
+      break
+    }
+  }
+  return undefined
 }
 
 /** Map Arena's public `/home/user` namespace onto the private Session root. */
@@ -1910,12 +2185,169 @@ export class ToolExecutor {
           const prompt = requiredString(args, 'prompt')
           const target = resolveWorkspacePath(workspace, path)
           await assertNoSymlinkTraversal(workspace, target)
+          const beforeBytes = await readFile(target)
+          const imageSha256 = createHash('sha256').update(beforeBytes).digest('hex')
+          const state = await this.store.get(context.sessionId)
+          const exactReference = state.activeReferenceStyleContract?.contract.strictness === 'exact'
+            ? state.activeReferenceStyleContract
+            : undefined
+          if (exactReference) {
+            const compare = this.vision.compare
+            if (!compare) {
+              throw new Error('Exact reference inspection requires a dual-image Vision comparison provider; single-image inspection is not an allowed fallback')
+            }
+            const manifest = exactReference.visualEvidence
+            if (!manifest) {
+              throw new Error('Exact reference inspection requires a durable reference visual evidence manifest')
+            }
+            const renderProfile = exactReference.renderProfile
+            if (!renderProfile) {
+              throw new Error('Exact reference inspection requires a durable rendered reference profile')
+            }
+            const fontEvidence = exactReference.fontEvidence
+            if (!fontEvidence) {
+              throw new Error('Exact reference inspection requires durable font evidence, including an explicit no-external-font attestation')
+            }
+            const phase = exactReferenceInspectionPhase(args, prompt)
+            const renderProfileSha256 = createHash('sha256')
+              .update(JSON.stringify(renderProfile))
+              .digest('hex')
+            const sourceEvidenceSha256 = exactReference.provenance.evidenceSha256
+            if (
+              manifest.sourceEvidenceSha256 !== sourceEvidenceSha256
+              || renderProfile.evidenceSha256 !== sourceEvidenceSha256
+              || fontEvidence.sourceEvidenceSha256 !== sourceEvidenceSha256
+            ) {
+              throw new Error('Exact reference visual/font evidence is not bound to the active source evidence SHA-256')
+            }
+            await this.store.resolveReferenceFontEvidence(context.sessionId, fontEvidence)
+            if (manifest.renderProfileSha256 !== renderProfileSha256) {
+              throw new Error('Exact reference visual evidence is not bound to the active render profile SHA-256')
+            }
+            if (
+              manifest.viewport.width !== exactReference.contract.viewport.width
+              || manifest.viewport.height !== exactReference.contract.viewport.height
+              || renderProfile.viewport.width !== manifest.viewport.width
+              || renderProfile.viewport.height !== manifest.viewport.height
+            ) {
+              throw new Error('Exact reference visual evidence viewport is not bound to the active StyleContract and render profile')
+            }
+            const renderAttestation = latestExactCandidateRenderAttestation(
+              state.messages,
+              path,
+              imageSha256,
+              phase,
+              manifest.viewport,
+              sourceEvidenceSha256,
+              fontEvidence.manifestSha256,
+            )
+            const referenceTarget = await this.store.resolveReferenceVisualEvidencePath(
+              context.sessionId,
+              manifest,
+              phase,
+            )
+            const referenceBeforeBytes = await readFile(referenceTarget)
+            const referencePngSha256 = createHash('sha256').update(referenceBeforeBytes).digest('hex')
+            const phaseEvidence = manifest.phases[phase]
+            if (referencePngSha256 !== phaseEvidence.sha256) {
+              throw new Error(`Exact ${phase} reference PNG does not match its durable manifest SHA-256`)
+            }
+            const typographyTextAlignAttested = Boolean(
+              renderProfile.phases[phase].typographyProbes?.some((probe) => (
+                typeof probe.styles['text-align'] === 'string'
+              )),
+            )
+            const comparisonPrompt = exactReferenceAttestedComparisonPrompt(
+              prompt,
+              typographyTextAlignAttested,
+            )
+            const result = await compare.call(this.vision, referenceTarget, target, comparisonPrompt, context.signal)
+            let afterBytes: Buffer
+            let referenceAfterBytes: Buffer
+            try {
+              [afterBytes, referenceAfterBytes] = await Promise.all([
+                readFile(target),
+                readFile(referenceTarget),
+              ])
+            } catch (error) {
+              throw withVisionComparisonAccounting(error, result)
+            }
+            const afterSha256 = createHash('sha256').update(afterBytes).digest('hex')
+            if (afterSha256 !== imageSha256) {
+              throw withVisionComparisonAccounting(
+                new Error('Image changed while visual comparison was running; capture and inspect one immutable screenshot again'),
+                result,
+              )
+            }
+            const referenceAfterSha256 = createHash('sha256').update(referenceAfterBytes).digest('hex')
+            if (referenceAfterSha256 !== referencePngSha256) {
+              throw withVisionComparisonAccounting(
+                new Error('Reference image changed while visual comparison was running'),
+                result,
+              )
+            }
+            if (
+              result.referenceMetadata.mime !== 'image/png'
+              || result.referenceMetadata.bytes !== referenceBeforeBytes.length
+              || result.referenceMetadata.width !== manifest.viewport.width
+              || result.referenceMetadata.height !== manifest.viewport.height
+            ) {
+              throw withVisionComparisonAccounting(
+                new Error('Vision comparison reference metadata does not match the durable reference PNG manifest'),
+                result,
+              )
+            }
+            if (
+              result.candidateMetadata.mime !== 'image/png'
+              || result.candidateMetadata.bytes !== beforeBytes.length
+              || result.candidateMetadata.width !== manifest.viewport.width
+              || result.candidateMetadata.height !== manifest.viewport.height
+            ) {
+              throw withVisionComparisonAccounting(
+                new Error('Candidate screenshot metadata does not match the exact reference viewport or captured bytes'),
+                result,
+              )
+            }
+            const comparisonDigestMaterial = {
+              version: 1,
+              candidate_screenshot_sha256: imageSha256,
+              reference_png_sha256: referencePngSha256,
+              source_evidence_sha256: sourceEvidenceSha256,
+              render_profile_sha256: renderProfileSha256,
+              manifest_sha256: manifest.manifestSha256,
+              font_manifest_sha256: fontEvidence.manifestSha256,
+              phase,
+              viewport: manifest.viewport,
+              render_page_epoch: renderAttestation.pageEpoch,
+              candidate_artifact_hash: renderAttestation.artifactHash,
+              comparison: result.content,
+            }
+            const comparisonDigest = createHash('sha256')
+              .update(JSON.stringify(comparisonDigestMaterial))
+              .digest('hex')
+            const dimensions = result.candidateMetadata.width && result.candidateMetadata.height
+              ? `${result.candidateMetadata.width}×${result.candidateMetadata.height}`
+              : 'dimensions unavailable'
+            return {
+              content: `Image metadata: ${result.candidateMetadata.mime}, ${dimensions}, ${result.candidateMetadata.bytes} bytes.\nImage evidence SHA-256: ${imageSha256}\nCandidate screenshot SHA-256: ${imageSha256}\nReference PNG SHA-256: ${referencePngSha256}\nSource evidence SHA-256: ${sourceEvidenceSha256}\nRender profile SHA-256: ${renderProfileSha256}\nReference manifest SHA-256: ${manifest.manifestSha256}\nFont manifest SHA-256: ${fontEvidence.manifestSha256}\nReference comparison phase: ${phase}\nReference viewport: ${JSON.stringify(manifest.viewport)}\nRender page epoch: ${renderAttestation.pageEpoch}\nCandidate artifact hash: ${renderAttestation.artifactHash}\nComparison digest SHA-256: ${comparisonDigest}\n\nVisual inspection:\n${result.content}\n\nEvidence note: Image 1 is the immutable reference PNG and Image 2 is the candidate screenshot. The comparison digest binds both image hashes, source evidence, render profile, visual and font manifests, phase, viewport, page epoch, candidate artifact hash, and exact Vision verdict.`,
+              isError: false,
+              modelUsage: result.usage,
+              ...(result.estimatedCostUsd !== undefined ? { estimatedCostUsd: result.estimatedCostUsd } : {}),
+              modelRequestCount: result.modelRequestCount ?? result.modelCallCount ?? 1,
+              modelCallCount: result.modelCallCount ?? 1,
+            }
+          }
           const result = await this.vision.inspect(target, prompt, context.signal)
+          const afterBytes = await readFile(target)
+          const afterSha256 = createHash('sha256').update(afterBytes).digest('hex')
+          if (afterSha256 !== imageSha256) {
+            throw new Error('Image changed while visual inspection was running; capture and inspect one immutable screenshot again')
+          }
           const dimensions = result.metadata.width && result.metadata.height
             ? `${result.metadata.width}×${result.metadata.height}`
             : 'dimensions unavailable'
           return {
-            content: `Image metadata: ${result.metadata.mime}, ${dimensions}, ${result.metadata.bytes} bytes.\n\nVisual inspection:\n${result.content}\n\nEvidence note: visual OCR is approximate. When this is a browser screenshot, the browser snapshot or action result is authoritative for exact rendered text, control state, and element refs; use this inspection for layout, color, spacing, clipping, and overlap evidence.`,
+            content: `Image metadata: ${result.metadata.mime}, ${dimensions}, ${result.metadata.bytes} bytes.\nImage evidence SHA-256: ${imageSha256}\n\nVisual inspection:\n${result.content}\n\nEvidence note: visual OCR is approximate. When this is a browser screenshot, the browser snapshot or action result is authoritative for exact rendered text, control state, and element refs; use this inspection for layout, color, spacing, clipping, and overlap evidence.`,
             isError: false,
             modelUsage: result.usage,
             ...(result.estimatedCostUsd !== undefined ? { estimatedCostUsd: result.estimatedCostUsd } : {}),
@@ -2098,6 +2530,9 @@ export class ToolExecutor {
             await assertNoSymlinkTraversal(workspace, target)
             if (!(await stat(target)).isDirectory()) throw new Error('cwd is not a directory')
           }
+          // Fail before starting a long-lived process if an exact task cannot
+          // publish its already-verified App delivery copy.
+          await this.exactReferenceWorkspacePreview(context.sessionId)
           const normalizedCommand = cwd ? command : rewriteArenaWorkspaceCommandPaths(command)
           const effectiveCommand = cwd ? `cd ${shellQuote(cwd)} && ${normalizedCommand}` : normalizedCommand
           const startedAt = Date.now()
@@ -2165,7 +2600,188 @@ export class ToolExecutor {
         case 'web_fetch':
           return await this.webFetch(requiredString(args, 'url'), typeof args.format === 'string' ? args.format : 'markdown', context.signal)
         case 'fetch_page':
-          return await this.fetchPage(requiredString(args, 'url'), typeof args.chunkIndex === 'number' ? args.chunkIndex : 0, context)
+          return await this.fetchPage(
+            requiredString(args, 'url'),
+            typeof args.chunkIndex === 'number' ? args.chunkIndex : 0,
+            typeof args.format === 'string' ? args.format : 'markdown',
+            context,
+          )
+        case 'record_reference_style': {
+          const proposedContract = normalizeReferenceStyleContract(args)
+          const state = await this.store.get(context.sessionId)
+          const evidence = findReferenceStyleEvidence(state.messages, [proposedContract.sourceUrl])
+          if (!evidence) {
+            throw new Error('No concrete style-bearing reference source was retrieved for source_url. Fetch the actual design specification or template source; a directory listing or template name is not enough.')
+          }
+          const normalization = normalizeReferenceStyleContractAgainstEvidence(proposedContract, evidence)
+          const contract = normalization.contract
+          if (!contractIsGroundedInEvidence(contract, evidence)) {
+            const gaps = referenceStyleGroundingGaps(contract, evidence)
+            const exactGapDetails = gaps
+              ? ([
+                ['colors', gaps.colors],
+                ['fonts', gaps.fonts],
+                ['markers', gaps.markers],
+              ] as const)
+                .filter(([, values]) => values.length > 0)
+                .map(([kind, values]) => `${kind}=${JSON.stringify(values)}`)
+                .join('; ')
+              : ''
+            throw new Error(exactGapDetails
+              ? `The proposed StyleContract is not grounded in the retrieved reference source. Ungrounded exact tokens: ${exactGapDetails}. Remove or replace only the listed tokens with values actually consumed by a DOM-connected CSS rule; do not retry unchanged values.`
+              : 'The proposed StyleContract is not grounded in the retrieved reference source. Use exact colors, font names, and distinctive markers that visibly occur in that source.')
+          }
+          const sourceProfile = extractReferenceStyleSourceProfile(evidence.content, contract)
+          if (contract.strictness === 'exact' && !sourceProfile) {
+            throw new Error('Exact reference verification requires a concrete template containing both usable CSS rules and their actual DOM classes or ids. Fetch the real HTML template; a prose design summary, CSS-only fragment, or link shell cannot establish exact fidelity.')
+          }
+          const materializedFonts = contract.strictness === 'exact'
+            ? await materializeReferenceFonts(
+              evidence.content,
+              context.signal,
+              this.externalFetchImpl,
+            ).catch((error) => {
+              throw new Error(`Exact reference font materialization failed: ${error instanceof Error ? error.message : String(error)}`)
+            })
+            : undefined
+          const renderBundle = contract.strictness === 'exact' && sourceProfile && materializedFonts
+            ? await this.browser.captureReferenceRenderBundle(
+              materializedFonts.rewrittenHtml,
+              sourceProfile,
+              evidence.sha256,
+              contract.viewport,
+              {
+                signal: context.signal,
+                ...(materializedFonts.manifest ? {
+                  fontCss: materializedFonts.fontCss,
+                  expectedFontFamilies: materializedFonts.familyNames,
+                } : {}),
+              },
+            ).catch((error) => {
+              throw new Error(`Exact reference verification could not establish a browser-rendered bundle: ${error instanceof Error ? error.message : String(error)}`)
+            })
+            : undefined
+          const renderProfile = renderBundle?.profile
+          const renderProfileSha256 = renderProfile
+            ? createHash('sha256').update(JSON.stringify(renderProfile)).digest('hex')
+            : undefined
+          let visualEvidence: ReferenceVisualEvidenceManifest | undefined
+          let fontEvidence: ReferenceFontEvidenceManifest | undefined
+          if (renderBundle && renderProfileSha256 && materializedFonts) {
+            try {
+              visualEvidence = await this.store.commitReferenceVisualEvidence(context.sessionId, {
+                sourceEvidenceSha256: evidence.sha256,
+                renderProfileSha256,
+                viewport: contract.viewport,
+                screenshots: renderBundle.screenshots,
+              })
+              fontEvidence = await this.store.commitReferenceFontEvidence(context.sessionId, {
+                sourceEvidenceSha256: evidence.sha256,
+                fontCss: materializedFonts.fontCss,
+                familyNames: materializedFonts.familyNames,
+                materializationManifest: materializedFonts.manifest,
+              })
+            } catch (error) {
+              throw new Error(`Exact reference evidence could not be committed: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+          await this.store.update(context.sessionId, (next) => {
+            next.activeReferenceStyleContract = {
+              contract,
+              provenance: {
+                resolvedUrl: evidence.resolvedUrl,
+                evidenceSha256: evidence.sha256,
+                evidenceBytes: evidence.bytes,
+              },
+              ...(sourceProfile ? { sourceProfile } : {}),
+              ...(renderProfile ? { renderProfile } : {}),
+              ...(visualEvidence ? { visualEvidence } : {}),
+              ...(fontEvidence ? { fontEvidence } : {}),
+            }
+            next.activeReferenceStyleEvidenceGeneration = createId('ref')
+            delete next.referenceStyleEvidenceInvalidation
+          })
+          return {
+            content: JSON.stringify({
+              status: 'success',
+              contract: {
+                source_url: contract.sourceUrl,
+                strictness: contract.strictness,
+                colors: contract.colors,
+                fonts: contract.fonts,
+                layout: contract.layout,
+                components: contract.components,
+                required_markers: contract.requiredMarkers,
+                signature: contract.signature,
+                avoid: contract.avoid,
+                viewport: contract.viewport,
+              },
+              provenance: {
+                resolvedUrl: evidence.resolvedUrl,
+                evidenceSha256: evidence.sha256,
+                evidenceBytes: evidence.bytes,
+              },
+              ...(normalization.omittedVisuallyInertColors.length > 0 ? {
+                normalization: {
+                  omitted_visually_inert_colors: normalization.omittedVisuallyInertColors,
+                },
+              } : {}),
+              ...(sourceProfile ? { source_profile: sourceProfile } : {}),
+              ...(renderProfile ? { render_profile: renderProfile } : {}),
+              ...(visualEvidence ? { visual_evidence: visualEvidence } : {}),
+              ...(fontEvidence ? { font_evidence: fontEvidence } : {}),
+            }),
+            isError: false,
+          }
+        }
+        case 'verify_reference_style': {
+          const path = requiredWorkspacePath(args, 'path')
+          if (!/\.html?$/iu.test(path)) throw new Error('verify_reference_style path must identify an HTML file')
+          const state = await this.store.get(context.sessionId)
+          const durable = state.activeReferenceStyleContract
+            ?? (state.referenceStyleEvidenceInvalidation
+              ? undefined
+              : latestSuccessfulReferenceStyleContract(state.messages))
+          if (!durable) throw new Error('No successful durable StyleContract is available for this task')
+          if (durable.contract.strictness === 'exact') {
+            if (!durable.fontEvidence) {
+              throw new Error('Exact reference verification requires durable font evidence, including an explicit no-external-font attestation')
+            }
+            if (durable.fontEvidence.sourceEvidenceSha256 !== durable.provenance.evidenceSha256) {
+              throw new Error('Exact reference font evidence is not bound to the active source evidence SHA-256')
+            }
+            await this.store.resolveReferenceFontEvidence(context.sessionId, durable.fontEvidence)
+          }
+          const target = resolveWorkspacePath(workspace, path)
+          await assertNoSymlinkTraversal(workspace, target)
+          const info = await stat(target)
+          if (!info.isFile()) throw new Error('verify_reference_style path is not a file')
+          if (info.size > config.maxReadBytes * 4) throw new Error('Canonical HTML is too large for bounded reference-style verification')
+          const htmlBytes = await readFile(target)
+          const html = htmlBytes.toString('utf8')
+          const verification = verifyHtmlAgainstReferenceStyle(html, durable.contract, durable.sourceProfile)
+          return {
+            content: JSON.stringify({
+              status: 'success',
+              path,
+              source_url: durable.contract.sourceUrl,
+              provenance: durable.provenance,
+              artifact_hash: createHash('sha256').update(htmlBytes).digest('base64url'),
+              reference_sha256: durable.provenance.evidenceSha256,
+              ...(durable.fontEvidence ? {
+                reference_font_manifest_sha256: durable.fontEvidence.manifestSha256,
+              } : {}),
+              ...(durable.sourceProfile ? {
+                source_profile_sha256: createHash('sha256').update(JSON.stringify(durable.sourceProfile)).digest('hex'),
+              } : {}),
+              ...(durable.renderProfile ? {
+                render_profile_sha256: createHash('sha256').update(JSON.stringify(durable.renderProfile)).digest('hex'),
+              } : {}),
+              ...verification,
+            }),
+            isError: false,
+          }
+        }
         case 'web_search':
           return await this.searchWeb(requiredString(args, 'query'), requiredString(args, 'depth'), context.signal)
         case 'fetch_media':
@@ -2695,6 +3311,7 @@ export class ToolExecutor {
 
   private async buildAndStart(call: ToolCallRecord, context: ToolContext): Promise<ToolExecutionResult> {
     const startedAt = Date.now()
+    await this.exactReferenceWorkspacePreview(context.sessionId)
     const build = await this.runBuildStage(call, context)
     if (!build.ok) {
       return {
@@ -2873,10 +3490,39 @@ export class ToolExecutor {
     const target = this.store.deploymentRevisionDir(context.sessionId, revision)
     let snapshot: StaticDeploymentSnapshot
     try {
+      const deliveryState = await this.store.get(context.sessionId)
+      const exactReference = deliveryState.activeReferenceStyleContract?.contract.strictness === 'exact'
+        ? deliveryState.activeReferenceStyleContract
+        : undefined
+      let transformEntryHtml: ((html: string) => string) | undefined
+      let sourceEntryPath: string | undefined
+      if (exactReference) {
+        const fontEvidence = exactReference.fontEvidence
+        if (!fontEvidence) {
+          throw new Error('Exact reference deployment requires durable private font evidence')
+        }
+        if (fontEvidence.sourceEvidenceSha256 !== exactReference.provenance.evidenceSha256) {
+          throw new Error('Exact reference deployment font evidence is bound to another source')
+        }
+        const resolvedFonts = await this.store.resolveReferenceFontEvidence(context.sessionId, fontEvidence)
+        sourceEntryPath = verifiedExactReferenceEntryPath(deliveryState)
+        if (!sourceEntryPath) {
+          throw new Error('Exact reference deployment requires a successful font-bound verify_reference_style result')
+        }
+        transformEntryHtml = (html) => injectMaterializedReferenceFonts(
+          html,
+          resolvedFonts.fontCss,
+          fontEvidence.manifestSha256,
+        )
+      }
       snapshot = await createStaticDeploymentSnapshot(
         this.store.workspaceDir(context.sessionId),
         target,
         context.signal,
+        {
+          ...(sourceEntryPath ? { sourceEntryPath } : {}),
+          ...(transformEntryHtml ? { transformEntryHtml } : {}),
+        },
       )
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -3018,16 +3664,25 @@ export class ToolExecutor {
     return { content: JSON.stringify({ status: 'success', title, content: truncateText(content) }), isError: false }
   }
 
-  private async fetchPage(rawUrl: string, chunkIndex: number, context: ToolContext): Promise<ToolExecutionResult> {
+  private async fetchPage(
+    rawUrl: string,
+    chunkIndex: number,
+    format: string,
+    context: ToolContext,
+  ): Promise<ToolExecutionResult> {
     if (!Number.isInteger(chunkIndex) || chunkIndex < 0) throw new Error('chunkIndex must be a non-negative integer')
+    if (format !== 'markdown' && format !== 'raw') throw new Error('format must be markdown or raw')
     const requests: WebProviderRequestMetering[] = []
     try {
       const url = await this.validateUrl(rawUrl)
       if (context.signal.aborted) throw context.signal.reason
       const canonicalUrl = canonicalFetchPageUrl(url)
-      const directKey = this.fetchPageCacheKey(context, canonicalUrl, 'direct')
-      if (this.firecrawlApiKey) {
-        const firecrawlKey = this.fetchPageCacheKey(context, canonicalUrl, 'firecrawl')
+      const directKey = this.fetchPageCacheKey(context, canonicalUrl, 'direct', format)
+      // Raw/source fidelity must be byte-for-byte relative to the bounded
+      // direct textual response. Firecrawl is a semantic Markdown extractor,
+      // so it is intentionally unavailable for this representation.
+      if (format === 'markdown' && this.firecrawlApiKey) {
+        const firecrawlKey = this.fetchPageCacheKey(context, canonicalUrl, 'firecrawl', format)
         const firecrawlCached = this.getFetchPageSnapshot(firecrawlKey)
         if (firecrawlCached) {
           return withWebProviderUsage(
@@ -3062,7 +3717,7 @@ export class ToolExecutor {
           webProviderMetering('hit', requests, 'direct'),
         )
       }
-      const loaded = await this.fetchPageDirect(url, context.signal, requests)
+      const loaded = await this.fetchPageDirect(url, format, context.signal, requests)
       if ('result' in loaded) return withWebProviderUsage(loaded.result, webProviderMetering('miss', requests))
       this.cacheFetchPageSnapshot(directKey, loaded.snapshot)
       return withWebProviderUsage(
@@ -3138,6 +3793,7 @@ export class ToolExecutor {
 
   private async fetchPageDirect(
     initialUrl: URL,
+    format: FetchPageFormat,
     signal: AbortSignal,
     requests: WebProviderRequestMetering[],
   ): Promise<FetchPageLoad> {
@@ -3175,16 +3831,26 @@ export class ToolExecutor {
     if (declaredPdf && !sniffedPdf) {
       throw new Error(`PDF response from ${finalUrl} is missing the required %PDF- signature`)
     }
+    if (format === 'raw' && bounded.truncated) {
+      throw new Error(
+        `fetch_page format raw requires the complete textual source, but the response from ${finalUrl} exceeds the ${config.maxReadBytes * 10}-byte download limit; no partial source was returned`,
+      )
+    }
     if (sniffedPdf && bounded.truncated) {
       throw new Error(`PDF response from ${finalUrl} exceeds the ${config.maxReadBytes * 10}-byte download limit`)
     }
+    if (sniffedPdf && format === 'raw') {
+      throw new Error('fetch_page format raw supports textual source responses, not PDF bytes')
+    }
     const raw = sniffedPdf ? '' : new TextDecoder().decode(bounded.bytes)
     const title = contentType.includes('html') && !sniffedPdf ? extractHtmlTitle(raw, finalUrl) : finalUrl
-    const extracted = sniffedPdf
-      ? await extractFetchPagePdf(bounded.bytes, signal)
-      : contentType.includes('html')
-        ? htmlToMarkdown(htmlReadableBody(raw))
-        : raw
+    const extracted = format === 'raw'
+      ? raw
+      : sniffedPdf
+        ? await extractFetchPagePdf(bounded.bytes, signal)
+        : contentType.includes('html')
+          ? htmlToMarkdown(htmlReadableBody(raw))
+          : raw
     const readable = !sniffedPdf && bounded.truncated
       ? `${extracted}\n\n[Source response byte limit reached after ${bounded.bytesRead} bytes. `
         + 'Content beyond this point is unavailable from fetch_page; chunk continuation ends after the text above.]'
@@ -3225,8 +3891,9 @@ export class ToolExecutor {
     context: Pick<ToolContext, 'sessionId' | 'turnId'>,
     canonicalUrl: string,
     provider: FetchPageProvider,
+    format: FetchPageFormat,
   ): string {
-    return `${context.sessionId}\0${context.turnId}\0${provider}\0${canonicalUrl}`
+    return `${context.sessionId}\0${context.turnId}\0${provider}\0${format}\0${canonicalUrl}`
   }
 
   private getFetchPageSnapshot(key: string): FetchPageSnapshot | undefined {
@@ -3344,12 +4011,15 @@ export class ToolExecutor {
     if (current.status === 'running' && current.processId === process.id && current.port === process.port) return []
     const baseUrl = `http://127.0.0.1:${process.port}`
     const resolved = await this.resolveProcessPreviewEntry(context, baseUrl, serverCwd)
+    const exactPreview = await this.exactReferenceWorkspacePreview(context.sessionId)
     await this.store.recordWebsiteUpdate(context.sessionId, {
       status: 'running',
-      ...(resolved.entryPath ? { entryPath: resolved.entryPath } : {}),
+      ...((exactPreview?.entryPath ?? resolved.entryPath)
+        ? { entryPath: exactPreview?.entryPath ?? resolved.entryPath }
+        : {}),
       processId: process.id,
       port: process.port,
-      previewUrl: resolved.previewUrl,
+      previewUrl: exactPreview?.previewUrl ?? resolved.previewUrl,
       updatedAt: new Date().toISOString(),
       restartCount: current.restartCount,
     }, { action: 'process_preview' }, {
@@ -3357,7 +4027,7 @@ export class ToolExecutor {
       stepId: context.stepId,
       callId: context.callId,
     })
-    return resolved.warnings
+    return exactPreview ? [] : resolved.warnings
   }
 
   private async resolveProcessPreviewEntry(
@@ -3904,6 +4574,8 @@ export class ToolExecutor {
     await assertNoSymlinkTraversal(workspace, target)
     const info = await stat(target)
     if (!info.isFile()) throw new Error('Path is not a file')
+    const bytes = await readFile(target)
+    const artifactHash = createHash('sha256').update(bytes).digest('base64url')
     const state = await this.store.get(context.sessionId)
     const artifact = state.artifacts.find((item) => item.path === path) ?? this.artifactForPath(context, path)
     if (!state.artifacts.some((item) => item.path === path)) {
@@ -3913,12 +4585,20 @@ export class ToolExecutor {
         callId: context.callId,
       })
     }
-    await this.store.append(context.sessionId, 'file.presented', { path, artifact }, {
+    await this.store.append(context.sessionId, 'file.presented', {
+      path,
+      artifact,
+      artifactHash,
+      bytes: bytes.length,
+    }, {
       turnId: context.turnId,
       stepId: context.stepId,
       callId: context.callId,
     })
-    return { content: JSON.stringify({ status: 'success', path }), isError: false }
+    return {
+      content: JSON.stringify({ status: 'success', path, artifact_hash: artifactHash, bytes: bytes.length }),
+      isError: false,
+    }
   }
 
   private async listConnectorTools(slug: string, context: ToolContext): Promise<ToolExecutionResult> {
@@ -4463,6 +5143,36 @@ export class ToolExecutor {
     }
   }
 
+  private async exactReferenceWorkspacePreview(
+    sessionId: string,
+  ): Promise<{ entryPath: string; previewUrl: string } | undefined> {
+    const state = await this.store.get(sessionId)
+    const reference = state.activeReferenceStyleContract
+    if (reference?.contract.strictness !== 'exact') return undefined
+    const fontEvidence = reference.fontEvidence
+    if (!fontEvidence) {
+      throw new Error('Exact reference Website preview requires durable private font evidence')
+    }
+    if (fontEvidence.sourceEvidenceSha256 !== reference.provenance.evidenceSha256) {
+      throw new Error('Exact reference Website preview font evidence is bound to another source')
+    }
+    await this.store.resolveReferenceFontEvidence(sessionId, fontEvidence)
+    const entryPath = verifiedExactReferenceEntryPath(state)
+    if (!entryPath) {
+      throw new Error('Exact reference Website preview requires a successful font-bound verify_reference_style result')
+    }
+    const workspace = this.store.workspaceDir(sessionId)
+    const target = resolveWorkspacePath(workspace, entryPath)
+    await assertNoSymlinkTraversal(workspace, target)
+    if (!(await stat(target)).isFile()) {
+      throw new Error('Exact reference Website preview entry is not a file')
+    }
+    return {
+      entryPath,
+      previewUrl: `/workspace/${sessionId}/preview/${encodeWorkspaceUrlPath(entryPath)}`,
+    }
+  }
+
   private async preview(context: ToolContext, args: Record<string, unknown>): Promise<ToolExecutionResult> {
     const workspace = this.store.workspaceDir(context.sessionId)
     if (typeof args.process_id === 'string') {
@@ -4476,11 +5186,13 @@ export class ToolExecutor {
       if (!process.port || !process.listeningPorts?.some((listener) => listener.port === process.port)) {
         throw new Error('Managed Website process does not own a verified listening port yet')
       }
+      const exactPreview = await this.exactReferenceWorkspacePreview(context.sessionId)
       const website = {
         status: 'running' as const,
+        ...(exactPreview ? { entryPath: exactPreview.entryPath } : {}),
         processId: process.id,
         port: process.port,
-        previewUrl: `http://127.0.0.1:${process.port}`,
+        previewUrl: exactPreview?.previewUrl ?? `http://127.0.0.1:${process.port}`,
         updatedAt: new Date().toISOString(),
         restartCount: (await this.store.get(context.sessionId)).website.restartCount,
       }
@@ -4522,8 +5234,9 @@ export class ToolExecutor {
       const hasHeight = typeof args.height === 'number'
       if (hasWidth !== hasHeight) throw new Error('browser open requires both width and height when setting a viewport')
       const state = await this.store.get(context.sessionId)
+      const exactPreview = await this.exactReferenceWorkspacePreview(context.sessionId)
       const path = typeof args.path === 'string' ? args.path : undefined
-      let url = state.website.previewUrl
+      let url = exactPreview?.previewUrl ?? state.website.previewUrl
       if (path) {
         const workspace = this.store.workspaceDir(context.sessionId)
         let browserPath = arenaWorkspacePath(path)
@@ -4539,14 +5252,31 @@ export class ToolExecutor {
         if (!requestedFileExists && publishedEntry && basename(publishedEntry) === basename(browserPath)) {
           const entryTarget = resolveWorkspacePath(workspace, publishedEntry)
           await assertNoSymlinkTraversal(workspace, entryTarget)
-          if ((await stat(entryTarget)).isFile()) browserPath = publishedEntry
+          try {
+            if ((await stat(entryTarget)).isFile()) {
+              browserPath = publishedEntry
+              requestedFileExists = true
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          }
+        }
+        if (!requestedFileExists) {
+          throw new Error(`Browser cannot open missing workspace file: ${browserPath}`)
+        }
+        if (exactPreview && browserPath !== exactPreview.entryPath) {
+          throw new Error(`Exact reference Browser open must target the verified Website entry: ${exactPreview.entryPath}`)
         }
         const appBaseUrl = this.localAppBaseUrl().replace(/\/+$/, '')
         if (!appBaseUrl) throw new Error('The local App preview origin is unavailable')
         url = `${appBaseUrl}/workspace/${context.sessionId}/preview/${encodeWorkspaceUrlPath(browserPath)}`
       }
       if (!url) throw new Error('Publish a Website or provide an HTML path before opening the browser')
-      if (url.startsWith('/')) url = `http://127.0.0.1:${config.port}${url}`
+      if (url.startsWith('/')) {
+        const appBaseUrl = this.localAppBaseUrl().replace(/\/+$/, '')
+        if (!appBaseUrl) throw new Error('The local App preview origin is unavailable')
+        url = `${appBaseUrl}${url}`
+      }
       const opened = await this.browser.open(context.sessionId, url, context.signal)
       const result = hasWidth && hasHeight
         ? await this.browser.setViewport(context.sessionId, args.width as number, args.height as number, context.signal)
@@ -5096,6 +5826,7 @@ interface FirecrawlScrapeResponse {
 }
 
 type FetchPageProvider = 'firecrawl' | 'direct'
+type FetchPageFormat = 'markdown' | 'raw'
 
 interface FetchPageSnapshot {
   url: string

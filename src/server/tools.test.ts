@@ -102,6 +102,132 @@ function syntheticPng(marker: number): Buffer {
   return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, marker, marker, marker, marker])
 }
 
+function dimensionedPng(width: number, height: number, marker: number): Buffer {
+  const png = Buffer.alloc(33)
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png)
+  png.writeUInt32BE(13, 8)
+  png.write('IHDR', 12, 'ascii')
+  png.writeUInt32BE(width, 16)
+  png.writeUInt32BE(height, 20)
+  png[32] = marker
+  return png
+}
+
+async function installExactReferenceVisualFixture(
+  store: SessionStore,
+  sessionId: string,
+  options: { includeManifest?: boolean } = {},
+) {
+  const viewport = { width: 320, height: 180 }
+  const sourceEvidenceSha256 = '1'.repeat(64)
+  const renderProfile = {
+    version: 1 as const,
+    evidenceSha256: sourceEvidenceSha256,
+    viewport,
+    phases: {
+      cover: { anchors: [], overlayProbes: [] },
+      content: { anchors: [], overlayProbes: [] },
+      closing: { anchors: [], overlayProbes: [] },
+    },
+  }
+  const renderProfileSha256 = createHash('sha256').update(JSON.stringify(renderProfile)).digest('hex')
+  const screenshots = {
+    cover: dimensionedPng(viewport.width, viewport.height, 1),
+    content: dimensionedPng(viewport.width, viewport.height, 2),
+    closing: dimensionedPng(viewport.width, viewport.height, 3),
+  }
+  const manifest = await store.commitReferenceVisualEvidence(sessionId, {
+    sourceEvidenceSha256,
+    renderProfileSha256,
+    viewport,
+    screenshots,
+  })
+  const fontEvidence = await store.commitReferenceFontEvidence(sessionId, {
+    sourceEvidenceSha256,
+    fontCss: '',
+    familyNames: [],
+    materializationManifest: null,
+  })
+  const durable = {
+    contract: {
+      sourceUrl: 'https://example.com/reference.html',
+      strictness: 'exact' as const,
+      colors: ['#fdfae7', '#1e2bfa'],
+      fonts: ['Space Grotesk', 'Inter'],
+      layout: ['cover', 'content'],
+      components: ['navigation', 'progress'],
+      requiredMarkers: ['.slide', '.nav-btn'],
+      signature: 'Blue professional reference',
+      avoid: ['generic cards'],
+      viewport,
+    },
+    provenance: {
+      resolvedUrl: 'https://example.com/reference.html',
+      evidenceSha256: sourceEvidenceSha256,
+      evidenceBytes: 1_024,
+    },
+    renderProfile,
+    fontEvidence,
+    ...(options.includeManifest === false ? {} : { visualEvidence: manifest }),
+  }
+  await store.update(sessionId, (state) => {
+    state.activeReferenceStyleContract = durable
+  })
+  return { manifest, fontEvidence, renderProfile, renderProfileSha256, screenshots, sourceEvidenceSha256, viewport }
+}
+
+async function appendExactRenderAttestation(
+  store: SessionStore,
+  sessionId: string,
+  input: {
+    callId: string
+    candidatePath: string
+    candidateSha256: string
+    phase: 'cover' | 'content' | 'closing'
+    viewport: { width: number; height: number }
+    referenceEvidenceSha256: string
+    fontManifestSha256?: string
+    pageEpoch?: number
+    artifactHash?: string
+  },
+): Promise<{ pageEpoch: number; artifactHash: string }> {
+  const pageEpoch = input.pageEpoch ?? 7
+  const artifactHash = input.artifactHash
+    ?? createHash('sha256').update(`artifact:${sessionId}`).digest('base64url')
+  const fontManifestSha256 = (await store.get(sessionId)).activeReferenceStyleContract?.fontEvidence?.manifestSha256
+  if (!fontManifestSha256) throw new Error('fixture font evidence missing')
+  const call = {
+    id: input.callId,
+    type: 'function' as const,
+    function: {
+      name: 'browser',
+      arguments: JSON.stringify({ action: 'screenshot', screenshot_path: input.candidatePath }),
+    },
+  }
+  await store.update(sessionId, (state) => {
+    state.messages.push({ role: 'assistant', content: null, tool_calls: [call] }, {
+      role: 'tool',
+      tool_call_id: call.id,
+      tool_result_status: 'succeeded',
+      content: JSON.stringify({
+        status: 'success',
+        render_fidelity: 'pass',
+        render_score: 100,
+        render_phase: input.phase,
+        render_violations: [],
+        render_violation_count: 0,
+        render_reference_sha256: input.referenceEvidenceSha256,
+        render_font_manifest_sha256: input.fontManifestSha256 ?? fontManifestSha256,
+        render_page_epoch: pageEpoch,
+        render_viewport: input.viewport,
+        render_artifact_hash: artifactHash,
+        screenshot_sha256: input.candidateSha256,
+      }),
+    })
+  })
+  return { pageEpoch, artifactHash }
+}
+
 function minimalPdf(pageTexts: string[]): Buffer {
   const objects: string[] = []
   const pageObjectIds = pageTexts.map((_text, index) => 4 + index * 2)
@@ -308,6 +434,18 @@ describe('tool executor vision integration', () => {
       path: 'src', cursor: 'opaque-cursor', limit: 300,
     })
     expect(() => validateToolCallArguments(normalizeAneraRuntimeToolCall(rawList))).not.toThrow()
+  })
+
+  it('instructs the reference-contract phase to omit exact tokens not consumed by connected DOM CSS', () => {
+    const definition = TOOL_DEFINITIONS.find((tool) => tool.function.name === 'record_reference_style')
+    expect(definition).toBeDefined()
+    expect(definition!.function.description).toMatch(/exact mode[\s\S]*real, non-inert DOM[\s\S]*merely declared[\s\S]*never consumed by a DOM-connected rule/iu)
+    const properties = (definition!.function.parameters as {
+      properties: Record<string, { items?: { description?: string } }>
+    }).properties
+    expect(properties.colors?.items?.description).toMatch(/DOM-connected rule[\s\S]*omit values from unused variable declarations/iu)
+    expect(properties.fonts?.items?.description).toMatch(/font-family[\s\S]*DOM-connected rule/iu)
+    expect(properties.required_markers?.items?.description).toMatch(/consumed CSS variable[\s\S]*real DOM relationship[\s\S]*compound selectors/iu)
   })
 
   it('enforces active ask_user identity uniqueness and legacy-to-active normalization', () => {
@@ -577,6 +715,11 @@ describe('tool executor vision integration', () => {
       name: 'web_fetch',
       arguments: { url: 'https://example.com', format: 'json' },
     })).toThrow(/format: expected one of markdown, text, html/)
+    expect(() => validateToolCallArguments({
+      id: 'call_fetch_page_format_enum',
+      name: 'fetch_page',
+      arguments: { url: 'https://example.com', format: 'html' },
+    })).toThrow(/format: expected one of markdown, raw/)
     expect(() => validateToolCallArguments({
       id: 'call_media_type_enum',
       name: 'fetch_media',
@@ -1122,6 +1265,84 @@ describe('tool executor vision integration', () => {
     expect((await reloaded.get(session.summary.id)).deployment).toEqual(failed)
   })
 
+  it('materializes exact-reference fonts into the immutable deployment entry only', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-deploy-exact-fonts-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const workspace = store.workspaceDir(session.summary.id)
+    const entryPath = 'verified-deck.html'
+    const sourceHtml = '<!doctype html><html><head><title>Exact</title></head><body>EXACT DEPLOYMENT</body></html>'
+    const decoyHtml = '<!doctype html><title>DECOY</title>'
+    await writeFile(resolve(workspace, entryPath), sourceHtml)
+    await writeFile(resolve(workspace, 'index.html'), decoyHtml)
+    const fixture = await installExactReferenceVisualFixture(store, session.summary.id)
+    const verificationCallId = 'call_deploy_exact_verifier'
+    await store.update(session.summary.id, (state) => {
+      state.messages.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: verificationCallId,
+          type: 'function',
+          function: { name: 'verify_reference_style', arguments: JSON.stringify({ path: entryPath }) },
+        }],
+      }, {
+        role: 'tool',
+        tool_call_id: verificationCallId,
+        tool_result_status: 'succeeded',
+        content: JSON.stringify({
+          status: 'success',
+          path: entryPath,
+          fidelity: 'pass',
+          score: 100,
+          artifact_hash: createHash('sha256').update(sourceHtml).digest('base64url'),
+          reference_sha256: fixture.sourceEvidenceSha256,
+          reference_font_manifest_sha256: fixture.fontEvidence.manifestSha256,
+        }),
+      })
+    })
+    const tools = new ToolExecutor(
+      store,
+      new ProcessManager(() => {}, 10_000),
+      new BrowserManager(),
+      { inspect: vi.fn() },
+      vi.fn(async () => true),
+    )
+
+    const deployed = await tools.execute({
+      id: 'call_deploy_exact_fonts',
+      name: 'deploy_project',
+      arguments: {},
+    }, {
+      sessionId: session.summary.id,
+      turnId: 'turn_deploy_exact_fonts',
+      stepId: 'step_deploy_exact_fonts',
+      signal: new AbortController().signal,
+    })
+    expect(deployed).toEqual({ content: '{"status":"success"}', isError: false })
+
+    const deliveredHtml = await readFile(
+      resolve(store.deploymentRevisionDir(session.summary.id, 1), entryPath),
+      'utf8',
+    )
+    expect(deliveredHtml).toContain(
+      `<style data-anera-reference-fonts data-manifest-sha256="${fixture.fontEvidence.manifestSha256}">`,
+    )
+    expect(deliveredHtml).toContain('EXACT DEPLOYMENT')
+    expect(await readFile(resolve(workspace, entryPath), 'utf8')).toBe(sourceHtml)
+    await expect(readFile(resolve(store.deploymentRevisionDir(session.summary.id, 1), 'index.html'), 'utf8'))
+      .resolves.toBe(decoyHtml)
+    expect((await store.get(session.summary.id)).deployment).toMatchObject({
+      status: 'deployed',
+      revision: 1,
+      entryPath,
+      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      bytes: Buffer.byteLength(deliveredHtml) + Buffer.byteLength(decoyHtml),
+    })
+  })
+
   it('persists Arena-compatible plan updates with stable item identity and append-only snapshots', async () => {
     const definition = TOOL_DEFINITIONS.find((tool) => tool.function.name === 'update_plan')
     expect(definition?.function.parameters).toEqual({
@@ -1457,6 +1678,110 @@ describe('tool executor vision integration', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
+  it('preserves paginated raw HTML source through the direct transport and isolates it from Firecrawl markdown cache', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-fetch-page-raw-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const source = [
+      '<!doctype html><html><head><title>Exact Source</title>',
+      '<style>:root{--accent:#1e2bfa}.layout-cover{clip-path:polygon(35% 0,100% 0,100% 100%,0 100%)}</style>',
+      '<script>window.referenceSourceMustSurvive=true</script></head>',
+      `<body><main class="layout-cover">${'source-byte-'.repeat(Math.ceil(config.maxReadBytes / 12))}</main></body></html>`,
+    ].join('')
+    expect(Buffer.byteLength(source)).toBeGreaterThan(config.maxReadBytes)
+    const targetUrl = 'https://templates.example/exact.html'
+    const firecrawlUrl = 'https://firecrawl.example/v1/scrape'
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) === firecrawlUrl) {
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          url: targetUrl,
+          formats: ['markdown'],
+        })
+        return Response.json({
+          success: true,
+          data: {
+            markdown: '# Extracted by Firecrawl',
+            metadata: { sourceURL: targetUrl, title: 'Extracted', statusCode: 200 },
+          },
+        })
+      }
+      expect(String(input)).toBe(targetUrl)
+      expect(init?.method).toBeUndefined()
+      return new Response(source, {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      })
+    })
+    const tools = new ToolExecutor(
+      store,
+      persistedProcessManager(store),
+      new BrowserManager(),
+      { inspect: vi.fn() },
+      async () => false,
+      {
+        fetch: fetchMock as typeof fetch,
+        validatePublicUrl: async (raw) => new URL(raw),
+        firecrawlApiKey: 'fc-raw-bypass-fixture',
+        firecrawlBaseUrl: 'https://firecrawl.example/v1',
+      },
+    )
+    const context = {
+      sessionId: session.summary.id,
+      turnId: 'turn_fetch_page_raw',
+      stepId: 'step_fetch_page_raw',
+      signal: new AbortController().signal,
+    }
+
+    let chunkIndex = 0
+    let reconstructed = ''
+    while (true) {
+      const result = await tools.execute({
+        id: `call_fetch_page_raw_${chunkIndex}`,
+        name: 'fetch_page',
+        arguments: { url: targetUrl, chunkIndex, format: 'raw' },
+      }, context)
+      expect(result.isError).toBe(false)
+      expect(result.webProviderUsage).toMatchObject(chunkIndex === 0 ? {
+        cache: 'miss',
+        providerCalls: 1,
+        requests: [{ provider: 'direct', operation: 'fetch', calls: 1, outcome: 'success' }],
+      } : {
+        cache: 'hit',
+        cacheProvider: 'direct',
+        providerCalls: 0,
+        requests: [],
+      })
+      const payload = JSON.parse(result.content) as {
+        content: string
+        hasMore: boolean
+        totalChunks: number
+      }
+      reconstructed += payload.content
+      if (!payload.hasMore) break
+      expect(payload.totalChunks).toBeGreaterThan(chunkIndex + 1)
+      chunkIndex += 1
+    }
+
+    expect(chunkIndex).toBeGreaterThan(0)
+    expect(reconstructed).toBe(source)
+    expect(reconstructed).toContain('<style>:root{--accent:#1e2bfa}')
+    expect(reconstructed).toContain('<script>window.referenceSourceMustSurvive=true</script>')
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(targetUrl)
+
+    const markdown = await tools.execute({
+      id: 'call_fetch_page_markdown_after_raw',
+      name: 'fetch_page',
+      arguments: { url: targetUrl, chunkIndex: 0 },
+    }, context)
+    expect(markdown.isError).toBe(false)
+    expect(JSON.parse(markdown.content)).toMatchObject({ content: '# Extracted by Firecrawl' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(firecrawlUrl)
+  })
+
   it('parses at most 30 PDF pages and continues only across the extracted chunks', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-fetch-page-pdf-limit-'))
     roots.push(root)
@@ -1704,6 +2029,25 @@ describe('tool executor vision integration', () => {
     expect(reconstructed).toContain(`Source response byte limit reached after ${limit} bytes`)
     expect(reconstructed).toContain('chunk continuation ends after the text above')
     expect(fetchMock).toHaveBeenCalledOnce()
+
+    const raw = await tools.execute({
+      id: 'call_fetch_page_raw_source_limit',
+      name: 'fetch_page',
+      arguments: { url: 'https://docs.example/too-large.txt', chunkIndex: 0, format: 'raw' },
+    }, context)
+    expect(raw.isError).toBe(true)
+    expect(JSON.parse(raw.content)).toEqual({
+      status: 'error',
+      error: `fetch_page format raw requires the complete textual source, but the response from https://docs.example/too-large.txt exceeds the ${limit}-byte download limit; no partial source was returned`,
+    })
+    expect(raw.content).not.toContain('x'.repeat(1_000))
+    expect(raw.webProviderUsage).toMatchObject({
+      cache: 'miss',
+      providerCalls: 1,
+      responseBytes: limit,
+      requests: [{ provider: 'direct', calls: 1, outcome: 'error', responseBytes: limit }],
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it('uses Firecrawl for fetch_page, preserves exact chunk continuation, and redacts its credential', async () => {
@@ -2461,6 +2805,92 @@ describe('tool executor vision integration', () => {
     expect(payload.warnings).toContain('Live preview root is a directory listing with 2 HTML entries; kept the root URL because no unique entry could be selected.')
   })
 
+  it('publishes exact process Websites and Browser verification through the same font-materialized App preview', async () => {
+    const port = await reserveTcpPort()
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-preview-exact-app-route-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const entryPath = 'exact-deck.html'
+    const html = '<!doctype html><title>Exact deck</title><main>EXACT APP ROUTE</main>'
+    await writeWorkspaceFile(store.workspaceDir(session.summary.id), entryPath, html)
+    const fixture = await installExactReferenceVisualFixture(store, session.summary.id)
+    const verificationCallId = 'call_exact_app_route_verifier'
+    await store.update(session.summary.id, (state) => {
+      state.messages.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: verificationCallId,
+          type: 'function',
+          function: {
+            name: 'verify_reference_style',
+            arguments: JSON.stringify({ path: entryPath }),
+          },
+        }],
+      }, {
+        role: 'tool',
+        tool_call_id: verificationCallId,
+        tool_result_status: 'succeeded',
+        content: JSON.stringify({
+          status: 'success',
+          path: entryPath,
+          fidelity: 'pass',
+          score: 100,
+          artifact_hash: createHash('sha256').update(html).digest('base64url'),
+          reference_sha256: fixture.sourceEvidenceSha256,
+          reference_font_manifest_sha256: fixture.fontEvidence.manifestSha256,
+        }),
+      })
+    })
+    const browser = new BrowserManager()
+    const browserOpen = vi.spyOn(browser, 'open').mockResolvedValue({ text: 'EXACT APP ROUTE' })
+    const resolveFonts = vi.spyOn(store, 'resolveReferenceFontEvidence')
+    const appOrigin = 'http://127.0.0.1:49123'
+    const tools = new ToolExecutor(
+      store,
+      persistedProcessManager(store),
+      browser,
+      { inspect: vi.fn() },
+      async () => false,
+      { localAppBaseUrl: appOrigin },
+    )
+    const context = {
+      sessionId: session.summary.id,
+      turnId: 'turn_exact_app_route',
+      stepId: 'step_exact_app_route',
+      signal: new AbortController().signal,
+    }
+    const started = await tools.execute({
+      id: 'call_exact_app_route_start',
+      name: 'start_process',
+      arguments: { command: `python3 -u -m http.server ${port} --bind 0.0.0.0`, startup_wait: 1 },
+    }, context)
+    expect(started.isError).toBe(false)
+    const expectedPreviewUrl = `/workspace/${session.summary.id}/preview/${entryPath}`
+    expect((await store.get(session.summary.id)).website).toMatchObject({
+      status: 'running',
+      entryPath,
+      port,
+      previewUrl: expectedPreviewUrl,
+    })
+    expect((JSON.parse(started.content) as { warnings: string[] }).warnings).toEqual([])
+
+    const opened = await tools.execute({
+      id: 'call_exact_app_route_browser',
+      name: 'browser',
+      arguments: { action: 'open' },
+    }, context)
+    expect(opened.isError).toBe(false)
+    expect(browserOpen).toHaveBeenCalledWith(
+      session.summary.id,
+      `${appOrigin}${expectedPreviewUrl}`,
+      context.signal,
+    )
+    expect(resolveFonts).toHaveBeenCalledWith(session.summary.id, fixture.fontEvidence)
+  })
+
   it('refreshes listening ports on an immediate get_process_output call without a wait mode', async () => {
     const reservation = createServer()
     await new Promise<void>((resolveListen) => reservation.listen(0, '127.0.0.1', resolveListen))
@@ -2594,7 +3024,12 @@ describe('tool executor vision integration', () => {
     const presented = await tools.execute({
       id: 'call_present', name: 'present_file', arguments: { path: '/home/user/deliverables/report.md' },
     }, context)
-    expect(JSON.parse(presented.content)).toEqual({ status: 'success', path: 'deliverables/report.md' })
+    expect(JSON.parse(presented.content)).toEqual({
+      status: 'success',
+      path: 'deliverables/report.md',
+      artifact_hash: createHash('sha256').update('# Report\n').digest('base64url'),
+      bytes: 9,
+    })
     expect((await store.events(session.summary.id)).find((event) => event.type === 'file.presented')).toMatchObject({
       turnId: context.turnId,
       stepId: context.stepId,
@@ -3376,7 +3811,7 @@ describe('tool executor vision integration', () => {
     })
 
     expect(result).toMatchObject({
-      content: 'Image metadata: image/png, 800×600, 3 bytes.\n\nVisual inspection:\nA white dashboard with a dark sidebar.\n\nEvidence note: visual OCR is approximate. When this is a browser screenshot, the browser snapshot or action result is authoritative for exact rendered text, control state, and element refs; use this inspection for layout, color, spacing, clipping, and overlap evidence.',
+      content: `Image metadata: image/png, 800×600, 3 bytes.\nImage evidence SHA-256: ${createHash('sha256').update(Buffer.from([1, 2, 3])).digest('hex')}\n\nVisual inspection:\nA white dashboard with a dark sidebar.\n\nEvidence note: visual OCR is approximate. When this is a browser screenshot, the browser snapshot or action result is authoritative for exact rendered text, control state, and element refs; use this inspection for layout, color, spacing, clipping, and overlap evidence.`,
       isError: false,
       modelUsage: { promptTokens: 900, completionTokens: 40, totalTokens: 940 },
       estimatedCostUsd: 0.000224,
@@ -3387,6 +3822,299 @@ describe('tool executor vision integration', () => {
       'Identify layout.',
       controller.signal,
     )
+  })
+
+  it('binds exact cover, content, and closing inspections to their immutable reference PNGs', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-exact-vision-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const fixture = await installExactReferenceVisualFixture(store, session.summary.id)
+    const candidate = dimensionedPng(fixture.viewport.width, fixture.viewport.height, 9)
+    const candidatePath = 'evidence/candidate.png'
+    const candidateTarget = resolve(store.workspaceDir(session.summary.id), candidatePath)
+    await writeWorkspaceFile(store.workspaceDir(session.summary.id), candidatePath, candidate)
+    const inspect = vi.fn<VisionInspector['inspect']>()
+    const compare = vi.fn<NonNullable<VisionInspector['compare']>>(async () => ({
+      content: 'NO DEFECTS\nREFERENCE MATCH',
+      referenceMetadata: {
+        mime: 'image/png',
+        bytes: fixture.screenshots.cover.length,
+        width: fixture.viewport.width,
+        height: fixture.viewport.height,
+      },
+      candidateMetadata: {
+        mime: 'image/png',
+        bytes: candidate.length,
+        width: fixture.viewport.width,
+        height: fixture.viewport.height,
+      },
+      usage: { promptTokens: 1_200, completionTokens: 8, totalTokens: 1_208, cachedPromptTokens: 600 },
+      estimatedCostUsd: 0.0001,
+      modelRequestCount: 1,
+      modelCallCount: 1,
+    }))
+    const tools = new ToolExecutor(
+      store,
+      new ProcessManager(() => {}, 10_000),
+      new BrowserManager(),
+      { inspect, compare },
+      async () => false,
+    )
+    const controller = new AbortController()
+    const phases = [
+      { phase: 'cover' as const, stage: 'cover slide' },
+      { phase: 'content' as const, stage: 'representative content slide' },
+      { phase: 'closing' as const, stage: 'closing/source slide' },
+    ]
+    const candidateSha256 = createHash('sha256').update(candidate).digest('hex')
+
+    for (const [index, { phase, stage }] of phases.entries()) {
+      const prompt = `REFERENCE FIDELITY check — ${stage}. Return NO DEFECTS then REFERENCE MATCH only on pass.`
+      const attestation = await appendExactRenderAttestation(store, session.summary.id, {
+        callId: `browser_exact_${phase}`,
+        candidatePath,
+        candidateSha256,
+        phase,
+        viewport: fixture.viewport,
+        referenceEvidenceSha256: fixture.sourceEvidenceSha256,
+      })
+      const result = await tools.execute({
+        id: `call_exact_vision_${phase}`,
+        name: 'inspect_image',
+        arguments: { path: candidatePath, prompt },
+      }, {
+        sessionId: session.summary.id,
+        turnId: 'turn_exact_vision',
+        stepId: `step_exact_vision_${phase}`,
+        signal: controller.signal,
+      })
+      const referencePath = await store.resolveReferenceVisualEvidencePath(
+        session.summary.id,
+        fixture.manifest,
+        phase,
+      )
+      const referenceSha256 = fixture.manifest.phases[phase].sha256
+      const digest = createHash('sha256').update(JSON.stringify({
+        version: 1,
+        candidate_screenshot_sha256: candidateSha256,
+        reference_png_sha256: referenceSha256,
+        source_evidence_sha256: fixture.sourceEvidenceSha256,
+        render_profile_sha256: fixture.renderProfileSha256,
+        manifest_sha256: fixture.manifest.manifestSha256,
+        font_manifest_sha256: fixture.fontEvidence.manifestSha256,
+        phase,
+        viewport: fixture.viewport,
+        render_page_epoch: attestation.pageEpoch,
+        candidate_artifact_hash: attestation.artifactHash,
+        comparison: 'NO DEFECTS\nREFERENCE MATCH',
+      })).digest('hex')
+
+      expect(result).toMatchObject({
+        isError: false,
+        modelUsage: { promptTokens: 1_200, completionTokens: 8, totalTokens: 1_208, cachedPromptTokens: 600 },
+        estimatedCostUsd: 0.0001,
+        modelRequestCount: 1,
+        modelCallCount: 1,
+      })
+      expect(result.content).toContain(`Image evidence SHA-256: ${candidateSha256}`)
+      expect(result.content).toContain(`Candidate screenshot SHA-256: ${candidateSha256}`)
+      expect(result.content).toContain(`Reference PNG SHA-256: ${referenceSha256}`)
+      expect(result.content).toContain(`Source evidence SHA-256: ${fixture.sourceEvidenceSha256}`)
+      expect(result.content).toContain(`Render profile SHA-256: ${fixture.renderProfileSha256}`)
+      expect(result.content).toContain(`Reference manifest SHA-256: ${fixture.manifest.manifestSha256}`)
+      expect(result.content).toContain(`Font manifest SHA-256: ${fixture.fontEvidence.manifestSha256}`)
+      expect(result.content).toContain(`Reference comparison phase: ${phase}`)
+      expect(result.content).toContain(`Reference viewport: ${JSON.stringify(fixture.viewport)}`)
+      expect(result.content).toContain(`Render page epoch: ${attestation.pageEpoch}`)
+      expect(result.content).toContain(`Candidate artifact hash: ${attestation.artifactHash}`)
+      expect(result.content).toContain(`Comparison digest SHA-256: ${digest}`)
+      expect(result.content).toContain('\n\nVisual inspection:\nNO DEFECTS\nREFERENCE MATCH\n\nEvidence note:')
+      expect(compare).toHaveBeenNthCalledWith(
+        index + 1,
+        referencePath,
+        candidateTarget,
+        expect.stringContaining(prompt),
+        controller.signal,
+      )
+      const submittedPrompt = compare.mock.calls[index][2]
+      expect(submittedPrompt).toContain('Harness-grounded deterministic evidence for this phase (authoritative)')
+      expect(submittedPrompt).toContain('passed the source-bound render-profile verifier with score 100')
+      expect(submittedPrompt).toContain('Do not claim that an attested component or decoration is missing')
+    }
+    expect(inspect).not.toHaveBeenCalled()
+    expect(await readFile(candidateTarget)).toEqual(candidate)
+  })
+
+  it('fails exact inspection closed when dual-image capability, manifest, binding, or phase is missing', async () => {
+    const cases = [
+      'compare', 'manifest', 'binding', 'font_manifest', 'font_binding',
+      'phase', 'attestation', 'attestation_hash', 'attestation_font',
+    ] as const
+    for (const missing of cases) {
+      const root = await mkdtemp(resolve(tmpdir(), `anera-tools-exact-vision-missing-${missing}-`))
+      roots.push(root)
+      const store = new SessionStore(root, 'test-model')
+      await store.initialize()
+      const session = await store.create()
+      const fixture = await installExactReferenceVisualFixture(store, session.summary.id, {
+        includeManifest: missing !== 'manifest',
+      })
+      if (missing === 'binding') {
+        await store.update(session.summary.id, (state) => {
+          const active = state.activeReferenceStyleContract
+          if (!active?.visualEvidence) throw new Error('fixture manifest missing')
+          active.visualEvidence = {
+            ...active.visualEvidence,
+            sourceEvidenceSha256: 'f'.repeat(64),
+          }
+        })
+      }
+      if (missing === 'font_manifest' || missing === 'font_binding') {
+        await store.update(session.summary.id, (state) => {
+          const active = state.activeReferenceStyleContract
+          if (!active?.fontEvidence) throw new Error('fixture font evidence missing')
+          if (missing === 'font_manifest') delete active.fontEvidence
+          else active.fontEvidence = { ...active.fontEvidence, sourceEvidenceSha256: 'f'.repeat(64) }
+        })
+      }
+      const candidatePath = 'evidence/candidate.png'
+      const candidate = dimensionedPng(fixture.viewport.width, fixture.viewport.height, 9)
+      await writeWorkspaceFile(
+        store.workspaceDir(session.summary.id),
+        candidatePath,
+        candidate,
+      )
+      if (missing === 'attestation_hash') {
+        await appendExactRenderAttestation(store, session.summary.id, {
+          callId: 'browser_exact_wrong_hash',
+          candidatePath,
+          candidateSha256: 'e'.repeat(64),
+          phase: 'cover',
+          viewport: fixture.viewport,
+          referenceEvidenceSha256: fixture.sourceEvidenceSha256,
+        })
+      }
+      if (missing === 'attestation_font') {
+        await appendExactRenderAttestation(store, session.summary.id, {
+          callId: 'browser_exact_wrong_font_manifest',
+          candidatePath,
+          candidateSha256: createHash('sha256').update(candidate).digest('hex'),
+          phase: 'cover',
+          viewport: fixture.viewport,
+          referenceEvidenceSha256: fixture.sourceEvidenceSha256,
+          fontManifestSha256: 'e'.repeat(64),
+        })
+      }
+      const inspect = vi.fn<VisionInspector['inspect']>()
+      const compare = vi.fn<NonNullable<VisionInspector['compare']>>()
+      const tools = new ToolExecutor(
+        store,
+        new ProcessManager(() => {}, 10_000),
+        new BrowserManager(),
+        missing === 'compare' ? { inspect } : { inspect, compare },
+        async () => false,
+      )
+      const result = await tools.execute({
+        id: `call_exact_vision_missing_${missing}`,
+        name: 'inspect_image',
+        arguments: {
+          path: candidatePath,
+          prompt: missing === 'phase'
+            ? 'Compare this screenshot with the exact reference.'
+            : 'REFERENCE FIDELITY check — cover slide. Compare it.',
+        },
+      }, {
+        sessionId: session.summary.id,
+        turnId: 'turn_exact_vision_missing',
+        stepId: `step_exact_vision_missing_${missing}`,
+        signal: new AbortController().signal,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(result.content).toMatch(missing === 'compare'
+        ? /requires a dual-image Vision comparison provider/
+        : missing === 'manifest'
+          ? /requires a durable reference visual evidence manifest/
+          : missing === 'binding'
+            ? /not bound to the active source evidence SHA-256/
+            : missing === 'font_manifest'
+              ? /requires durable font evidence/
+              : missing === 'font_binding'
+                ? /visual\/font evidence is not bound/iu
+            : missing === 'phase'
+              ? /must identify exactly one phase/
+              : missing === 'attestation'
+                ? /requires a successful browser screenshot render attestation/
+                : /does not carry a matching exact render attestation/)
+      expect(inspect).not.toHaveBeenCalled()
+      expect(compare).not.toHaveBeenCalled()
+    }
+  })
+
+  it('rejects an exact comparison when the candidate screenshot changes during the model call', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-exact-vision-mutated-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const fixture = await installExactReferenceVisualFixture(store, session.summary.id)
+    const candidatePath = 'evidence/candidate.png'
+    const candidateTarget = resolve(store.workspaceDir(session.summary.id), candidatePath)
+    const candidate = dimensionedPng(fixture.viewport.width, fixture.viewport.height, 9)
+    await writeWorkspaceFile(store.workspaceDir(session.summary.id), candidatePath, candidate)
+    await appendExactRenderAttestation(store, session.summary.id, {
+      callId: 'browser_exact_mutated',
+      candidatePath,
+      candidateSha256: createHash('sha256').update(candidate).digest('hex'),
+      phase: 'cover',
+      viewport: fixture.viewport,
+      referenceEvidenceSha256: fixture.sourceEvidenceSha256,
+    })
+    const inspect = vi.fn<VisionInspector['inspect']>()
+    const compare = vi.fn<NonNullable<VisionInspector['compare']>>(async () => {
+      await writeFile(candidateTarget, dimensionedPng(fixture.viewport.width, fixture.viewport.height, 8))
+      return {
+        content: 'NO DEFECTS\nREFERENCE MATCH',
+        referenceMetadata: { mime: 'image/png', bytes: fixture.screenshots.cover.length, ...fixture.viewport },
+        candidateMetadata: { mime: 'image/png', bytes: candidate.length, ...fixture.viewport },
+        usage: { promptTokens: 100, completionTokens: 4, totalTokens: 104, cachedPromptTokens: 0 },
+        modelRequestCount: 1,
+        modelCallCount: 1,
+      }
+    })
+    const tools = new ToolExecutor(
+      store,
+      new ProcessManager(() => {}, 10_000),
+      new BrowserManager(),
+      { inspect, compare },
+      async () => false,
+    )
+
+    const result = await tools.execute({
+      id: 'call_exact_vision_mutated',
+      name: 'inspect_image',
+      arguments: {
+        path: candidatePath,
+        prompt: 'REFERENCE FIDELITY check — cover slide. Compare it.',
+      },
+    }, {
+      sessionId: session.summary.id,
+      turnId: 'turn_exact_vision_mutated',
+      stepId: 'step_exact_vision_mutated',
+      signal: new AbortController().signal,
+    })
+
+    expect(result).toMatchObject({
+      isError: true,
+      content: expect.stringMatching(/Image changed while visual comparison was running/),
+      modelUsage: { promptTokens: 100, completionTokens: 4, totalTokens: 104, cachedPromptTokens: 0 },
+      modelRequestCount: 1,
+      modelCallCount: 1,
+    })
+    expect(compare).toHaveBeenCalledOnce()
+    expect(inspect).not.toHaveBeenCalled()
   })
 
   it('keeps completed vision usage on a failed inspect_image result', async () => {
@@ -3595,6 +4323,41 @@ describe('tool executor vision integration', () => {
       expect.anything(),
     )
     appOrigin = ''
+  })
+
+  it('fails an explicit Browser open before transport when the workspace file is missing', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-browser-missing-file-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const browser = new BrowserManager()
+    const open = vi.spyOn(browser, 'open').mockResolvedValue({ text: 'unexpected preview response' })
+    const tools = new ToolExecutor(
+      store,
+      new ProcessManager(() => {}, 10_000),
+      browser,
+      { inspect: vi.fn() },
+      async () => false,
+      { localAppBaseUrl: 'http://127.0.0.1:49123' },
+    )
+
+    const result = await tools.execute({
+      id: 'call_browser_missing_file',
+      name: 'browser',
+      arguments: { action: 'open', path: 'missing-deck.html' },
+    }, {
+      sessionId: session.summary.id,
+      turnId: 'turn_browser_missing_file',
+      stepId: 'step_browser_missing_file',
+      signal: new AbortController().signal,
+    })
+
+    expect(result).toMatchObject({
+      isError: true,
+      content: expect.stringContaining('Browser cannot open missing workspace file: missing-deck.html'),
+    })
+    expect(open).not.toHaveBeenCalled()
   })
 
   it('applies an explicit viewport on browser open and returns the resized snapshot', async () => {
@@ -4304,6 +5067,404 @@ describe('tool executor vision integration', () => {
     expect(validated).toEqual(['https://example.com/start', 'https://cdn.example.com/missing'])
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls.every(([, init]) => init?.redirect === 'manual')).toBe(true)
+  })
+
+  it('records only a source-grounded reference contract and statically rejects the prior navy-and-gold redesign', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-reference-style-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const referenceUrl = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/blue-professional/template.html'
+    const referenceHtml = '<!doctype html><html><head><style>:root{--bg:#fdfae7;--primary:#1e2bfa;--text:#111111;--muted:#6b6b6b;--accent-medium:rgba(30,43,250,0.15)}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg)}body{font-family:Inter;color:var(--text)}p{color:var(--muted)}.deck{position:relative;width:100vw;height:100vh}.slide{position:absolute;inset:0;display:flex;flex-direction:column;opacity:0}.slide.active{opacity:1}.layout-cover{justify-content:center;clip-path:polygon(30% 0,100% 0,100% 100%,0 100%)}.cover-dots{display:grid;grid-template-columns:repeat(3,6px)}.slide-header{display:flex;justify-content:space-between}.layout-closing{display:flex;align-items:center;justify-content:center}.progress-bar{height:3px;position:fixed;left:0;right:0;bottom:0;background:var(--primary)}.nav-controls{position:fixed;right:24px;bottom:20px}h1{font-family:"Space Grotesk"}</style></head><body><main class="deck"><section class="slide active layout-cover"><h1>Reference cover</h1><p>Reference subtitle</p><div class="cover-dots"><span></span><span></span><span></span></div></section><section class="slide"><header class="slide-header"><span>Overview</span><span>Weekly</span></header></section><section class="slide layout-closing"><h1>Reference closing</h1></section></main><div class="progress-bar"></div><nav class="nav-controls"><button>Previous</button><button>Next</button></nav></body></html>'
+    const fetchCall = {
+      id: 'reference-fetch',
+      type: 'function' as const,
+      function: { name: 'web_fetch', arguments: JSON.stringify({ url: referenceUrl, format: 'html' }) },
+    }
+    await store.update(session.summary.id, (state) => {
+      state.messages = [{ role: 'user', content: '严格参考 blue-professional 制作 HTML Slides。' }, {
+        role: 'assistant', content: null, tool_calls: [fetchCall],
+      }, {
+        role: 'tool', tool_call_id: fetchCall.id, tool_result_status: 'succeeded',
+        content: JSON.stringify({ status: 'success', url: referenceUrl, content: referenceHtml }),
+      }]
+    })
+    const referenceBrowser = new BrowserManager()
+    const tools = new ToolExecutor(
+      store,
+      new ProcessManager(() => {}, 10_000),
+      referenceBrowser,
+      { inspect: vi.fn() },
+      async () => false,
+    )
+    const context = {
+      sessionId: session.summary.id,
+      turnId: 'turn_reference_style',
+      stepId: 'step_reference_style',
+      signal: new AbortController().signal,
+    }
+    const contractArguments = {
+      source_url: referenceUrl,
+      strictness: 'exact',
+      colors: ['#fdfae7', '#1e2bfa', '#111111', '#6b6b6b'],
+      fonts: ['Space Grotesk', 'Inter'],
+      layout: ['warm cream 16:9 canvas', 'diagonal cover panel and dot grid'],
+      components: ['soft cobalt cards', 'circular navigation and progress bar'],
+      required_markers: ['.layout-cover', '.cover-dots', '.progress-bar', '.nav-controls', '.slide.active'],
+      signature: 'Warm cream canvas with one cobalt accent and restrained consulting geometry.',
+      avoid: ['dark gradient cover', 'gold accent', 'full-width dark footer'],
+      viewport: { width: 1440, height: 900 },
+    }
+    const fabricated = await tools.execute({
+      id: 'record-fabricated-reference',
+      name: 'record_reference_style',
+      arguments: {
+        ...contractArguments,
+        colors: ['#081426', '#d4af37', '#ffffff'],
+        fonts: ['Segoe UI', 'PingFang SC'],
+        required_markers: ['.dark-cover', '.gold-divider', '.square-nav'],
+      },
+    }, context)
+    expect(fabricated.isError).toBe(true)
+    expect(JSON.parse(fabricated.content)).toMatchObject({
+      status: 'error', message: expect.stringMatching(/not grounded/iu),
+    })
+
+    const cssOnlyReference = referenceHtml.replace(/<main[\s\S]*$/u, '')
+    await store.update(session.summary.id, (state) => {
+      const fetchResult = state.messages.find((message) => message.role === 'tool' && message.tool_call_id === fetchCall.id)
+      if (fetchResult) fetchResult.content = JSON.stringify({ status: 'success', url: referenceUrl, content: cssOnlyReference })
+    })
+    const exactWithoutDom = await tools.execute({
+      id: 'record-reference-without-dom', name: 'record_reference_style', arguments: contractArguments,
+    }, context)
+    expect(exactWithoutDom.isError).toBe(true)
+    expect(JSON.parse(exactWithoutDom.content)).toMatchObject({
+      status: 'error', message: expect.stringMatching(/not grounded|concrete template.*CSS.*DOM/iu),
+    })
+    await store.update(session.summary.id, (state) => {
+      const fetchResult = state.messages.find((message) => message.role === 'tool' && message.tool_call_id === fetchCall.id)
+      if (fetchResult) fetchResult.content = JSON.stringify({ status: 'success', url: referenceUrl, content: referenceHtml })
+      state.referenceStyleEvidenceInvalidation = {
+        version: 1,
+        contractEvidenceSha256: 'f'.repeat(64),
+        sourceUrl: referenceUrl,
+        sourceEvidenceSha256: 'e'.repeat(64),
+        strictness: 'exact',
+        reason: 'visual_evidence_missing_or_invalid',
+        invalidatedAt: new Date().toISOString(),
+      }
+    })
+
+    const recorded = await tools.execute({
+      id: 'record-reference',
+      name: 'record_reference_style',
+      arguments: {
+        ...contractArguments,
+        colors: [...contractArguments.colors, 'rgba(30, 43, 250, 0.15)'],
+      },
+    }, context)
+    expect(recorded.isError, recorded.content).toBe(false)
+    const recordedState = await store.get(session.summary.id)
+    expect(recordedState.referenceStyleEvidenceInvalidation).toBeUndefined()
+    expect(recordedState.activeReferenceStyleEvidenceGeneration).toMatch(/^ref_[a-z0-9]{20}$/u)
+    const recordedPayload = JSON.parse(recorded.content) as Record<string, unknown>
+    expect(recordedPayload).toMatchObject({
+      status: 'success',
+      contract: contractArguments,
+      normalization: {
+        omitted_visually_inert_colors: ['rgba(30,43,250,0.15)'],
+      },
+      provenance: {
+        resolvedUrl: referenceUrl,
+        evidenceSha256: createHash('sha256').update(referenceHtml).digest('hex'),
+        evidenceBytes: Buffer.byteLength(referenceHtml),
+      },
+      source_profile: {
+        version: 1,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ selector: '.layout-cover', requiredInDom: true }),
+          expect.objectContaining({ selector: '.progress-bar', requiredInDom: true }),
+        ]),
+        dom: expect.arrayContaining([
+          expect.objectContaining({ className: 'layout-cover', required: true }),
+          expect.objectContaining({ className: 'progress-bar', required: true }),
+        ]),
+      },
+      render_profile: {
+        version: 1,
+        evidenceSha256: createHash('sha256').update(referenceHtml).digest('hex'),
+        viewport: contractArguments.viewport,
+        phases: {
+          cover: { anchors: expect.arrayContaining([expect.objectContaining({ selector: '.progress-bar' })]) },
+          content: { anchors: expect.arrayContaining([expect.objectContaining({ selector: '.progress-bar' })]) },
+          closing: { anchors: expect.arrayContaining([expect.objectContaining({ selector: '.progress-bar' })]) },
+        },
+      },
+    })
+    expect(recordedState.activeReferenceStyleContract?.contract.colors)
+      .toEqual(contractArguments.colors)
+
+    const recordCall = {
+      id: 'record-reference',
+      type: 'function' as const,
+      function: { name: 'record_reference_style', arguments: JSON.stringify(contractArguments) },
+    }
+    await store.update(session.summary.id, (state) => {
+      state.messages.push(
+        { role: 'assistant', content: null, tool_calls: [recordCall] },
+        { role: 'tool', tool_call_id: recordCall.id, tool_result_status: 'succeeded', content: recorded.content },
+      )
+    })
+    const navyCandidate = '<!doctype html><html><head><style>:root{--navy:#081426;--gold:#d4af37}body{background:linear-gradient(135deg,#081426,#123769);font-family:Segoe UI}.card{background:#fff;box-shadow:0 12px 30px #0003}</style><!-- #fdfae7 #1e2bfa Space Grotesk Inter .layout-cover .cover-dots .progress-bar .nav-controls --></head><body><main class="card">Corporate deck</main></body></html>'
+    await writeFile(resolve(store.workspaceDir(session.summary.id), 'ai-week.html'), navyCandidate, 'utf8')
+    const mismatch = await tools.execute({
+      id: 'verify-reference', name: 'verify_reference_style', arguments: { path: 'ai-week.html' },
+    }, context)
+    expect(mismatch.isError).toBe(false)
+    expect(JSON.parse(mismatch.content)).toMatchObject({
+      status: 'success', path: 'ai-week.html', fidelity: 'mismatch', score: 0,
+      missing: {
+        colors: contractArguments.colors,
+        fonts: contractArguments.fonts,
+        markers: contractArguments.required_markers,
+      },
+      violations: { source: expect.arrayContaining([expect.stringMatching(/layout-cover|progress-bar/iu)]) },
+    })
+
+    const geometryDrift = referenceHtml.replace('.progress-bar{height:3px;position:fixed', '.progress-bar{height:12px;position:fixed')
+    await writeFile(resolve(store.workspaceDir(session.summary.id), 'ai-week.html'), geometryDrift, 'utf8')
+    const geometryMismatch = await tools.execute({
+      id: 'verify-reference-geometry', name: 'verify_reference_style', arguments: { path: 'ai-week.html' },
+    }, context)
+    expect(geometryMismatch.isError).toBe(false)
+    expect(JSON.parse(geometryMismatch.content)).toMatchObject({
+      fidelity: 'mismatch',
+      violations: { source: expect.arrayContaining([expect.stringMatching(/progress-bar height.*3px.*12px/iu)]) },
+    })
+
+    await writeFile(resolve(store.workspaceDir(session.summary.id), 'ai-week.html'), referenceHtml, 'utf8')
+    const exactMatch = await tools.execute({
+      id: 'verify-reference-exact', name: 'verify_reference_style', arguments: { path: 'ai-week.html' },
+    }, context)
+    expect(exactMatch.isError).toBe(false)
+    expect(JSON.parse(exactMatch.content)).toMatchObject({
+      fidelity: 'pass', score: 100, violations: { source: [] },
+      reference_font_manifest_sha256: (recordedPayload.font_evidence as { manifestSha256: string }).manifestSha256,
+    })
+    await store.update(session.summary.id, (state) => {
+      if (!state.activeReferenceStyleContract) throw new Error('reference fixture missing')
+      delete state.activeReferenceStyleContract.fontEvidence
+    })
+    const missingFontEvidence = await tools.execute({
+      id: 'verify-reference-missing-font', name: 'verify_reference_style', arguments: { path: 'ai-week.html' },
+    }, context)
+    expect(missingFontEvidence.isError).toBe(true)
+    expect(missingFontEvidence.content).toMatch(/requires durable font evidence/iu)
+    await referenceBrowser.closeEverything()
+  })
+
+  it('atomically records exact font and three-phase visual evidence without exposing materialized font bytes', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-reference-bundle-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const referenceUrl = 'https://example.com/reference.html'
+    const cssUrl = 'https://fonts.googleapis.com/css2?family=Inter&display=swap'
+    const fontUrl = 'https://fonts.gstatic.com/s/inter/v1/inter.woff2'
+    const referenceHtml = `<!doctype html><html><head>
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <link rel="stylesheet" href="${cssUrl.replaceAll('&', '&amp;')}">
+      <style>
+        :root{--bg:#fdfae7;--primary:#1e2bfa}
+        body{margin:0;background:var(--bg);color:var(--primary);font-family:'Inter',sans-serif}
+        .slide{position:absolute;inset:0}.layout-cover{display:flex}.layout-content{display:grid}
+        .layout-closing{display:flex}.progress-bar{position:fixed;bottom:0;height:3px;background:var(--primary)}
+      </style></head><body>
+      <section class="slide layout-cover">Cover</section>
+      <section class="slide layout-content">Content</section>
+      <section class="slide layout-closing">Closing</section>
+      <div class="progress-bar"></div></body></html>`
+    const fetchCall = {
+      id: 'reference-bundle-fetch',
+      type: 'function' as const,
+      function: { name: 'web_fetch', arguments: JSON.stringify({ url: referenceUrl, format: 'html' }) },
+    }
+    await store.update(session.summary.id, (state) => {
+      state.messages = [
+        { role: 'user', content: 'Use the exact reference style.' },
+        { role: 'assistant', content: null, tool_calls: [fetchCall] },
+        {
+          role: 'tool', tool_call_id: fetchCall.id, tool_result_status: 'succeeded',
+          content: JSON.stringify({ status: 'success', url: referenceUrl, content: referenceHtml }),
+        },
+      ]
+    })
+
+    const fontBytes = Buffer.from('wOF2-inter-fixture', 'ascii')
+    const fontCss = `@font-face{font-family:'Inter';font-style:normal;font-weight:400;src:url(${fontUrl}) format('woff2')}`
+    let rejectFontFetch = false
+    const responseAt = (url: string, body: BodyInit, contentType: string, status = 200): Response => {
+      const response = new Response(body, { status, headers: { 'content-type': contentType } })
+      Object.defineProperty(response, 'url', { configurable: true, value: url })
+      return response
+    }
+    const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
+      const url = String(input)
+      if (url === cssUrl) {
+        return rejectFontFetch
+          ? responseAt(url, 'unavailable', 'text/css', 503)
+          : responseAt(url, fontCss, 'text/css')
+      }
+      if (url === fontUrl) return responseAt(url, fontBytes, 'font/woff2')
+      throw new Error(`Unexpected exact-font fetch ${url}`)
+    }) as unknown as typeof fetch
+
+    const viewport = { width: 1000, height: 600 }
+    const evidenceSha256 = createHash('sha256').update(referenceHtml).digest('hex')
+    const chrome = {
+      selector: '.progress-bar', count: 1, geometry: 'strict' as const,
+      rects: [{ x: 0, y: 0.995, width: 1, height: 0.005 }],
+      styles: [{ display: 'block', position: 'fixed', opacity: '1', height: '3px' }],
+      occlusion: [1],
+    }
+    const structural = (selector: string) => ({
+      selector, count: 1, geometry: 'strict' as const,
+      rects: [{ x: 0, y: 0, width: 1, height: 1 }],
+      styles: [{ display: 'flex', position: 'absolute', opacity: '1' }],
+      occlusion: [1],
+    })
+    const renderProfile = {
+      version: 1 as const,
+      evidenceSha256,
+      viewport,
+      phases: {
+        cover: { anchors: [structural('.layout-cover'), chrome], overlayProbes: [] },
+        content: { anchors: [structural('.layout-content'), chrome], overlayProbes: [] },
+        closing: { anchors: [structural('.layout-closing'), chrome], overlayProbes: [] },
+      },
+    }
+    const screenshots = {
+      cover: dimensionedPng(viewport.width, viewport.height, 11),
+      content: dimensionedPng(viewport.width, viewport.height, 12),
+      closing: dimensionedPng(viewport.width, viewport.height, 13),
+    }
+    const browser = new BrowserManager()
+    const capture = vi.spyOn(browser, 'captureReferenceRenderBundle').mockResolvedValue({
+      profile: renderProfile,
+      screenshots,
+    })
+    const tools = new ToolExecutor(
+      store,
+      new ProcessManager(() => {}, 10_000),
+      browser,
+      { inspect: vi.fn() },
+      async () => false,
+      { fetch: fetchMock },
+    )
+    const context = {
+      sessionId: session.summary.id,
+      turnId: 'turn-reference-bundle',
+      stepId: 'step-reference-bundle',
+      signal: new AbortController().signal,
+    }
+    const contractArguments = {
+      source_url: referenceUrl,
+      strictness: 'exact',
+      colors: ['#fdfae7', '#1e2bfa'],
+      fonts: ['Inter'],
+      layout: ['full viewport slide canvas', 'three distinct cover/content/closing layouts'],
+      components: ['persistent progress bar', 'structured slide layouts'],
+      required_markers: ['.layout-cover', '.progress-bar'],
+      signature: 'Cream and cobalt exact reference.',
+      avoid: ['unapproved fonts'],
+      viewport,
+    }
+
+    const recorded = await tools.execute({
+      id: 'record-reference-bundle', name: 'record_reference_style', arguments: contractArguments,
+    }, context)
+    expect(recorded.isError, recorded.content).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(capture).toHaveBeenCalledTimes(1)
+    const [renderedHtml, , renderedEvidenceSha256, renderedViewport, renderedOptions] = capture.mock.calls[0]
+    expect(renderedHtml).not.toMatch(/fonts\.(?:googleapis|gstatic)\.com/iu)
+    expect(renderedHtml).toContain(`data:font/woff2;base64,${fontBytes.toString('base64')}`)
+    expect(renderedEvidenceSha256).toBe(evidenceSha256)
+    expect(renderedViewport).toEqual(viewport)
+    expect(renderedOptions).toMatchObject({
+      signal: context.signal,
+      expectedFontFamilies: ['Inter'],
+      fontCss: expect.stringContaining(`data:font/woff2;base64,${fontBytes.toString('base64')}`),
+    })
+
+    const payload = JSON.parse(recorded.content) as Record<string, unknown>
+    expect(payload).toMatchObject({
+      status: 'success',
+      visual_evidence: {
+        sourceEvidenceSha256: evidenceSha256,
+        renderProfileSha256: createHash('sha256').update(JSON.stringify(renderProfile)).digest('hex'),
+        viewport,
+      },
+      font_evidence: {
+        sourceEvidenceSha256: evidenceSha256,
+        familyNames: ['Inter'],
+        materializationManifest: { familyNames: ['Inter'], fonts: [{ bytes: fontBytes.length }] },
+      },
+    })
+    expect(recorded.content).not.toContain('data:font/woff2')
+    const durable = (await store.get(session.summary.id)).activeReferenceStyleContract
+    expect(durable).toMatchObject({
+      provenance: { evidenceSha256 },
+      renderProfile,
+      visualEvidence: payload.visual_evidence,
+      fontEvidence: payload.font_evidence,
+    })
+    expect(await store.resolveReferenceFontEvidence(session.summary.id, durable!.fontEvidence!)).toMatchObject({
+      familyNames: ['Inter'],
+      fontCss: expect.stringContaining(`data:font/woff2;base64,${fontBytes.toString('base64')}`),
+    })
+    for (const phase of ['cover', 'content', 'closing'] as const) {
+      const path = await store.resolveReferenceVisualEvidencePath(session.summary.id, durable!.visualEvidence!, phase)
+      expect(await readFile(path)).toEqual(screenshots[phase])
+    }
+
+    const priorDurable = structuredClone(durable)
+    rejectFontFetch = true
+    const failed = await tools.execute({
+      id: 'record-reference-bundle-font-failure', name: 'record_reference_style', arguments: contractArguments,
+    }, context)
+    expect(failed.isError).toBe(true)
+    expect(JSON.parse(failed.content)).toMatchObject({
+      status: 'error', message: expect.stringMatching(/font materialization.*HTTP 503/iu),
+    })
+    expect(capture).toHaveBeenCalledTimes(1)
+    expect((await store.get(session.summary.id)).activeReferenceStyleContract).toEqual(priorDurable)
+
+    rejectFontFetch = false
+    capture.mockRejectedValueOnce(new Error('trusted family failed to load'))
+    const renderFailed = await tools.execute({
+      id: 'record-reference-bundle-render-failure', name: 'record_reference_style', arguments: contractArguments,
+    }, context)
+    expect(renderFailed.isError).toBe(true)
+    expect(JSON.parse(renderFailed.content)).toMatchObject({
+      status: 'error', message: expect.stringMatching(/browser-rendered bundle.*trusted family failed to load/iu),
+    })
+    expect((await store.get(session.summary.id)).activeReferenceStyleContract).toEqual(priorDurable)
+
+    const fontCommit = vi.spyOn(store, 'commitReferenceFontEvidence')
+      .mockRejectedValueOnce(new Error('private font publication failed'))
+    const commitFailed = await tools.execute({
+      id: 'record-reference-bundle-commit-failure', name: 'record_reference_style', arguments: contractArguments,
+    }, context)
+    expect(commitFailed.isError).toBe(true)
+    expect(JSON.parse(commitFailed.content)).toMatchObject({
+      status: 'error', message: expect.stringMatching(/evidence could not be committed.*private font publication failed/iu),
+    })
+    expect(fontCommit).toHaveBeenCalledOnce()
+    expect((await store.get(session.summary.id)).activeReferenceStyleContract).toEqual(priorDurable)
   })
 
   it('maps a constrained Pexels image search to the exact Arena fetch_media result', async () => {

@@ -1,11 +1,13 @@
 import type { LookupOptions } from 'node:dns'
 import { createServer } from 'node:http'
+import { Agent as HttpsAgent } from 'node:https'
 import type { AddressInfo, LookupFunction } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createPinnedLookup,
   createPublicFetch,
   isPrivateIp,
+  pinnedHttpsProxyRequestOptions,
   pinnedRequestOptions,
   validatePublicUrl,
   type ResolvedPublicUrl,
@@ -96,6 +98,26 @@ describe('network policy', () => {
     expect(options.headers).not.toHaveProperty('host')
   })
 
+  it('uses Happy Eyeballs only within a prevalidated dual-stack address set', () => {
+    const dualStack: ResolvedPublicUrl = {
+      url: new URL('https://public.example/resource'),
+      hostname: 'public.example',
+      addresses: [
+        { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
+        { address: '93.184.216.34', family: 4 },
+      ],
+    }
+    const dualOptions = pinnedRequestOptions(new Request(dualStack.url), dualStack, new Headers())
+    expect(dualOptions).toMatchObject({
+      autoSelectFamily: true,
+      autoSelectFamilyAttemptTimeout: 250,
+    })
+
+    const ipv4Only = { ...dualStack, addresses: [dualStack.addresses[1]] }
+    expect(pinnedRequestOptions(new Request(ipv4Only.url), ipv4Only, new Headers()))
+      .toMatchObject({ autoSelectFamily: false })
+  })
+
   it('uses one admitted DNS answer for the real connection and preserves the URL Host header', async () => {
     const hosts: string[] = []
     const server = createServer((request, response) => {
@@ -120,6 +142,74 @@ describe('network policy', () => {
     expect(resolveAddresses).toHaveBeenCalledOnce()
     expect(hosts).toEqual([`public.example:${port}`])
     expect(response.url).toBe(`http://public.example:${port}/resource`)
+  })
+
+  it('pins HTTPS proxy CONNECT authority while preserving the admitted Host and TLS SNI', () => {
+    const resolved: ResolvedPublicUrl = {
+      url: new URL('https://public.example:8443/resource?q=1'),
+      hostname: 'public.example',
+      addresses: [
+        { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
+        { address: '93.184.216.34', family: 4 },
+      ],
+    }
+    const options = pinnedHttpsProxyRequestOptions(
+      new Request(resolved.url),
+      resolved,
+      new Headers({ accept: 'text/html' }),
+      { HTTPS_PROXY: 'http://127.0.0.1:7897', NO_PROXY: '' },
+    )
+
+    expect(options).toMatchObject({
+      protocol: 'https:',
+      hostname: '93.184.216.34',
+      servername: 'public.example',
+      port: '8443',
+      path: '/resource?q=1',
+      autoSelectFamily: false,
+    })
+    expect(options.headers).toMatchObject({
+      accept: 'text/html',
+      host: 'public.example:8443',
+    })
+    expect(options).not.toHaveProperty('lookup')
+    expect(options.agent).toBeInstanceOf(HttpsAgent)
+    expect(() => pinnedHttpsProxyRequestOptions(
+      new Request('http://public.example/resource'),
+      { ...resolved, url: new URL('http://public.example/resource') },
+      new Headers(),
+      { HTTP_PROXY: 'http://127.0.0.1:7897' },
+    )).toThrow(/only for HTTPS/)
+  })
+
+  it('keeps HTTP requests on the verified direct socket even when an HTTP proxy is configured', async () => {
+    let proxyRequests = 0
+    const proxy = createServer((_request, response) => {
+      proxyRequests += 1
+      response.end('unexpected proxy path')
+    })
+    servers.push(proxy)
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+    const proxyPort = (proxy.address() as AddressInfo).port
+
+    const hosts: string[] = []
+    const destination = createServer((request, response) => {
+      hosts.push(request.headers.host ?? '')
+      response.end('verified direct path')
+    })
+    servers.push(destination)
+    await new Promise<void>((resolve) => destination.listen(0, '127.0.0.1', resolve))
+    const destinationPort = (destination.address() as AddressInfo).port
+    const pinnedFetch = createPublicFetch({
+      resolveAddresses: async () => [{ address: '127.0.0.1', family: 4 }],
+      isAddressAllowed: (address) => address === '127.0.0.1',
+      proxyEnv: { HTTP_PROXY: `http://127.0.0.1:${proxyPort}`, NO_PROXY: '' },
+    })
+
+    const response = await pinnedFetch(`http://public.example:${destinationPort}/resource`)
+    expect(await response.text()).toBe('verified direct path')
+    expect(proxyRequests).toBe(0)
+    expect(hosts).toEqual([`public.example:${destinationPort}`])
   })
 
   it('re-resolves and revalidates every redirect hop before making its connection', async () => {

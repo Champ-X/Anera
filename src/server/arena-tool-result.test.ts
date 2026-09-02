@@ -52,7 +52,7 @@ const activeSuccesses: Record<string, Record<string, unknown>> = {
     status: 'enabled', connector: 'github', tools: [{ name: 'github_read_file', description: 'Read a file.' }],
   },
   list_files: { files: [{ path: 'notes.md', size: '12 B' }] },
-  present_file: { status: 'success', path: 'notes.md' },
+  present_file: { status: 'success', path: 'notes.md', artifact_hash: 'present-hash', bytes: 12 },
   propose_plan: { decision: 'accepted' },
   read_file: { status: 'success', kind: 'text', size: 8, lines: 1, content: 'contents', truncated: false },
   start_process: {
@@ -176,6 +176,9 @@ describe('Arena public tool-result protocol', () => {
     expect(() => assertArenaActiveToolResult('ask_user', {
       content: JSON.stringify({ skipped: true, answers: [{ questionId: 'q', selectedOptionId: 'a', customResponse: null }] }), isError: false,
     })).toThrow(/must be empty/)
+    expect(() => assertArenaActiveToolResult('present_file', {
+      content: JSON.stringify({ status: 'success', path: 'notes.md', artifact_hash: 42, bytes: '12' }), isError: false,
+    })).toThrow(/artifact_hash/)
 
     const enforced = enforceArenaPublicToolResult('bash', {
       content: JSON.stringify({ status: 'completed', stdout: 'invalid' }), isError: false,

@@ -28,7 +28,7 @@ describe('deterministic UI visual fixture', () => {
         'Visual Task Completion',
         'Visual Task Review',
         'Visual Coding Repository',
-        'Visual Token Limit',
+        'Visual High Token Usage',
         'Visual Structured Answer',
         'Visual Approval',
         'Visual Timed Out',
@@ -42,7 +42,10 @@ describe('deterministic UI visual fixture', () => {
       const timedOut = await store.get(sessions.timedOut.id)
       expect(timedOut.summary.status).toBe('timed_out')
       expect(timedOut.plan?.items.map((item) => item.status)).toEqual(['in_progress', 'pending'])
-      expect((await store.get(sessions.limited.id)).summary.limits?.sessionTokens.reached).toBe(true)
+      const highUsage = await store.get(sessions.highUsage.id)
+      expect(highUsage.summary.usage.totalTokens).toBe(100_240)
+      expect(highUsage.summary.limits).toBeUndefined()
+      expect((await store.events(sessions.highUsage.id)).some((event) => event.type === 'session.limit.reached')).toBe(false)
       const completed = await store.get(sessions.completed.id)
       expect(completed.summary.status).toBe('completed')
       expect(completed.artifacts).toHaveLength(7)

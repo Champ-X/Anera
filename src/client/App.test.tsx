@@ -1526,6 +1526,40 @@ describe('client timeline projection', () => {
     })
     expect(timeline.some((item) => item.kind === 'final')).toBe(false)
   })
+
+  it('keeps historical Session token-limit events auditable without rendering an obsolete error', () => {
+    const legacyLimit = {
+      maxTokens: 1_000_000,
+      usedTokens: 1_002_796,
+      remainingTokens: 0,
+      reached: true,
+      message: 'This session has reached its token usage limit. Please start a new chat to continue.',
+    }
+    const limitEvent = event(2, 'session.limit.reached', {
+      code: 'session_token_limit',
+      limit: legacyLimit,
+    }, 'step_legacy_token_limit')
+    const snapshot = fixture([
+      event(1, 'error', {
+        code: 'session_token_limit',
+        category: 'session_token_limit',
+        message: 'This session has reached its token usage limit. Please start a new chat to continue.',
+      }, 'step_legacy_token_limit'),
+    ])
+    snapshot.session.status = 'completed'
+    snapshot.session.limits = { sessionTokens: legacyLimit }
+    const projected = applyEventToSnapshot(
+      applyEventToSnapshot(snapshot, limitEvent),
+      event(3, 'assistant.final', { content: 'The resumed task completed.', finishReason: 'stop' }, 'step_resumed_final'),
+    )
+
+    expect(projected.session.limits).toBeUndefined()
+    const timeline = projectTimeline(projected)
+    expect(timeline.some((item) => item.kind === 'error')).toBe(false)
+    expect(timeline.find((item) => item.kind === 'final')).toMatchObject({
+      content: 'The resumed task completed.',
+    })
+  })
 })
 
 describe('live snapshot projection', () => {
