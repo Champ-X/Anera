@@ -208,7 +208,6 @@ export const config = {
   customFeedbackArm: customFeedbackArm(),
   visionModel: env('DEEPSEEK_VISION_MODEL', 'deepseek-v4-flash-vision-exp'),
   maxToolCallsPerStep: positiveInt('ANERA_MAX_TOOL_CALLS_PER_STEP', 16),
-  maxToolCallsPerRun: positiveInt('ANERA_MAX_TOOL_CALLS_PER_RUN', 96),
   maxParallelToolCalls: positiveInt('ANERA_MAX_PARALLEL_TOOL_CALLS', 6),
   runTimeoutMs: positiveInt('ANERA_RUN_TIMEOUT_MS', 30 * 60 * 1000),
   websiteIdleSleepMs: positiveInt('ANERA_WEBSITE_IDLE_SLEEP_MS', 5 * 60 * 1000),

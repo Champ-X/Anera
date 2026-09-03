@@ -69,7 +69,13 @@ export interface ReferenceStyleSourceProfile {
 
 export type ReferenceRenderPhase = 'cover' | 'content' | 'closing'
 
-export type ReferenceRenderGeometryPolicy = 'strict' | 'size' | 'intrinsic-block'
+export type ReferenceRenderGeometryPolicy =
+  | 'strict'
+  | 'size'
+  | 'intrinsic-block'
+  | 'intrinsic-block-center'
+  | 'intrinsic-inline'
+  | 'intrinsic-size'
 
 export interface RenderedReferenceRectProfile {
   /** Viewport-normalized coordinates, retained with bounded precision. */
@@ -114,7 +120,7 @@ export interface RenderedReferencePhaseProfile {
 }
 
 /**
- * One real interior `.layout-*` grammar captured from the reference deck.
+ * One real interior slide-variant grammar captured from the reference deck.
  * The selector is intentionally retained instead of a slide index: an exact
  * candidate may reduce or reorder the reference deck, but it may not invent a
  * layout whose rendered structure was never present in the reference.
@@ -302,6 +308,21 @@ const STRUCTURAL_LAYOUT_PROPERTIES = new Set([
   'display', 'grid-template-columns', 'grid-template-rows', 'gap', 'row-gap', 'column-gap',
   'align-items', 'justify-content', 'position', 'width', 'height', 'min-width', 'min-height',
 ])
+const STRUCTURAL_REFERENCE_MARKERS = new Set([
+  'clip-path', 'grid-template', 'grid-template-columns', 'grid-template-rows',
+])
+const RENDER_PHASE_STRUCTURAL_ROOT_SELECTOR_PATTERN = /^(?:\.slide-header|\.(?!(?:(?:slide|active|prev|current|visible|hidden|entering|leaving)|(?:nav|progress|counter|keyboard|hint|chrome|runner|footer)(?:[-_][\w-]*)?|cover-dots?|closing-decoration|accent-(?:line|dot))$)[a-z_][\w-]*)$/iu
+const STANDARD_HTML_SELECTOR_TAGS = new Set([
+  'a', 'abbr', 'address', 'article', 'aside', 'audio', 'b', 'blockquote', 'body', 'button',
+  'canvas', 'caption', 'cite', 'code', 'col', 'colgroup', 'data', 'dd', 'del', 'details',
+  'dfn', 'dialog', 'div', 'dl', 'dt', 'em', 'fieldset', 'figcaption', 'figure', 'footer',
+  'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header', 'hgroup', 'html', 'i',
+  'iframe', 'img', 'input', 'ins', 'kbd', 'label', 'legend', 'li', 'main', 'mark', 'menu',
+  'meter', 'nav', 'object', 'ol', 'optgroup', 'option', 'output', 'p', 'picture', 'pre',
+  'progress', 'q', 's', 'samp', 'section', 'select', 'slot', 'small', 'source', 'span',
+  'strong', 'sub', 'summary', 'sup', 'svg', 'table', 'tbody', 'td', 'template', 'textarea',
+  'tfoot', 'th', 'thead', 'time', 'tr', 'track', 'u', 'ul', 'var', 'video', 'wbr',
+])
 
 export function normalizeReferenceStyleContract(value: unknown): ReferenceStyleContract {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('reference style contract must be an object')
@@ -326,11 +347,9 @@ export function normalizeReferenceStyleContract(value: unknown): ReferenceStyleC
     2,
     10,
     300,
-    normalizeContractMarker,
+    normalizeReferenceContractMarker,
   )
-  const distinctiveMarkers = requiredMarkers.filter((marker) => (
-    /(?:[.#][a-z][\w-]{3,}|--[a-z][\w-]+|clip-path|grid-template|progress|nav(?:igation)?[-_ ]|cover[-_ ]|dots?[-_ ]|diagonal|slide-counter)/iu.test(marker)
-  ))
+  const distinctiveMarkers = requiredMarkers.filter(referenceContractMarkerIsDistinctive)
   if (distinctiveMarkers.length < Math.min(2, requiredMarkers.length)) {
     throw new Error('required_markers must include at least two distinctive source selectors, variables, or layout declarations')
   }
@@ -679,16 +698,11 @@ export function normalizeRenderedReferenceStyleProfile(
   if (!input.phases || typeof input.phases !== 'object' || Array.isArray(input.phases)) throw new Error('render_profile.phases must be an object')
   const phasesInput = input.phases as Record<string, unknown>
   const phases = Object.fromEntries((['cover', 'content', 'closing'] as const).map((phase) => {
-    const structuralPattern = phase === 'cover'
-      ? /(?:^|[-_.#])(?:layout-cover|cover)(?:$|[-_.:# ])/iu
-      : phase === 'closing'
-        ? /(?:^|[-_.#])(?:layout-closing|closing)(?:$|[-_.:# ])/iu
-        : /(?:^|[-_.#])(?:slide-header|layout-(?!cover|closing)[a-z0-9-]+)(?:$|[-_.:# ])/iu
     return [phase, normalizeRenderedReferencePhaseProfile(
       phasesInput[phase],
       `render_profile.phases.${phase}`,
       RENDER_PROFILE_MAX_ANCHORS_PER_PHASE,
-      structuralPattern,
+      RENDER_PHASE_STRUCTURAL_ROOT_SELECTOR_PATTERN,
       true,
     )]
   })) as unknown as Record<ReferenceRenderPhase, RenderedReferencePhaseProfile>
@@ -705,7 +719,7 @@ export function normalizeRenderedReferenceStyleProfile(
       if (!rawVariant || typeof rawVariant !== 'object' || Array.isArray(rawVariant)) throw new Error(`${path} must be an object`)
       const variant = rawVariant as Record<string, unknown>
       const layoutSelector = normalizeCssSelector(requiredBoundedString(variant.layoutSelector, `${path}.layoutSelector`, 120))
-      if (!/^\.layout-(?!cover$|closing$)[a-z0-9-]+$/u.test(layoutSelector) || selectors.has(layoutSelector)) {
+      if (!RENDER_PHASE_STRUCTURAL_ROOT_SELECTOR_PATTERN.test(layoutSelector) || selectors.has(layoutSelector)) {
         throw new Error(`${path}.layoutSelector is invalid or duplicated`)
       }
       selectors.add(layoutSelector)
@@ -754,7 +768,9 @@ function normalizeRenderedReferencePhaseProfile(
     selectors.add(selector)
     const count = Number(anchor.count)
     if (!Number.isInteger(count) || count < 1 || count > 10_000) throw new Error(`${anchorPath}.count is out of bounds`)
-    if (!['strict', 'size', 'intrinsic-block'].includes(String(anchor.geometry))) {
+    if (![
+      'strict', 'size', 'intrinsic-block', 'intrinsic-block-center', 'intrinsic-inline', 'intrinsic-size',
+    ].includes(String(anchor.geometry))) {
       throw new Error(`${anchorPath}.geometry is invalid`)
     }
     const geometry = anchor.geometry as ReferenceRenderGeometryPolicy
@@ -792,7 +808,7 @@ function normalizeRenderedReferencePhaseProfile(
     throw new Error(`${path} must retain at least one strict geometry structural anchor`)
   }
   if (requirePersistentChrome
-    && !anchors.some((anchor) => /(?:^|[-_.#])(?:nav|progress|counter|keyboard|hint|chrome)(?:$|[-_.:# ])/iu.test(anchor.selector))) {
+    && !anchors.some((anchor) => /(?:^|[-_.#])(?:nav|progress|counter|keyboard|hint|chrome|runner|footer)(?:$|[-_.:# ])/iu.test(anchor.selector))) {
     throw new Error(`${path} lacks persistent chrome`)
   }
   const rawOverlayProbes = rawPhase.overlayProbes
@@ -1697,10 +1713,13 @@ function boundedNormalizedStringArray(
   if (!Array.isArray(value)) throw new Error(`${name} must be an array`)
   const normalized: string[] = []
   const seen = new Set<string>()
-  for (const item of value) {
-    const raw = requiredBoundedString(item, name, maxCharacters)
+  for (const [index, item] of value.entries()) {
+    const entryName = `${name}[${index}]`
+    const raw = requiredBoundedString(item, entryName, maxCharacters)
     const token = normalize(raw)
-    if (!token) throw new Error(`${name} entries must contain one concrete source token, not a generic label`)
+    if (!token) {
+      throw new Error(`${entryName} ${JSON.stringify(raw)} must contain one concrete source token, not a generic label`)
+    }
     const key = normalizeStyleText(token)
     if (seen.has(key)) continue
     seen.add(key)
@@ -1758,6 +1777,7 @@ interface DomConnectedVisualTokens {
   variables: Set<string>
   domClasses: Set<string>
   domIds: Set<string>
+  domTags: Set<string>
 }
 
 function normalizeCssColorToken(value: string): string {
@@ -1771,12 +1791,9 @@ function normalizeFontFamilyToken(value: string): string {
 function cssRuleIsVisiblyConnected(rule: ParsedCssRule, dom: DomSnapshot): boolean {
   if (rule.declarations.get('display') === 'none'
     || ['hidden', 'collapse'].includes(rule.declarations.get('visibility') ?? '')) return false
-  const identifiers = selectorIdentifiers(rule.selector)
-  if (identifiers.length > 0) return selectorIdentifiersShareRelationship(rule.selector, dom)
   const base = rule.selector.replace(/::(?:before|after)$/iu, '')
   if (base === ':root') return dom.tags.has('html')
-  return /^(?:html|body|h[1-6]|p|li|blockquote|small|strong|em)$/iu.test(base)
-    && dom.tags.has(base.toLowerCase())
+  return selectorIdentifiersShareRelationship(rule.selector, dom)
 }
 
 /**
@@ -1802,6 +1819,7 @@ function domConnectedVisualTokens(
   for (const rule of rules) {
     selectors.add(rule.selector)
     for (const identifier of selectorIdentifiers(rule.selector)) selectors.add(identifier)
+    for (const fragment of selectorCompoundFragments(rule.selector)) selectors.add(fragment)
     for (const [property, value] of rule.declarations) {
       properties.add(property)
       if (property.startsWith('--')) variableValues.set(property, value)
@@ -1864,6 +1882,7 @@ function domConnectedVisualTokens(
     variables,
     domClasses: new Set(dom.classes.keys()),
     domIds: new Set(dom.ids),
+    domTags: new Set(dom.tags),
   }
 }
 
@@ -1876,12 +1895,17 @@ function domConnectedMarkerIsGrounded(marker: string, tokens: DomConnectedVisual
     // proven against one real DOM relationship. Requiring that exact selector
     // keeps unused-selector stuffing out while allowing valid compounds such
     // as `.slide.active` whose classes coexist on the same element.
-    return tokens.selectors.has(normalized) && identifiers.every((identifier) => (
-      identifier.startsWith('.')
-        ? tokens.domClasses.has(identifier.slice(1))
-        : tokens.domIds.has(identifier.slice(1))
-    ))
+    return tokens.selectors.has(normalized)
+      && identifiers.every((identifier) => (
+        identifier.startsWith('.')
+          ? tokens.domClasses.has(identifier.slice(1))
+          : tokens.domIds.has(identifier.slice(1))
+      ))
+      && selectorTypeNames(normalized).every((tagName) => tokens.domTags.has(tagName))
   }
+  if (concreteCustomElementName(normalized)
+    && tokens.domTags.has(normalized)
+    && tokens.selectors.has(normalized)) return true
   if (tokens.properties.has(normalized) || tokens.selectors.has(normalized)) return true
   return tokens.domClasses.has(normalized) && tokens.selectors.has(`.${normalized}`)
 }
@@ -1896,14 +1920,82 @@ function normalizeContractFont(value: string): string | undefined {
   return candidate
 }
 
-function normalizeContractMarker(value: string): string | undefined {
+/**
+ * Normalize one model-authored marker using the same grammar as the durable
+ * StyleContract validator and phase repair. Custom elements and bounded CSS
+ * relationships are first-class source tokens; template-specific word lists
+ * are intentionally not used here.
+ */
+export function normalizeReferenceContractMarker(value: string): string | undefined {
   const trimmed = value.trim()
-  if (/^(?:[.#][a-z][\w-]{3,}|--[a-z][\w-]+|(?:layout|cover|closing|nav|progress|slide|metric|accent|card|tag|cta|step|bar|insight|split|keyboard)[a-z0-9_.-]{2,})$/iu.test(trimmed)) {
-    return trimmed
+  const leadingVariable = trimmed.match(/^--[a-z][\w-]+/iu)?.[0]
+  if (leadingVariable) return leadingVariable.toLowerCase()
+
+  const structural = trimmed.toLowerCase()
+  if (STRUCTURAL_REFERENCE_MARKERS.has(structural)) return structural
+
+  const selector = analyzeConcreteCssSelector(trimmed)
+  if (selector?.distinctive) return selector.normalized
+
+  const identifier = trimmed.match(/[.#]-?[_a-z][\w-]{2,}/iu)?.[0]
+  if (identifier) return identifier.toLowerCase()
+
+  for (const candidate of trimmed.matchAll(/(?:^|[^\w-])([a-z][\w]*-[\w-]*[a-z0-9])(?=$|[^\w-])/giu)) {
+    const customElement = concreteCustomElementName(candidate[1])
+    if (customElement) return customElement
   }
-  return trimmed.match(
-    /(?:[.#](?:layout|cover|closing|nav|progress|slide|metric|accent|card|tag|cta|step|bar|insight|split|keyboard)[a-z0-9_.-]*|\b(?:layout|cover|closing|nav|progress|slide|metric|accent|card|tag|cta|step|bar|insight|split|keyboard)[a-z0-9_.-]{2,}|--[a-z][\w-]+)/iu,
-  )?.[0]
+
+  const structuralInProse = trimmed.match(/\b(?:clip-path|grid-template(?:-columns|-rows)?)\b/iu)?.[0]?.toLowerCase()
+  if (structuralInProse) return structuralInProse
+  const embeddedVariable = trimmed.match(/--[a-z][\w-]+/iu)?.[0]
+  if (embeddedVariable) return embeddedVariable.toLowerCase()
+  return undefined
+}
+
+function referenceContractMarkerIsDistinctive(marker: string): boolean {
+  if (/^--[a-z][\w-]+$/u.test(marker) || STRUCTURAL_REFERENCE_MARKERS.has(marker)) return true
+  return analyzeConcreteCssSelector(marker)?.distinctive === true
+    || /[.#][a-z][\w-]{2,}/iu.test(marker)
+}
+
+interface ConcreteCssSelectorAnalysis {
+  normalized: string
+  distinctive: boolean
+}
+
+function analyzeConcreteCssSelector(value: string): ConcreteCssSelectorAnalysis | undefined {
+  const normalized = normalizeCssSelector(value)
+  if (!normalized || normalized.length > 300 || /[,{};]/u.test(normalized)) return undefined
+  const surface = selectorRelationshipSurface(normalized)
+  if (!surface
+    || /^[>+~]/u.test(surface)
+    || /[>+~]$/u.test(surface)
+    || /[>+~]{2}/u.test(surface)) return undefined
+  const compounds = surface.split(/(?:[>+~]|\s+)/u).filter(Boolean)
+  if (compounds.length === 0) return undefined
+  let distinctive = false
+  for (const compound of compounds) {
+    const match = compound.match(/^(?:(\*|[a-z][\w-]*))?((?:[.#]-?[_a-z][\w-]*)*)$/iu)
+    if (!match || (!match[1] && !match[2])) return undefined
+    const tagName = match[1]?.toLowerCase()
+    if (tagName && tagName !== '*') {
+      const customElement = concreteCustomElementName(tagName)
+      if (!STANDARD_HTML_SELECTOR_TAGS.has(tagName) && !customElement) return undefined
+      if (customElement) distinctive = true
+    }
+    for (const identifier of selectorIdentifiers(compound)) {
+      if (identifier.slice(1).length >= 3) distinctive = true
+    }
+  }
+  return { normalized, distinctive }
+}
+
+function concreteCustomElementName(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase()
+  if (!/^[a-z][\w]*-[\w-]*[a-z0-9]$/u.test(normalized)
+    || SOURCE_PROFILE_PROPERTIES.has(normalized)
+    || STRUCTURAL_REFERENCE_MARKERS.has(normalized)) return undefined
+  return normalized
 }
 
 interface ParsedCssRule {
@@ -2296,6 +2388,29 @@ function selectorIdentifiers(selector: string): string[] {
   return identifiers
 }
 
+function selectorRelationshipSurface(selector: string): string | undefined {
+  const withoutAttributes = selector.replace(/\[[^\]\r\n]{0,160}\]/gu, '')
+  if (/[\[\]]/u.test(withoutAttributes)) return undefined
+  const withoutPseudos = withoutAttributes.replace(/::?[-a-z][\w-]*(?:\([^()\r\n]{0,160}\))?/giu, '')
+  if (/[:()]/u.test(withoutPseudos)) return undefined
+  return withoutPseudos.trim()
+}
+
+function selectorCompoundFragments(selector: string): string[] {
+  const surface = selectorRelationshipSurface(normalizeCssSelector(selector))
+  if (!surface) return []
+  return surface.split(/(?:[>+~]|\s+)/u).filter(Boolean)
+}
+
+function selectorTypeNames(selector: string): string[] {
+  const typeNames: string[] = []
+  for (const compound of selectorCompoundFragments(selector)) {
+    const tagName = compound.match(/^[a-z][\w-]*/iu)?.[0]?.toLowerCase()
+    if (tagName && !typeNames.includes(tagName)) typeNames.push(tagName)
+  }
+  return typeNames
+}
+
 function terminalSelectorIdentifier(selector: string): string | undefined {
   const surface = selector.replace(/\[[^\]]*\]/gu, ' ')
   const matches = [...surface.matchAll(/([.#])(-?[_a-z][\w-]*)/giu)]
@@ -2343,10 +2458,9 @@ function selectorIdentifiersExist(identifiers: readonly string[], dom: DomSnapsh
 }
 
 function selectorIdentifiersShareRelationship(selector: string, dom: DomSnapshot): boolean {
-  const surface = selector
-    .replace(/::[-\w]+/gu, '')
-    .replace(/:[-\w]+(?:\([^)]*\))?/gu, '')
-    .replace(/\[[^\]]*\]/gu, '')
+  const relationshipSurface = selectorRelationshipSurface(selector)
+  if (!relationshipSurface) return false
+  const surface = relationshipSurface
     .replace(/\s*([>+~])\s*/gu, ' $1 ')
     .trim()
   const tokens = surface.split(/\s+/gu).filter(Boolean)
@@ -2359,9 +2473,14 @@ function selectorIdentifiersShareRelationship(selector: string, dom: DomSnapshot
       continue
     }
     const identifiers = selectorIdentifiers(token)
-    if (identifiers.length === 0) return selectorIdentifiersExist(selectorIdentifiers(selector), dom)
+    const tagName = token.match(/^[a-z][\w-]*/iu)?.[0]?.toLowerCase()
+    const relationshipIdentifiers = [
+      ...(tagName ? [`@${tagName}`] : []),
+      ...identifiers,
+    ]
+    if (relationshipIdentifiers.length === 0) return selectorIdentifiersExist(selectorIdentifiers(selector), dom)
     if (compounds.length > 0) combinators.push(pending ?? ' ')
-    compounds.push(identifiers)
+    compounds.push(relationshipIdentifiers)
     pending = undefined
   }
   if (compounds.length === 0) return false
@@ -2442,6 +2561,7 @@ function extractDomSnapshot(content: string): DomSnapshot {
     const hiddenReason = stack.at(-1)?.hiddenReason ?? ownHiddenReason
     if (!hiddenReason) tags.add(tagName)
     const identifiers = new Set<string>()
+    identifiers.add(`@${tagName}`)
     for (const rawClass of classValue?.split(/\s+/gu) ?? []) {
       const className = rawClass.trim().toLowerCase()
       if (!/^-?[_a-z][\w-]*$/iu.test(className)) continue

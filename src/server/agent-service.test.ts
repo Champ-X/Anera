@@ -47,6 +47,9 @@ import {
   projectArenaUserMessageForModel,
   projectContextPressureTokens,
   preferredConcreteReferenceSourceUrl,
+  recoverActiveTaskResearchEvidence,
+  recoverActiveVisualArtifact,
+  recoverTextualDsmlToolCalls,
   referenceInteriorStructureProjection,
   repairVisualWebArtifactPhaseToolCalls,
   revalidateActiveExactReferenceEvidence,
@@ -659,6 +662,141 @@ describe('web research citation integrity', () => {
       unsupportedCitationUrls: [],
     })
     expect(webResearchCitationGap(messages, `新闻来源：[Weekly AI](${newsUrl})`)).toBeUndefined()
+  })
+
+  it('keeps compacted Web results as structured, machine-verifiable source evidence', () => {
+    const sourceUrl = 'https://news.example/weekly-entertainment'
+    const messages: ModelMessage[] = [{
+      role: 'user',
+      content: '整理本周娱乐新闻并引用来源。',
+    }, {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'large-weekly-search', type: 'function',
+        function: { name: 'web_search', arguments: '{"query":"本周娱乐新闻"}' },
+      }],
+    }, {
+      role: 'tool',
+      tool_call_id: 'large-weekly-search',
+      tool_result_status: 'succeeded',
+      content: JSON.stringify({
+        status: 'success',
+        results: [{ title: 'Weekly entertainment', url: sourceUrl, description: '报道'.repeat(4_000) }],
+      }),
+    }, {
+      role: 'assistant',
+      content: 'I have consumed the search evidence.',
+    }]
+
+    const compacted = compactHistoricalToolPayloads(messages, { forceResultCompaction: true })
+    const result = JSON.parse(String(compacted.messages[2].content)) as Record<string, unknown>
+    expect(compacted.changed).toBe(true)
+    expect(result).toMatchObject({
+      status: 'success',
+      historical_result_compacted: true,
+      tool_name: 'web_search',
+      source_urls: [sourceUrl],
+      original_bytes: expect.any(Number),
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    })
+    expect(webResearchCitationGap(
+      compacted.messages,
+      `来源：[Weekly entertainment](${sourceUrl})`,
+    )).toBeUndefined()
+  })
+
+  it('recovers the current task research ledger from full durable events and resets it for a new task', () => {
+    const firstUrl = 'https://news.example/first-task'
+    const base = {
+      id: 'evt', sessionId: 'ses_test', at: '2026-09-03T00:00:00.000Z',
+    }
+    const firstTaskEvents: SessionEvent[] = [{
+      ...base, id: 'evt_1', seq: 1, type: 'turn.started', turnId: 'turn_1',
+      data: { content: 'Research this week\'s entertainment news.' },
+    }, {
+      ...base, id: 'evt_2', seq: 2, type: 'tool.completed', turnId: 'turn_1', callId: 'search_1',
+      data: {
+        call: { id: 'search_1', name: 'web_search', arguments: { query: 'weekly entertainment' } },
+        result: JSON.stringify({ status: 'success', results: [{ title: 'First', url: firstUrl }] }),
+        isError: false,
+      },
+    }, {
+      ...base, id: 'evt_3', seq: 3, type: 'run.resumed', turnId: 'turn_2',
+      data: { message: 'Continue from persisted evidence.' },
+    }]
+    expect(recoverActiveTaskResearchEvidence(firstTaskEvents)).toEqual({
+      schemaVersion: 1,
+      sourceUrls: [firstUrl],
+      toolCallIds: ['search_1'],
+    })
+
+    const nextTaskEvents: SessionEvent[] = [...firstTaskEvents, {
+      ...base, id: 'evt_4', seq: 4, type: 'turn.started', turnId: 'turn_3',
+      data: { content: 'Write a new local note.' },
+    }]
+    expect(recoverActiveTaskResearchEvidence(nextTaskEvents)).toEqual({
+      schemaVersion: 1,
+      sourceUrls: [],
+      toolCallIds: [],
+    })
+  })
+
+  it('does not reopen visual Web research when the private durable ledger retains its source URLs', () => {
+    const gap = visualWebArtifactCompletionGap([{
+      role: 'user',
+      content: '整理本周娱乐新闻，生成 HTML Slides。',
+    }], {
+      forceTask: true,
+      requiresResearch: true,
+      researchSourceUrls: ['https://news.example/weekly-entertainment'],
+    })
+    expect(gap?.missingPhases).not.toContain('web_research')
+    expect(gap?.missingPhases).toContain('html_artifact')
+  })
+
+  it('recovers canonical visual HTML identity and its latest mutation across context compaction', () => {
+    const base = {
+      id: 'evt', sessionId: 'ses_visual', at: '2026-09-03T00:00:00.000Z', turnId: 'turn_visual',
+    }
+    const canonicalHash = 'a'.repeat(43)
+    const editedHash = 'b'.repeat(43)
+    const events: SessionEvent[] = [{
+      ...base, id: 'evt_1', seq: 1, type: 'turn.started',
+      data: { content: 'Create an HTML Slides presentation.' },
+    }, {
+      ...base, id: 'evt_2', seq: 2, type: 'tool.completed', callId: 'write_visual',
+      data: {
+        call: { id: 'write_visual', name: 'write_file', arguments: { path: 'weekly.html' } },
+        result: JSON.stringify({ status: 'success', path: 'weekly.html', hash: canonicalHash, canonical_html: true }),
+      },
+    }, {
+      ...base, id: 'evt_3', seq: 3, type: 'tool.completed', callId: 'edit_visual',
+      data: {
+        call: { id: 'edit_visual', name: 'edit_file', arguments: { path: 'weekly.html' } },
+        result: JSON.stringify({ status: 'success', path: 'weekly.html', hash: editedHash }),
+      },
+    }]
+    const artifact = recoverActiveVisualArtifact(events)
+    expect(artifact).toEqual({
+      schemaVersion: 1,
+      path: 'weekly.html',
+      canonicalWriteCallId: 'write_visual',
+      canonicalWriteEventSeq: 2,
+      lastMutationCallId: 'edit_visual',
+      lastMutationEventSeq: 3,
+      currentHash: editedHash,
+    })
+    const gap = visualWebArtifactCompletionGap([{
+      role: 'user', content: 'Create an HTML Slides presentation.',
+    }], {
+      forceTask: true,
+      requiresResearch: false,
+      canonicalPath: 'weekly.html',
+      canonicalArtifact: artifact,
+    })
+    expect(gap?.missingPhases).not.toContain('html_artifact')
+    expect(gap?.canonicalPath).toBe('weekly.html')
   })
 
   it('accepts grounded Markdown citations followed by Chinese punctuation without corrupting the URL', () => {
@@ -2895,18 +3033,43 @@ describe('agent context preparation', () => {
       'reference_contract',
     ).toolCalls[0].function.arguments) as Record<string, unknown[]>
     expect(boundedContract.components).toHaveLength(10)
-    expect(boundedContract.components).toEqual(expect.arrayContaining([
-      '.layout-cover .cover-dots',
-      '.layout-closing .closing-decoration',
-      '.nav-controls .nav-btn',
-      '.accent-line',
-      '.accent-dot',
-    ]))
+    expect(boundedContract.components).toEqual([
+      '.layout-agenda', '.layout-metrics', '.layout-dashboard', '.layout-split',
+      '.layout-bars', '.layout-quote', '.layout-timeline', '.layout-detail',
+      '.layout-cover .cover-dots', '.layout-closing .closing-decoration',
+    ])
     expect(boundedContract.required_markers).toHaveLength(10)
-    expect(boundedContract.required_markers).toEqual(expect.arrayContaining([
-      '.layout-cover', '.nav-controls', '.progress-bar', '.slide-counter',
-      '.slide.active', '.slide.prev', '--bg', '--primary',
-    ]))
+    expect(boundedContract.required_markers).toEqual([
+      '.slide.active', '.slide.prev', '.layout-cover', '.nav-controls', '.progress-bar',
+      '.slide-counter', '--bg', '--primary', '--text', '--text-muted',
+    ])
+
+    const pinkScriptMarkersCall: NonNullable<ModelMessage['tool_calls']> = [{
+      id: 'pink-script-reference-markers',
+      type: 'function',
+      function: {
+        name: 'record_reference_style',
+        arguments: JSON.stringify({
+          ...originalContract,
+          required_markers: [
+            'deck-stage', 'section.slide', '.runner', '.footer', '.script', '.s-cover',
+            '.s-toc', '.s-stats', '.s-section', '.s-quote', '.s-cta',
+          ],
+        }),
+      },
+    }]
+    const repairedPinkScript = repairVisualWebArtifactPhaseToolCalls(
+      pinkScriptMarkersCall,
+      'reference_contract',
+    )
+    expect(repairedPinkScript.repairs).toEqual([{
+      callId: 'pink-script-reference-markers',
+      toAction: 'record_reference_style',
+    }])
+    expect(JSON.parse(repairedPinkScript.toolCalls[0].function.arguments).required_markers).toEqual([
+      'deck-stage', 'section.slide', '.runner', '.footer', '.script',
+      '.s-cover', '.s-toc', '.s-stats', '.s-section', '.s-quote',
+    ])
 
     const html = `<!doctype html><html><body>${'complete artifact '.repeat(200)}</body></html>`
     const aliasedWrite: NonNullable<ModelMessage['tool_calls']> = [{
@@ -2957,6 +3120,33 @@ describe('agent context preparation', () => {
       path: 'ai-news-week.html',
       content: schemeLessCitationHtml.replace('news.example/ai-week', retrievedNewsUrl),
     })
+    const retrievedWwwUrl = 'https://www.globaltimes.cn/page/202609/1369537.shtml'
+    const omittedWwwHtml = '<!doctype html><html><body><div class="url">globaltimes.cn/page/202609/1369537.shtml</div></body></html>'
+    const omittedWwwCall: NonNullable<ModelMessage['tool_calls']> = [{
+      id: 'omitted-www-citation-html-write',
+      type: 'function',
+      function: {
+        name: 'write_file',
+        arguments: JSON.stringify({ path: 'entertainment-weekly.html', content: omittedWwwHtml }),
+      },
+    }]
+    const repairedOmittedWww = repairVisualWebArtifactPhaseToolCalls(
+      omittedWwwCall,
+      'html_artifact',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [retrievedWwwUrl],
+    )
+    expect(repairedOmittedWww.repairs).toEqual([{
+      callId: 'omitted-www-citation-html-write',
+      toAction: 'write_file',
+    }])
+    expect(JSON.parse(repairedOmittedWww.toolCalls[0].function.arguments).content).toBe(
+      omittedWwwHtml.replace('globaltimes.cn/page/202609/1369537.shtml', retrievedWwwUrl),
+    )
     expect(repairVisualWebArtifactPhaseToolCalls(
       schemeLessCitationWrite,
       'html_artifact',
@@ -4450,11 +4640,34 @@ describe('agent context preparation', () => {
     ])).toMatchObject({
       canonicalPath: 'ai-week.html',
       missingPhases: expect.arrayContaining(['visual_inspection_pass']),
+      renderRepair: {
+        phase: 'cover',
+        score: 98.8,
+        violations: coverMismatchViolations,
+        violationCount: 1,
+      },
     })
     expect(visualWebArtifactCompletionGap([
       request, ...news, ...concreteReference, ...record, ...write, ...verifyPass, ...preview, ...open,
       ...coverMismatchShot,
     ])?.missingPhases).not.toContain('reference_cover_inspection')
+    expect(visualWebArtifactPhaseInstruction(visualWebArtifactCompletionGap([
+      request, ...news, ...concreteReference, ...record, ...write, ...verifyPass, ...preview, ...open,
+      ...coverMismatchShot,
+    ]), 6)).toContain('authoritative deterministic Browser verdict')
+    const stageRepairInstruction = visualWebArtifactPhaseInstruction({
+      canonicalPath: 'ai-week.html',
+      missingPhases: ['visual_inspection_pass'],
+      renderRepair: {
+        phase: 'content',
+        score: 99,
+        violations: ['render content active slide 2 is outside the viewport because one inactive predecessor slide still occupies normal vertical flow'],
+        violationCount: 1,
+      },
+    }, 6)
+    expect(stageRepairInstruction).toContain('shared slide-stage/visibility failure')
+    expect(stageRepairInstruction).toContain('.slide:not(.active){display:none}')
+    expect(stageRepairInstruction).toContain('never put display:none on the base .slide selector')
 
     const staleCoverInspect = step('reference-cover-stale-inspection', 'inspect_image', {
       path: 'ai-week-reference-cover.png', prompt: coverInspectionPrompt,
@@ -4538,6 +4751,58 @@ describe('agent context preparation', () => {
       request, ...news, ...concreteReference, ...record, ...write, ...verifyPass, ...preview,
       ...open, ...coverShot, ...coverInspect, ...navigate, ...contentShot, ...healthOnlyInspect,
     ])).toMatchObject({ missingPhases: expect.arrayContaining(['visual_inspection_pass']) })
+
+    const stalledForward = step('reference-next-stalled', 'browser', {
+      action: 'press', key: 'ArrowRight',
+    }, JSON.stringify({ url: canonicalUrl, text: '1 / 8', pageEpoch }))
+    const stalledForwardMessages = [
+      request, ...news, ...concreteReference, ...record, ...write, ...verifyPass, ...preview,
+      ...open, ...coverShot, ...coverInspect, ...stalledForward,
+    ]
+    const stalledForwardGap = visualWebArtifactCompletionGap(stalledForwardMessages)
+    expect(stalledForwardGap).toMatchObject({
+      missingPhases: expect.arrayContaining(['visual_inspection_pass', 'navigation_check']),
+      interactionRepair: {
+        key: 'ArrowRight',
+        reason: expect.stringContaining('unchanged rendered slide state'),
+      },
+    })
+    expect(visualArtifactDefectRepairPhase(
+      stalledForwardMessages,
+      'ai-week.html',
+      stalledForwardGap?.interactionRepair,
+    )).toBe('read')
+
+    const stalledEnd = step('reference-end-stalled', 'browser', {
+      action: 'press', key: 'End',
+    }, JSON.stringify({ url: `${canonicalUrl}#slide-2`, text: '2 / 8', pageEpoch }))
+    const stalledEndMessages = [
+      request, ...news, ...concreteReference, ...record, ...write, ...verifyPass, ...preview,
+      ...open, ...coverShot, ...coverInspect, ...navigate, ...contentShot, ...contentInspect,
+      ...stalledEnd,
+    ]
+    const stalledEndGap = visualWebArtifactCompletionGap(stalledEndMessages)
+    expect(stalledEndGap).toMatchObject({
+      missingPhases: expect.arrayContaining(['visual_inspection_pass', 'reference_closing_navigation']),
+      interactionRepair: {
+        key: 'End',
+        reason: expect.stringContaining('did not reach a distinct closing/source state'),
+      },
+    })
+    expect(visualWebArtifactRequiredToolNames(stalledEndGap!)).toEqual(new Set(['edit_file']))
+    expect(visualArtifactDefectRepairPhase(
+      stalledEndMessages,
+      'ai-week.html',
+      stalledEndGap?.interactionRepair,
+    )).toBe('read')
+    const stalledEndRead = step('reference-end-repair-read', 'read_file', {
+      path: 'ai-week.html',
+    }, JSON.stringify({ status: 'success', kind: 'text', content: candidateHtml, hasMore: false }))
+    expect(visualArtifactDefectRepairPhase(
+      [...stalledEndMessages, ...stalledEndRead],
+      'ai-week.html',
+      stalledEndGap?.interactionRepair,
+    )).toBe('edit')
 
     const sameCoverShot = step('same-cover-shot', 'browser', { action: 'screenshot', screenshot_path: 'same-reference.png' }, passingExactRenderAttestation({
       phase: 'cover', canonicalPath: 'ai-week.html', pageUrl: canonicalUrl, pageEpoch,
@@ -5301,6 +5566,14 @@ describe('agent context preparation', () => {
       'recreated-dashboard.html',
     )).toBe('edit')
 
+    const compactedRead = step('compacted-dashboard-read', 'read_file', {
+      path: 'recreated-dashboard.html',
+    }, '[Historical tool result compacted after a later assistant response consumed it: 17187 UTF-8 bytes, sha256 deadbeef]\n{"kind":"text","content":"<main>"}\n[...12000 UTF-8 bytes omitted...]')
+    expect(visualArtifactDefectRepairPhase(
+      [...messages, ...compactedRead],
+      'recreated-dashboard.html',
+    )).toBe('read')
+
     const failedEdit = step('failed-dashboard-edit', 'edit_file', {
       path: 'recreated-dashboard.html', old_text: '.missing', new_text: '.fixed',
     }, '{"status":"error","message":"Context not found. Read the file to verify the text exists."}', 'failed')
@@ -5316,6 +5589,30 @@ describe('agent context preparation', () => {
       [...messages, ...executedRead, ...repaired],
       'recreated-dashboard.html',
     )).toBeUndefined()
+
+    const largeRead = step('large-dashboard-read', 'read_file', {
+      path: 'recreated-dashboard.html',
+    }, JSON.stringify({
+      status: 'success', kind: 'text', content: `<main>${'dashboard-content'.repeat(600)}</main>`, hasMore: false,
+    }))
+    const pendingDiagnostic = [
+      ...messages,
+      ...largeRead,
+      { role: 'assistant' as const, content: 'I located the exact repair target and will edit it next.' },
+    ]
+    expect(compactHistoricalToolPayloads(pendingDiagnostic, { forceResultCompaction: true })).toEqual({
+      messages: pendingDiagnostic,
+      changed: false,
+    })
+    const consumedDiagnostic = compactHistoricalToolPayloads([
+      ...pendingDiagnostic,
+      ...repaired,
+      { role: 'assistant' as const, content: 'The targeted edit succeeded.' },
+    ], { forceResultCompaction: true })
+    expect(consumedDiagnostic.changed).toBe(true)
+    expect(consumedDiagnostic.messages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'large-dashboard-read'
+    ))?.content).toContain('Historical tool result compacted')
 
     const passingInspection = step('inspect-dashboard-pass', 'inspect_image', {
       path: 'dashboard-check.png',
@@ -11085,6 +11382,31 @@ describe('agent context preparation', () => {
     expect(groupMessages(compacted.messages).map((group) => group.length)).toEqual([1, 2, 1])
   })
 
+  it('compacts consumed oversized visual-workflow narration without treating textual pseudo-calls as durable actions', () => {
+    const oversized = `The Vision defect is concrete.\n${'I will reconsider the same targeted edit. '.repeat(500)}\n<｜｜DSML｜｜tool_calls>not executed</｜｜DSML｜｜tool_calls>`
+    const pending: ModelMessage[] = [
+      { role: 'user', content: 'Create and present a self-contained HTML slide deck, then verify it with Browser screenshots.' },
+      { role: 'assistant', content: oversized },
+    ]
+    expect(compactHistoricalToolPayloads(pending, { forceResultCompaction: true })).toEqual({
+      messages: pending,
+      changed: false,
+    })
+
+    const consumed = [...pending, {
+      role: 'user' as const,
+      content: '[Harness operator action: Continue] Resume the unfinished visual workflow.',
+    }]
+    const compacted = compactHistoricalToolPayloads(consumed, { forceResultCompaction: true })
+    expect(compacted.changed).toBe(true)
+    expect(compacted.messages[0]).toEqual(consumed[0])
+    expect(compacted.messages[1].content).toContain('Historical oversized visual-workflow narration compacted')
+    expect(compacted.messages[1].content).toContain('does not imply that any textual pseudo-tool call executed')
+    expect(compacted.messages[1].content).not.toContain('<｜｜DSML｜｜tool_calls>')
+    expect(Buffer.byteLength(compacted.messages[1].content || '')).toBeLessThan(2_000)
+    expect(compacted.messages[2]).toEqual(consumed[2])
+  })
+
   it('preserves active write_file/edit_file identity while moving consumed payloads out of content fields', () => {
     const messages: ModelMessage[] = [
       {
@@ -12007,6 +12329,42 @@ describe('agent context preparation', () => {
     expect(normalized.toolCalls.map((call) => call.id)).toEqual(['stable', 'stable', 'call_2_generated_1', 'call_2'])
   })
 
+  it('recovers a complete trailing DeepSeek DSML call only through the active tool whitelist', () => {
+    const editTool = TOOL_DEFINITIONS.find((tool) => tool.function.name === 'edit_file') as ToolDefinition
+    const preamble = `The visual defect is understood. ${'I will keep the edit targeted. '.repeat(500)}`
+    const content = `${preamble}\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="edit_file">\n<｜｜DSML｜｜parameter name="new_text" string="true"><h1>Contents</h1></｜｜DSML｜｜parameter>\n<｜｜DSML｜｜parameter name="old_text" string="true"><h1>目录</h1></｜｜DSML｜｜parameter>\n<｜｜DSML｜｜parameter name="path" string="true">deck.html</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>`
+    const original = {
+      content,
+      reasoningContent: '',
+      finishReason: 'stop',
+      toolCalls: [],
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, cachedPromptTokens: 0 },
+      modelCallCount: 1,
+    }
+
+    const recovered = recoverTextualDsmlToolCalls(original, [editTool])
+    expect(recovered).toMatchObject({
+      recovered: true,
+      toolNames: ['edit_file'],
+      originalContentBytes: Buffer.byteLength(content),
+    })
+    expect(recovered.result.toolCalls).toHaveLength(1)
+    expect(recovered.result.toolCalls[0].id).toMatch(/^call_/u)
+    expect(JSON.parse(recovered.result.toolCalls[0].function.arguments)).toEqual({
+      new_text: '<h1>Contents</h1>',
+      old_text: '<h1>目录</h1>',
+      path: 'deck.html',
+    })
+    expect(Buffer.byteLength(recovered.result.content)).toBeLessThan(2_000)
+    expect(recovered.result.content).not.toContain('<｜｜DSML｜｜tool_calls>')
+
+    const partial = { ...original, content: content.replace('</｜｜DSML｜｜tool_calls>', '') }
+    expect(recoverTextualDsmlToolCalls(partial, [editTool])).toMatchObject({ recovered: false, result: partial })
+    expect(recoverTextualDsmlToolCalls(original, [])).toMatchObject({ recovered: false, result: original })
+    const wrongSurface = TOOL_DEFINITIONS.find((tool) => tool.function.name === 'read_file') as ToolDefinition
+    expect(recoverTextualDsmlToolCalls(original, [wrongSurface])).toMatchObject({ recovered: false, result: original })
+  })
+
   it('serializes same-resource fetch_page calls while keeping independent reads parallel', async () => {
     const calls = [
       { id: 'fetch_a_0', name: 'fetch_page', arguments: { url: 'https://EXAMPLE.com:443/large#first', chunkIndex: 0 } },
@@ -12136,7 +12494,7 @@ describe('agent context preparation', () => {
     }
   })
 
-  it('fails excess per-step and per-run tool calls before execution while preserving every tool response', async () => {
+  it('enforces only the per-step burst limit while allowing cumulative tool work beyond the former run ceiling', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-tool-admission-'))
     const store = new SessionStore(root, 'test-model')
     await store.initialize()
@@ -12146,9 +12504,9 @@ describe('agent context preparation', () => {
     const stream = vi.fn(async (options: { messages: ModelMessage[]; onContent: (delta: string) => void }) => {
       modelCall += 1
       toolResponseCounts.push(options.messages.filter((message) => message.role === 'tool').length)
-      if (modelCall <= 2) {
+      if (modelCall <= 49) {
         const count = modelCall === 1 ? 4 : 2
-        const offset = modelCall === 1 ? 0 : 4
+        const offset = modelCall === 1 ? 0 : 4 + (modelCall - 2) * 2
         return {
           content: '',
           reasoningContent: '',
@@ -12181,26 +12539,32 @@ describe('agent context preparation', () => {
     const agent = new AgentService(store, {
       client: { stream } as never,
       tools: tools as never,
-      runTimeoutMs: 1_000,
+      runTimeoutMs: 5_000,
       maxToolCallsPerStep: 2,
-      maxToolCallsPerRun: 3,
       maxParallelToolCalls: 2,
     })
     try {
       await agent.submit(session.summary.id, { content: 'Read the evidence without allowing an unbounded tool burst.' })
-      for (let attempt = 0; attempt < 100; attempt += 1) {
+      for (let attempt = 0; attempt < 500; attempt += 1) {
         if ((await store.get(session.summary.id)).summary.status === 'completed') break
         await new Promise((resolveWait) => setTimeout(resolveWait, 5))
       }
       const state = await store.get(session.summary.id)
       const events = await store.events(session.summary.id)
       expect(state.summary.status).toBe('completed')
-      expect(tools.execute.mock.calls.map(([call]) => call.id)).toEqual(['call_budget_0', 'call_budget_1', 'call_budget_4'])
-      expect(toolResponseCounts).toEqual([0, 4, 6])
-      expect(state.summary.usage.toolCalls).toBe(6)
-      expect(events.filter((event) => event.type === 'tool.failed' && event.data.reason === 'tool_budget_exceeded')).toHaveLength(3)
-      expect(events.filter((event) => event.type === 'tool.started')).toHaveLength(6)
-      expect(state.messages.filter((message) => message.role === 'tool')).toHaveLength(6)
+      const executedIds = tools.execute.mock.calls.map(([call]) => call.id)
+      expect(executedIds).toHaveLength(98)
+      expect(executedIds.slice(0, 4)).toEqual([
+        'call_budget_0', 'call_budget_1', 'call_budget_4', 'call_budget_5',
+      ])
+      expect(executedIds.at(-1)).toBe('call_budget_99')
+      expect(toolResponseCounts).toHaveLength(50)
+      expect(toolResponseCounts.at(0)).toBe(0)
+      expect(toolResponseCounts.at(-1)).toBe(100)
+      expect(state.summary.usage.toolCalls).toBe(100)
+      expect(events.filter((event) => event.type === 'tool.failed' && event.data.reason === 'per_step_tool_limit_exceeded')).toHaveLength(2)
+      expect(events.filter((event) => event.type === 'tool.started')).toHaveLength(100)
+      expect(state.messages.filter((message) => message.role === 'tool')).toHaveLength(100)
     } finally {
       await agent.shutdown()
       await rm(root, { recursive: true, force: true })

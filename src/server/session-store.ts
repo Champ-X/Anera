@@ -92,6 +92,17 @@ export interface StoredSession {
   /** Exact-only Final constraint for the current real user task; operator Continue inherits it. */
   activeTaskExactFinalRequest?: string
   /**
+   * Server-private, monotonic Web-research evidence for the current real user
+   * task. Provider-visible tool payloads may be compacted or semantically
+   * summarized, but citation admission and visual phase routing must continue
+   * to see every successfully retrieved canonical source URL. The event log
+   * is the recovery journal if a crash lands between tool publication and
+   * this materialized projection.
+   */
+  activeTaskResearchEvidence?: DurableResearchEvidenceLedger
+  /** Durable identity of the current task's canonical visual HTML bytes. */
+  activeVisualArtifact?: DurableVisualArtifactLedger
+  /**
    * Server-private exact-reference verifier ledger. Unlike provider-visible
    * messages, this survives semantic context compaction and resume intact.
    */
@@ -147,6 +158,23 @@ export interface StoredSession {
    */
   pendingDeployment?: DurablePendingDeployment
   repository: CodingRepositoryState | null
+}
+
+export interface DurableResearchEvidenceLedger {
+  schemaVersion: 1
+  sourceUrls: string[]
+  toolCallIds: string[]
+}
+
+export interface DurableVisualArtifactLedger {
+  schemaVersion: 1
+  path: string
+  canonicalWriteCallId: string
+  canonicalWriteEventSeq: number
+  lastMutationCallId: string
+  lastMutationEventSeq: number
+  /** SHA-256 base64url emitted by the atomic Workspace mutation. */
+  currentHash: string
 }
 
 export type ReferenceVisualEvidencePhase = 'cover' | 'content' | 'closing'
@@ -2304,6 +2332,8 @@ export class SessionStore {
         createdAt,
       }
       state.messages = state.messages.slice(0, messageCountAfter)
+      delete state.activeTaskResearchEvidence
+      delete state.activeVisualArtifact
       delete state.visualNoProgress
       for (const turnId of targetTurnIds) delete state.turnMessageStarts?.[turnId]
       state.pendingTurnUndo = pending

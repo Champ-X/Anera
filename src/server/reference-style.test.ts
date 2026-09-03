@@ -8,6 +8,7 @@ import {
   extractReferenceStyleSourceProfile,
   findReferenceStyleEvidence,
   latestSuccessfulReferenceStyleContract,
+  normalizeReferenceContractMarker,
   normalizeRenderedReferenceStyleProfile,
   normalizeReferenceStyleContract,
   normalizeReferenceStyleContractAgainstEvidence,
@@ -26,6 +27,7 @@ import {
 const REFERENCE_DIRECTORY = 'https://github.com/zarazhangrui/beautiful-html-templates/blob/main/templates/blue-professional'
 const REFERENCE_SOURCE = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/blue-professional/template.html'
 const SIBLING_SOURCE = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/dark-corporate/template.html'
+const PINK_SCRIPT_SOURCE = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/pink-script/template.html'
 
 const REFERENCE_HTML = `<!doctype html>
 <html>
@@ -49,6 +51,25 @@ const REFERENCE_HTML_CHUNKS = [
   REFERENCE_HTML.slice(Math.floor(REFERENCE_HTML.length / 3), Math.floor(REFERENCE_HTML.length * 2 / 3)),
   REFERENCE_HTML.slice(Math.floor(REFERENCE_HTML.length * 2 / 3)),
 ] as const
+
+// Exact structural slice from pink-script. This fixture covers the custom
+// element and nested selectors that exposed the reference-contract loop.
+const PINK_SCRIPT_MARKER_HTML = `<!doctype html><html><head><style>
+  :root{--ink:#060507;--paper:#f5edf1;--pink:#ed3d8c}
+  html,body{background:var(--ink);color:var(--paper);font-family:"Inter",sans-serif}
+  deck-stage > section.slide{position:relative;background:var(--ink);color:var(--paper)}
+  .runner,.footer{font-family:"JetBrains Mono",monospace;color:var(--pink)}
+  .script{font-family:"DM Serif Display",serif;color:var(--pink)}
+  .s-cover .title{font-family:"DM Serif Display",serif}
+  .s-toc .row{display:grid}.s-stats .stat{display:grid}
+  .s-section .num{color:var(--pink)}.s-quote blockquote{color:var(--paper)}
+</style></head><body><deck-stage>
+  <section class="slide s-cover"><div class="runner"></div><h1 class="title script">After hours</h1><footer class="footer"></footer></section>
+  <section class="slide s-toc"><div class="row"></div></section>
+  <section class="slide s-stats"><div class="stat"></div></section>
+  <section class="slide s-section"><div class="num"></div></section>
+  <section class="slide s-quote"><blockquote>Quote</blockquote></section>
+</deck-stage></body></html>`
 
 const CONTRACT: ReferenceStyleContract = {
   sourceUrl: REFERENCE_SOURCE,
@@ -666,6 +687,41 @@ describe('reference style evidence and verification', () => {
       fonts: ['Space Grotesk', 'Inter'],
       requiredMarkers: ['--bg', 'nav-btn', 'progress-bar'],
     })
+  })
+
+  it('accepts and grounds the real pink-script custom element and selector markers', () => {
+    expect(normalizeReferenceContractMarker('deck-stage > section.slide')).toBe('deck-stage>section.slide')
+    expect(normalizeReferenceContractMarker('deck-stage')).toBe('deck-stage')
+    expect(normalizeReferenceContractMarker('.runner')).toBe('.runner')
+
+    const contract = normalizeReferenceStyleContract({
+      ...CONTRACT,
+      source_url: PINK_SCRIPT_SOURCE,
+      colors: ['#060507', '#f5edf1', '#ed3d8c'],
+      fonts: ['DM Serif Display', 'Inter', 'JetBrains Mono'],
+      required_markers: [
+        'deck-stage', 'section.slide', '.runner', '.footer', '.script',
+        '.s-cover', '.s-toc', '.s-stats', '.s-section', '.s-quote',
+      ],
+      viewport: { width: 1920, height: 1080 },
+    })
+    const evidence = findReferenceStyleEvidence(
+      fetchMessages(PINK_SCRIPT_SOURCE, PINK_SCRIPT_MARKER_HTML),
+      [PINK_SCRIPT_SOURCE],
+    )
+    expect(evidence).toBeDefined()
+    expect(referenceStyleGroundingGaps(contract, evidence!)).toEqual({
+      colors: [], fonts: [], markers: [],
+    })
+    expect(contractIsGroundedInEvidence(contract, evidence!)).toBe(true)
+  })
+
+  it('identifies the exact invalid marker entry instead of returning a generic array error', () => {
+    expect(() => normalizeReferenceStyleContract({
+      ...CONTRACT,
+      source_url: CONTRACT.sourceUrl,
+      required_markers: ['.runner', 'generic visual label'],
+    })).toThrow('required_markers[1] "generic visual label" must contain one concrete source token')
   })
 
   it('fails the prior navy-and-gold redesign and ignores required tokens hidden in comments or scripts', () => {

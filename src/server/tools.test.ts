@@ -446,6 +446,7 @@ describe('tool executor vision integration', () => {
     expect(properties.colors?.items?.description).toMatch(/DOM-connected rule[\s\S]*omit values from unused variable declarations/iu)
     expect(properties.fonts?.items?.description).toMatch(/font-family[\s\S]*DOM-connected rule/iu)
     expect(properties.required_markers?.items?.description).toMatch(/consumed CSS variable[\s\S]*real DOM relationship[\s\S]*compound selectors/iu)
+    expect(properties.required_markers?.items?.description).toMatch(/custom elements[\s\S]*deck-stage[\s\S]*deck-stage > section\.slide/iu)
   })
 
   it('enforces active ask_user identity uniqueness and legacy-to-active normalization', () => {
@@ -3942,6 +3943,11 @@ describe('tool executor vision integration', () => {
       expect(submittedPrompt).toContain('Harness-grounded deterministic evidence for this phase (authoritative)')
       expect(submittedPrompt).toContain('passed the source-bound render-profile verifier with score 100')
       expect(submittedPrompt).toContain('Do not claim that an attested component or decoration is missing')
+      expect(submittedPrompt).toContain('does not prove that every visible Unicode glyph is covered')
+      expect(submittedPrompt).toContain('glyph-coverage or typography-role mismatch')
+      expect(submittedPrompt).toContain('matching dark square control as a light, rounded, or card-like widget')
+      expect(submittedPrompt).toContain('Localized body copy in a general body-text role')
+      expect(submittedPrompt).toContain('report clipping only when visible ink is actually cut off')
     }
     expect(inspect).not.toHaveBeenCalled()
     expect(await readFile(candidateTarget)).toEqual(candidate)
