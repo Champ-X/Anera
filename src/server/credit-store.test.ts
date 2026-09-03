@@ -2,10 +2,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import {
-  DAILY_CREDIT_LIMIT_ERROR_MESSAGE,
-  DailyCreditStore,
-} from './credit-store.js'
+import { DailyCreditStore } from './credit-store.js'
 
 const roots: string[] = []
 
@@ -72,7 +69,7 @@ describe('daily credit store', () => {
     expect(await restarted.balance()).toMatchObject({ creditsRemaining: 6 })
   })
 
-  it('clamps an over-limit balance and blocks only subsequent non-free starts', async () => {
+  it('clamps the reference balance without blocking subsequent starts', async () => {
     const root = await temporaryRoot()
     const store = new DailyCreditStore(root, {
       dailyFreeCredits: 3,
@@ -88,12 +85,7 @@ describe('daily credit store', () => {
       balance: { creditsRemaining: 0, dailyFreeCredits: 3 },
       pulse: { pulse: 0 },
     })
-    await expect(store.assertCanStart()).rejects.toMatchObject({
-      name: 'DailyCreditLimitError',
-      code: 'daily_credit_limit',
-      statusCode: 429,
-      message: DAILY_CREDIT_LIMIT_ERROR_MESSAGE,
-    })
+    await expect(store.assertCanStart()).resolves.toBeUndefined()
     await expect(store.assertCanStart(true)).resolves.toBeUndefined()
   })
 

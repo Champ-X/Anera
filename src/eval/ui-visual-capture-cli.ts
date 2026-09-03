@@ -1319,17 +1319,15 @@ try {
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 })
   await page.locator('.app-shell').waitFor({ state: 'visible' })
   await expectSessionRoute(sessions.empty.id, sessions.empty.title)
-  await page.getByRole('dialog', { name: 'Daily usage limit' }).waitFor({ state: 'visible' })
   await page.getByRole('textbox', { name: 'Message' }).evaluate((element) => {
-    if (element.getAttribute('aria-placeholder') !== 'You have reached your usage limit for today...'
-      || element.getAttribute('contenteditable') !== 'false'
-      || element.getAttribute('aria-readonly') !== 'true') {
-      throw new Error('Daily-limit composer did not project its locked contenteditable state')
+    if (element.getAttribute('aria-placeholder') !== 'Ask anything…'
+      || element.getAttribute('contenteditable') !== 'true'
+      || element.getAttribute('aria-readonly') === 'true') {
+      throw new Error('Zero-credit telemetry incorrectly locked the composer')
     }
   })
   await capture('credits-zero-desktop')
-  await page.getByRole('button', { name: 'You have reached your daily usage limit' }).click()
-  await page.getByRole('button', { name: 'All credits used' }).click()
+  await page.getByRole('button', { name: 'Daily reference usage reached; tasks remain available' }).click()
   await page.getByRole('dialog', { name: 'Daily credits details' }).waitFor({ state: 'visible' })
   await capture('credits-zero-gauge-desktop')
 

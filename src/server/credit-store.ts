@@ -29,18 +29,6 @@ export interface DailyCreditStoreOptions {
   now?: () => Date
 }
 
-export const DAILY_CREDIT_LIMIT_ERROR_MESSAGE = 'You have reached your usage limit for today...'
-
-export class DailyCreditLimitError extends Error {
-  readonly code = 'daily_credit_limit'
-  readonly statusCode = 429
-
-  constructor() {
-    super(DAILY_CREDIT_LIMIT_ERROR_MESSAGE)
-    this.name = 'DailyCreditLimitError'
-  }
-}
-
 export class DailyCreditStore {
   private readonly dailyFreeCredits: number
   private readonly creditsPerUsd: number
@@ -87,9 +75,10 @@ export class DailyCreditStore {
     })
   }
 
-  async assertCanStart(isFreeSession = false): Promise<void> {
-    if (isFreeSession) return
-    if ((await this.balance()).creditsRemaining <= 0) throw new DailyCreditLimitError()
+  async assertCanStart(_isFreeSession = false): Promise<void> {
+    // Credits are local usage telemetry, not an admission quota. Keeping this
+    // compatibility hook preserves startup ordering without allowing tracked
+    // spend to block a self-hosted run.
   }
 
   async settle(sessionId: string, totalCostUsd: number, isFreeSession = false): Promise<CreditSettlement> {

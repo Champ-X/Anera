@@ -55,7 +55,6 @@ import type {
   ArtifactRecord,
   CodingRepositoryState,
   CreditBalance,
-  DailyCreditPulse,
   GitHubBranch,
   GitHubConnectionState,
   GitHubRepository,
@@ -653,7 +652,6 @@ export function App() {
   const [error, setError] = useState<string>()
   const [agentModels, setAgentModels] = useState<AgentModelOption[]>([])
   const [creditBalance, setCreditBalance] = useState<CreditBalance>()
-  const [dailyCreditPulse, setDailyCreditPulse] = useState<DailyCreditPulse>()
   const [modelListUnavailable, setModelListUnavailable] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [leftOpen, setLeftOpen] = useState(false)
@@ -947,10 +945,9 @@ export function App() {
   }, [refreshSnapshot, replaceWorkspaceInventory])
 
   const refreshCredits = useCallback(async () => {
-    const [balance, pulse] = await Promise.all([api.creditBalance(), api.dailyCreditPulse()])
+    const balance = await api.creditBalance()
     setCreditBalance(balance)
-    setDailyCreditPulse(pulse)
-    return { balance, pulse }
+    return { balance }
   }, [])
 
   const activateSession = useCallback((id: string) => {
@@ -1137,12 +1134,12 @@ export function App() {
   }, [refreshCredits])
 
   useEffect(() => {
-    const resetAt = dailyCreditPulse?.refreshedAt ?? creditBalance?.refreshedAt
+    const resetAt = creditBalance?.refreshedAt
     if (!resetAt) return
     const delay = Math.max(1_000, Date.parse(resetAt) - Date.now() + 1_000)
     const timer = window.setTimeout(() => void refreshCredits().catch(() => undefined), Math.min(delay, 2_147_000_000))
     return () => window.clearTimeout(timer)
-  }, [creditBalance?.refreshedAt, dailyCreditPulse?.refreshedAt, refreshCredits])
+  }, [creditBalance?.refreshedAt, refreshCredits])
 
   useEffect(() => {
     try {
@@ -1445,10 +1442,7 @@ export function App() {
 
   const running = snapshot?.session.status === 'running' || snapshot?.session.status === 'cancelling' || snapshot?.session.status === 'awaiting_approval'
   const tokenLimit = snapshot?.session.limits?.sessionTokens
-  const blockedByDailyCredits = snapshot?.session.isFreeSession !== true && (
-    creditBalance?.creditsRemaining === 0 || dailyCreditPulse?.pulse === 0
-  )
-  const resumable = snapshot ? !tokenLimit?.reached && !blockedByDailyCredits && ['cancelled', 'failed', 'timed_out', 'interrupted'].includes(snapshot.session.status) : false
+  const resumable = snapshot ? !tokenLimit?.reached && ['cancelled', 'failed', 'timed_out', 'interrupted'].includes(snapshot.session.status) : false
   const optimisticUndoneTurnIds = useMemo(() => new Set(
     optimisticUndo && optimisticUndo.sessionId === activeId ? optimisticUndo.targetTurnIds : [],
   ), [activeId, optimisticUndo])
@@ -1930,7 +1924,6 @@ export function App() {
             resumable={resumable}
             tokenLimit={tokenLimit}
             creditBalance={creditBalance}
-            dailyCreditPulse={dailyCreditPulse}
             isFreeSession={snapshot?.session.isFreeSession === true}
             models={agentModels}
             modelListUnavailable={modelListUnavailable}
@@ -2667,7 +2660,7 @@ function SearchPicker(props: {
   )
 }
 
-function Composer(props: {
+export function Composer(props: {
   sessionId: string
   draftCommand?: ComposerDraftCommand
   reviewedNodeId?: string
@@ -2679,7 +2672,6 @@ function Composer(props: {
   resumable: boolean
   tokenLimit?: SessionTokenLimitState
   creditBalance?: CreditBalance
-  dailyCreditPulse?: DailyCreditPulse
   isFreeSession: boolean
   models: AgentModelOption[]
   modelListUnavailable: boolean
@@ -2700,7 +2692,6 @@ function Composer(props: {
   const [uploading, setUploading] = useState(false)
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [creditOpen, setCreditOpen] = useState(false)
-  const [dailyCreditOpen, setDailyCreditOpen] = useState(false)
   const [modelSelection, setModelSelection] = useState(props.modelSelection ?? 'auto')
   const fileInput = useRef<HTMLInputElement>(null)
   const editor = useRef<HTMLDivElement>(null)
@@ -2709,24 +2700,16 @@ function Composer(props: {
   const draftAttachmentSequence = useRef(0)
   const applyingDraftCommand = useRef<number | undefined>(undefined)
   const blockedBySessionLimit = Boolean(props.tokenLimit?.reached)
-  const blockedByBalance = !props.isFreeSession && props.creditBalance?.creditsRemaining === 0
-  const blockedByPulse = !props.isFreeSession && props.dailyCreditPulse?.pulse === 0
-  const blockedByDailyCredits = blockedByBalance || blockedByPulse
-  const editorLocked = props.readOnly || props.running || blockedBySessionLimit || blockedByDailyCredits
+  const editorLocked = props.readOnly || props.running || blockedBySessionLimit
   const placeholder = props.readOnly
     ? 'Static replay — new tasks are disabled'
     : props.running
     ? 'Agent is working…'
     : blockedBySessionLimit
       ? 'Start a new chat to continue.'
-      : blockedByDailyCredits
-        ? 'You have reached your usage limit for today...'
-        : props.reviewedNodeId
-          ? 'Give feedback on this task…'
-          : 'Ask anything…'
-  useEffect(() => {
-    if (blockedByPulse) setDailyCreditOpen(true)
-  }, [blockedByPulse])
+      : props.reviewedNodeId
+        ? 'Give feedback on this task…'
+        : 'Ask anything…'
   useEffect(() => {
     if (props.codingMode) setAttachments([])
   }, [props.codingMode])
@@ -2799,14 +2782,6 @@ function Composer(props: {
   }
   const submit = async () => {
     if (props.readOnly || props.submitDisabled || (!value.trim() && (!attachments.length || props.codingMode)) || props.running || blockedBySessionLimit || uploading) return
-    if (blockedByPulse) {
-      setDailyCreditOpen(true)
-      return
-    }
-    if (blockedByBalance) {
-      setCreditOpen(true)
-      return
-    }
     const content = value
     setValue('')
     try {
@@ -2876,7 +2851,7 @@ function Composer(props: {
           aria-multiline="true"
           aria-placeholder={placeholder}
           aria-disabled={editorLocked || undefined}
-          aria-readonly={props.readOnly || blockedByDailyCredits || undefined}
+          aria-readonly={props.readOnly || undefined}
           contentEditable={!editorLocked}
           suppressContentEditableWarning
           data-placeholder={placeholder}
@@ -2932,10 +2907,6 @@ function Composer(props: {
             }
             void submit()
           }}
-          onClick={() => {
-            if (blockedByPulse) setDailyCreditOpen(true)
-            else if (blockedByBalance) setCreditOpen(true)
-          }}
         />
         <div className="composer-tools">
           <input
@@ -2964,7 +2935,7 @@ function Composer(props: {
             type="button"
             aria-label={props.connectionsEnabled ? 'Connections enabled: GitHub' : 'Connections'}
             aria-expanded={props.connectionsOpen}
-            disabled={props.readOnly || props.running || blockedBySessionLimit || blockedByDailyCredits}
+            disabled={props.readOnly || props.running || blockedBySessionLimit}
             onClick={(event) => {
               const bounds = event.currentTarget.getBoundingClientRect()
               props.onConnections({ left: bounds.left, top: bounds.top })
@@ -2973,14 +2944,11 @@ function Composer(props: {
           <span className="composer-spacer" />
           {props.resumable && !props.running && <button className="resume-button" onClick={() => void props.onResume()}><RotateCcw size={13} /> Continue</button>}
           <CreditGaugeControl balance={props.creditBalance} isFreeSession={props.isFreeSession} open={creditOpen} onOpenChange={setCreditOpen} />
-          <DailyCreditControl state={props.dailyCreditPulse} isFreeSession={props.isFreeSession} open={dailyCreditOpen} onOpenChange={setDailyCreditOpen} />
           {props.running
             ? <button className="send-button stop" onClick={() => void props.onStop()} aria-label="Stop agent"><CircleStop size={17} /></button>
             : <button
-                className="send-button"
-                disabled={Boolean(props.readOnly || props.submitDisabled || blockedBySessionLimit || (!blockedByDailyCredits && ((!value.trim() && (attachments.length === 0 || props.codingMode)) || uploading)))}
-                aria-disabled={blockedByDailyCredits || undefined}
-                title={blockedByDailyCredits ? 'Out of credits for today' : undefined}
+              className="send-button"
+                disabled={Boolean(props.readOnly || props.submitDisabled || blockedBySessionLimit || ((!value.trim() && (attachments.length === 0 || props.codingMode)) || uploading))}
                 onClick={() => void submit()}
                 aria-label="Send message"
               ><ArrowUp size={17} /></button>}
@@ -3070,18 +3038,6 @@ export function formatCreditResetDuration(resetAt: string, now = Date.now()): st
   return `${hours === 1 ? '1 hour' : `${hours} hours`} ${rest === 1 ? '1 minute' : `${rest} minutes`} until daily credits reset`
 }
 
-export function formatCreditResetTime(resetAt: string): string {
-  return new Date(resetAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
-}
-
-export function formatCreditResetDay(resetAt: string, now = Date.now()): 'today' | 'tomorrow' {
-  const current = new Date(now)
-  const reset = new Date(resetAt)
-  return reset.getFullYear() === current.getFullYear() && reset.getMonth() === current.getMonth() && reset.getDate() === current.getDate()
-    ? 'today'
-    : 'tomorrow'
-}
-
 function CreditGaugeControl(props: {
   balance?: CreditBalance
   isFreeSession: boolean
@@ -3097,7 +3053,7 @@ function CreditGaugeControl(props: {
     : state === 'loading'
       ? 'Loading credits'
       : state === 'zero'
-        ? 'All credits used'
+        ? 'Daily reference usage reached; tasks remain available'
         : `Credits remaining: ${balance.toLocaleString()} of ${maximum.toLocaleString()}`
   return (
     <div className="credit-control">
@@ -3122,39 +3078,11 @@ function CreditGaugeControl(props: {
       {props.open && (
         <div className="credit-popover gauge-popover" role="dialog" aria-label="Daily credits details">
           {props.isFreeSession && <div className="credit-callout free"><Check size={13} />No credits are being used during this session</div>}
-          {!props.isFreeSession && state === 'zero' && <div className="credit-callout zero"><CircleGauge size={13} />You are out of credits for today</div>}
+          {!props.isFreeSession && state === 'zero' && <div className="credit-callout zero"><CircleGauge size={13} />Daily reference reached — tasks remain available</div>}
           <div className="credit-heading"><span>Credits</span><a href="https://help.arena.ai/articles/5476762589-credit-sytem" target="_blank" rel="noreferrer" aria-label="More information about credits"><Info size={14} /></a></div>
           <div className="credit-balance-track"><i className={`credit-balance-fill ${state}`} style={{ width: `${props.isFreeSession ? 0 : Math.max(0, Math.min(100, balance / Math.max(1, maximum) * 100))}%` }} /></div>
-          <div className="credit-balance-legend"><i className={`credit-legend-dot ${state}`} /><span>{balance.toLocaleString()} / {maximum.toLocaleString()}</span><em>credits available</em></div>
+          <div className="credit-balance-legend"><i className={`credit-legend-dot ${state}`} /><span>{balance.toLocaleString()} / {maximum.toLocaleString()}</span><em>reference credits remaining</em></div>
           {props.balance?.refreshedAt && <div className="credit-reset"><Timer size={12} /><span>{formatCreditResetDuration(props.balance.refreshedAt)}</span></div>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function DailyCreditControl(props: {
-  state?: DailyCreditPulse
-  isFreeSession: boolean
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  if (!props.state || props.isFreeSession || props.state.pulse >= 10) return null
-  const blocked = props.state.pulse <= 0
-  return (
-    <div className="credit-control daily-credit-control">
-      <button
-        type="button"
-        className={`daily-credit-trigger ${blocked ? 'blocked' : 'warning'}`}
-        aria-label={blocked ? 'You have reached your daily usage limit' : 'You are about to reach your daily usage limit'}
-        aria-expanded={props.open}
-        onClick={() => props.onOpenChange(!props.open)}
-      ><CircleGauge size={16} /></button>
-      {props.open && (
-        <div className="credit-popover daily-credit-popover" role="dialog" aria-label="Daily usage limit">
-          <p>{blocked ? 'Sorry you have reached your usage limit for today' : 'You are about to reach your daily usage limit'}</p>
-          <div className="daily-credit-reset"><Timer size={12} /><span>Resets at {formatCreditResetTime(props.state.refreshedAt)} {formatCreditResetDay(props.state.refreshedAt)}</span><a href="https://help.arena.ai/articles/5476762589-credit-sytem" target="_blank" rel="noreferrer">Learn more</a></div>
-          {blocked && <><hr /><p className="battle-copy">Battles are still available to use, if you'd like to continue to use Arena.</p><a className="battle-link" href="/text"><Sparkles size={12} />Continue to Battle</a></>}
         </div>
       )}
     </div>

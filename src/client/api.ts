@@ -1,7 +1,6 @@
 import type {
   AgentModelOption,
   CreditBalance,
-  DailyCreditPulse,
   GitHubBranchPage,
   GitHubConnectionState,
   GitHubRepositoryPage,
@@ -165,9 +164,6 @@ export const api = {
   },
   async creditBalance(): Promise<CreditBalance> {
     return await request('/api/billing/balance')
-  },
-  async dailyCreditPulse(): Promise<DailyCreditPulse> {
-    return await request('/api/me/pulse')
   },
   async snapshot(id: string): Promise<SessionSnapshot> {
     return await request<SessionSnapshot>(`/api/sessions/${id}`)

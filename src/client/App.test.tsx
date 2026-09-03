@@ -8,6 +8,7 @@ import {
   AssistantActivityRow,
   AskUserHitl,
   CODING_REPOSITORY_PANEL_STORAGE_KEY,
+  Composer,
   CONVERSATION_NEAR_BOTTOM_PX,
   HISTORY_SEARCH_PATH,
   applyEventToSnapshot,
@@ -16,9 +17,7 @@ import {
   conversationDistanceFromBottom,
   conversationScrollBehavior,
   filterHistorySessions,
-  formatCreditResetDay,
   formatCreditResetDuration,
-  formatCreditResetTime,
   ImageSelectionHitl,
   isAgentDraftPath,
   isConversationNearBottom,
@@ -604,7 +603,7 @@ describe('conversation search route', () => {
   })
 })
 
-describe('Arena credit presentation helpers', () => {
+describe('non-blocking credit telemetry', () => {
   it('uses the public normal, low, zero, and loading gauge thresholds', () => {
     expect(resolveCreditGaugeState(undefined)).toBe('loading')
     expect(resolveCreditGaugeState({ creditsRemaining: 2_500, dailyFreeCredits: 2_500, refreshedAt: '2026-08-29T00:00:00.000Z' })).toBe('normal')
@@ -621,13 +620,35 @@ describe('Arena credit presentation helpers', () => {
     expect(formatCreditResetDuration('2026-08-28T11:59:00.000Z', now)).toBe('0 hours 0 minutes until daily credits reset')
   })
 
-  it('labels resets as today or tomorrow in the browser locale', () => {
-    const current = new Date(2026, 7, 28, 10, 0)
-    const today = new Date(2026, 7, 28, 23, 0)
-    const tomorrow = new Date(2026, 7, 29, 8, 0)
-    expect(formatCreditResetDay(today.toISOString(), current.getTime())).toBe('today')
-    expect(formatCreditResetDay(tomorrow.toISOString(), current.getTime())).toBe('tomorrow')
-    expect(formatCreditResetTime(today.toISOString())).toBe(today.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }))
+  it('keeps the composer editable and removes the limit dialog at zero balance', () => {
+    const markup = renderToStaticMarkup(<Composer
+      sessionId="ses_1234567890abcdefghij"
+      onRemoveCustomFeedback={() => {}}
+      onDraftStateChange={() => {}}
+      running={false}
+      resumable={false}
+      creditBalance={{ creditsRemaining: 0, dailyFreeCredits: 2_500, refreshedAt: '2026-08-29T00:00:00.000Z' }}
+      isFreeSession={false}
+      models={[]}
+      modelListUnavailable={false}
+      modelSelection={null}
+      codingMode={false}
+      connectionsOpen={false}
+      connectionsEnabled={false}
+      onError={() => {}}
+      onConnections={() => {}}
+      onSend={async () => {}}
+      onStop={async () => {}}
+      onResume={async () => {}}
+      onNewChat={async () => {}}
+    />)
+
+    expect(markup).toContain('contentEditable="true"')
+    expect(markup).toContain('aria-placeholder="Ask anything…"')
+    expect(markup).toContain('Daily reference usage reached; tasks remain available')
+    expect(markup).not.toContain('daily-credit-trigger')
+    expect(markup).not.toContain('Daily usage limit')
+    expect(markup).not.toContain('You have reached your usage limit')
   })
 })
 

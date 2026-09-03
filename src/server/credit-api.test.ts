@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp } from './app.js'
-import { DAILY_CREDIT_LIMIT_ERROR_MESSAGE } from './credit-store.js'
 
 const roots: string[] = []
 const servers: Server[] = []
@@ -39,6 +38,14 @@ function postJson(base: string, path: string, body: unknown): Promise<Response> 
   })
 }
 
+async function waitForCompleted(created: Awaited<ReturnType<typeof createApp>>, sessionId: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await created.store.get(sessionId)).summary.status === 'completed') return
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+  }
+  throw new Error(`Session ${sessionId} did not complete`)
+}
+
 describe('Arena daily credit API contract', () => {
   it('returns the exact public balance and pulse response shapes', async () => {
     const created = await createApp({ dataRoot: await temporaryDataRoot(), model: 'test-model' })
@@ -63,46 +70,59 @@ describe('Arena daily credit API contract', () => {
     }
   })
 
-  it('globally blocks Message and Continue at zero without creating an execution episode', async () => {
+  it('keeps Message, Continue, and New Chat available after the reference balance reaches zero', async () => {
+    const stream = vi.fn(async (options: { onContent: (delta: string) => void }) => {
+      options.onContent('Completed without a local credit gate.')
+      return {
+        content: 'Completed without a local credit gate.',
+        reasoningContent: '',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: { promptTokens: 20, completionTokens: 5, totalTokens: 25, cachedPromptTokens: 0 },
+      }
+    })
     const created = await createApp({
       dataRoot: await temporaryDataRoot(),
       model: 'test-model',
       dailyFreeCredits: 1,
       creditsPerUsd: 1,
+      agent: { client: { stream } as never, runTimeoutMs: 1_000 },
     })
-    const exhausted = await created.store.create()
-    await created.store.update(exhausted.summary.id, (state) => {
+    const messageSession = await created.store.create()
+    const resumeSession = await created.store.create()
+    await created.store.update(resumeSession.summary.id, (state) => {
       state.summary.status = 'failed'
       state.messages.push({ role: 'user', content: 'Persisted task to continue.' })
     })
-    await created.credits.settle(exhausted.summary.id, 1)
+    await created.credits.settle(messageSession.summary.id, 1)
     const base = await listen(created.app)
     try {
-      for (const request of [
-        () => postJson(base, `/api/sessions/${exhausted.summary.id}/messages`, { content: 'Start another turn.', attachments: [] }),
-        () => postJson(base, `/api/sessions/${exhausted.summary.id}/resume`, {}),
-      ]) {
-        const response = await request()
-        expect(response.status).toBe(429)
-        expect(await response.json()).toEqual({
-          error: DAILY_CREDIT_LIMIT_ERROR_MESSAGE,
-          code: 'daily_credit_limit',
-        })
-      }
-      const events = await created.store.events(exhausted.summary.id)
-      expect(events.filter((event) => event.type === 'turn.started')).toHaveLength(0)
-      expect(events.filter((event) => event.type === 'run.resumed')).toHaveLength(0)
+      const messageResponse = await postJson(base, `/api/sessions/${messageSession.summary.id}/messages`, {
+        content: 'Start another turn.', attachments: [],
+      })
+      expect(messageResponse.status).toBe(202)
+      await waitForCompleted(created, messageSession.summary.id)
+
+      const resumeResponse = await postJson(base, `/api/sessions/${resumeSession.summary.id}/resume`, {})
+      expect(resumeResponse.status).toBe(202)
+      await waitForCompleted(created, resumeSession.summary.id)
 
       const newChat = await postJson(base, '/api/sessions', {})
       expect(newChat.status).toBe(201)
       const newSession = await newChat.json() as { session: { id: string; isFreeSession: boolean } }
       expect(newSession.session.isFreeSession).toBe(false)
-      const blockedNewChat = await postJson(base, `/api/sessions/${newSession.session.id}/messages`, {
-        content: 'A new chat does not reset the daily balance.',
+      const newChatResponse = await postJson(base, `/api/sessions/${newSession.session.id}/messages`, {
+        content: 'A new chat remains available at zero.',
         attachments: [],
       })
-      expect(blockedNewChat.status).toBe(429)
-      expect((await created.store.events(newSession.session.id)).filter((event) => event.type === 'turn.started')).toHaveLength(0)
+      expect(newChatResponse.status).toBe(202)
+      await waitForCompleted(created, newSession.session.id)
+
+      expect((await created.store.events(messageSession.summary.id)).filter((event) => event.type === 'turn.started')).toHaveLength(1)
+      expect((await created.store.events(resumeSession.summary.id)).filter((event) => event.type === 'run.resumed')).toHaveLength(1)
+      expect((await created.store.events(newSession.session.id)).filter((event) => event.type === 'turn.started')).toHaveLength(1)
+      expect(stream).toHaveBeenCalledTimes(3)
+      expect(await created.credits.balance()).toMatchObject({ creditsRemaining: 0 })
     } finally {
       await created.agent.shutdown()
     }
@@ -155,7 +175,7 @@ describe('Arena daily credit API contract', () => {
     }
   })
 
-  it('lets the in-flight normal run finish when its first usage settlement consumes the last credit', async () => {
+  it('keeps later normal turns available after usage consumes the last reference credit', async () => {
     const stream = vi.fn(async (options: { onContent: (delta: string) => void }) => {
       options.onContent('The admitted run still finishes.')
       return {
@@ -195,44 +215,13 @@ describe('Arena daily credit API contract', () => {
       })
 
       const nextTurn = await postJson(base, `/api/sessions/${session.summary.id}/messages`, {
-        content: 'This later turn must be blocked.',
+        content: 'This later turn must remain available.',
         attachments: [],
       })
-      expect(nextTurn.status).toBe(429)
-      expect((await created.store.events(session.summary.id)).filter((event) => event.type === 'turn.started')).toHaveLength(1)
-    } finally {
-      await created.agent.shutdown()
-    }
-  })
-
-  it('rejects a coding submit before repository resolution, bootstrap, or session creation', async () => {
-    const prepare = vi.fn()
-    const created = await createApp({
-      dataRoot: await temporaryDataRoot(),
-      model: 'test-model',
-      dailyFreeCredits: 1,
-      creditsPerUsd: 1,
-      github: { bootstrapper: { prepare } as never },
-    })
-    const chargingSession = await created.store.create()
-    await created.credits.settle(chargingSession.summary.id, 1)
-    const sessionsBefore = (await created.store.list()).map((session) => session.id)
-    const base = await listen(created.app)
-    try {
-      const response = await postJson(base, '/api/coding-agent/sessions', {
-        repoId: 1,
-        repoOwner: 'arena-probe',
-        repoName: 'synthetic',
-        baseBranch: 'main',
-        message: 'Do not bootstrap this repository.',
-      })
-      expect(response.status).toBe(429)
-      expect(await response.json()).toEqual({
-        error: DAILY_CREDIT_LIMIT_ERROR_MESSAGE,
-        code: 'daily_credit_limit',
-      })
-      expect(prepare).not.toHaveBeenCalled()
-      expect((await created.store.list()).map((session) => session.id)).toEqual(sessionsBefore)
+      expect(nextTurn.status).toBe(202)
+      await waitForCompleted(created, session.summary.id)
+      expect((await created.store.events(session.summary.id)).filter((event) => event.type === 'turn.started')).toHaveLength(2)
+      expect(stream).toHaveBeenCalledTimes(2)
     } finally {
       await created.agent.shutdown()
     }
