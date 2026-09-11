@@ -19,13 +19,13 @@ const manifestRoot = dirname(absoluteManifest)
 const manifest = JSON.parse(readFileSync(absoluteManifest, 'utf8')) as SuiteManifest
 if (!Array.isArray(manifest.runs)) throw new Error('Suite manifest runs must be an array')
 
-const loaded: LoadedSuiteRun[] = manifest.runs.map((definition) => {
+const loaded: LoadedSuiteRun[] = await Promise.all(manifest.runs.map(async (definition) => {
   const referencePath = realpathSync(resolve(manifestRoot, definition.reference))
   const candidatePath = realpathSync(resolve(manifestRoot, definition.candidate))
   const result: LoadedSuiteRun = {
     definition,
-    referenceTrace: loadCanonicalTrace(referencePath),
-    candidateTrace: loadCanonicalTrace(candidatePath),
+    referenceTrace: await loadCanonicalTrace(referencePath),
+    candidateTrace: await loadCanonicalTrace(candidatePath),
     referencePath,
     candidatePath,
   }
@@ -45,7 +45,7 @@ const loaded: LoadedSuiteRun[] = manifest.runs.map((definition) => {
     result.candidateEvidenceSha256 = sha256(readFileSync(candidateEvidencePath))
   }
   return result
-})
+}))
 let externalEvidence: LoadedSuiteExternalEvidence | undefined
 if (manifest.schemaVersion === 'anera-eval-suite/2.0') {
   const visualReportManifestPath = manifest.visualEvidence.report

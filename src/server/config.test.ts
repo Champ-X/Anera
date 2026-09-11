@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import { resolveDeepSeekVisionPricing, resolveModelTemperature, resolveTavilyApiKey, resolveTestLoopbackDeepSeekProvider } from './config.js'
+import { resolveDeepSeekModel, resolveDeepSeekVisionPricing, resolveModelTemperature, resolveTavilyApiKey, resolveTestLoopbackDeepSeekProvider } from './config.js'
 
 describe('provider configuration', () => {
+  it.each([undefined, '', '   ', '\t\n'])('defaults an unset or blank text model (%j) to DeepSeek Flash', (value) => {
+    expect(resolveDeepSeekModel(value)).toBe('deepseek-flash')
+  })
+
+  it.each([
+    ['deepseek-v4-pro', 'deepseek-v4-pro'],
+    ['custom-provider-model', 'custom-provider-model'],
+    ['  custom-provider-model  ', 'custom-provider-model'],
+    ['deepseek-chat', 'deepseek-chat'],
+  ])('preserves the explicitly configured text model %s', (value, expected) => {
+    expect(resolveDeepSeekModel(value)).toBe(expected)
+  })
+
   it('prefers TAVILY_API_KEY and accepts the existing TAVILY_API_KRY spelling', () => {
     expect(resolveTavilyApiKey((name) => ({
       TAVILY_API_KEY: 'standard-key',

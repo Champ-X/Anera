@@ -23,11 +23,14 @@ export type EventType =
   | 'assistant.thought.started'
   | 'assistant.thought.delta'
   | 'assistant.thought.completed'
+  | 'assistant.progress.delta'
+  | 'assistant.progress'
   | 'assistant.tool_call.delta'
   | 'assistant.final.delta'
   | 'assistant.final'
   | 'model.tool_call.repair'
   | 'model.final.repair'
+  | 'model.final.evidence.expanded'
   | 'tool.started'
   | 'tool.output'
   | 'tool.completed'
@@ -49,6 +52,7 @@ export type EventType =
   | 'usage.updated'
   | 'provider.usage'
   | 'context.compacted'
+  | 'context.projected'
   | 'context.compaction.failed'
   | 'hitl.required'
   | 'hitl.resolved'
@@ -126,7 +130,7 @@ export interface WebProviderRequestMetering {
   operation: 'search' | 'fetch'
   calls: number
   responseBytes: number
-  outcome: 'success' | 'empty' | 'error'
+  outcome: 'success' | 'empty' | 'error' | 'not_dispatched'
 }
 
 /**
@@ -295,6 +299,7 @@ export interface AgentModelOption {
   id: string
   publicName: string
   displayName: string | null
+  description?: string
 }
 
 export interface WorkspaceEntry {
@@ -469,10 +474,14 @@ export interface ModelArenaSystemMessagePart {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string | null
+  /** Provider reasoning must be replayed verbatim in subsequent thinking/tool requests. */
+  reasoning_content?: string
   name?: string
   tool_call_id?: string
   /** Private harness metadata. DeepSeekClient removes it from provider payloads. */
   tool_result_status?: 'succeeded' | 'failed'
+  /** Private provider-only context view; original evidence remains in content. */
+  context_projection?: { sourceSha256: string; content: string }
   /** Private typed projection of an Arena tool result; provider adapters translate it. */
   tool_content_parts?: ModelToolImageDataPart[]
   /** Private provenance only; provider adapters remove it after projecting the tagged text. */

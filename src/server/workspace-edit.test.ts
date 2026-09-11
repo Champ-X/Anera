@@ -113,4 +113,25 @@ describe('Arena-compatible edit matching', () => {
       /^Context not found\. Read the file to verify the text exists\.$/,
     )
   })
+
+  it('diagnoses literal JSON escape backslashes in a minified edit without applying it', () => {
+    const prefix = 'deck-stage>section.slide{visibility:hidden;background:#060507}.slide::before{content:'
+    const current = `${prefix}"";position:absolute}`
+    const escaped = `${prefix}\\"\\";position:absolute}`
+    expect(() => applyArenaEdit(current, escaped, 'changed')).toThrow(/literal escape backslash/)
+    expect(() => applyArenaEdit(current, escaped, 'changed')).toThrow(/Closest current excerpt \(not applied\):[\s\S]*content:""/)
+    expect(current).toContain('content:""')
+  })
+
+  it('bounds inline diagnostics and refuses an ambiguous prefix', () => {
+    const prefix = '.unique-slide-header{color:#112233;background:'
+    const current = `${prefix}#445566;${'padding:10px;'.repeat(2000)}}`
+    let message = ''
+    try { applyArenaEdit(current, `${prefix}#778899}`, 'changed') } catch (error) { message = String(error) }
+    expect(message).toContain('first mismatch')
+    expect(message.length).toBeLessThan(1600)
+    expect(() => applyArenaEdit(`${current}${current}`, `${prefix}#778899}`, 'changed')).toThrow(
+      /^Context not found\. Read the file to verify the text exists\.$/,
+    )
+  })
 })

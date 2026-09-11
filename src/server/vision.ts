@@ -461,6 +461,14 @@ function exactReferenceVerdictContradictsAttestedFacts(content: string, prompt: 
       || /(?:\b(?:left|right|center)(?:ed)?[- ]?align(?:ed|ment)?\b|左对齐|右对齐|居中对齐|文本对齐)[\s\S]{0,100}(?:\b(?:title|heading|text|typography)\b|标题|文本|文字|排版)/iu.test(content)
     if (alignmentClaim) return true
   }
+  if (/\[ATTESTED_FACT:\s*localized_copy_not_a_defect\]/iu.test(prompt)) {
+    const concretePixelFailure = /\b(?:clip(?:ped|ping)?|cut[ -]?off|crop(?:ped|ping)?|overlap(?:ped|ping)?|collid(?:e|es|ed|ing)|occlud(?:e|es|ed|ing)|unreadable|illegible)\b|裁切|截断|遮挡|重叠|碰撞|无法阅读/iu.test(content)
+    const copyRole = /\b(?:body(?:[ -]?copy| text)?|paragraph|footnote|caption|copy|label|pill|badge|kicker|chip|tag|wording|translation|translated text)\b|正文|文案|段落|脚注|标签|徽章|翻译|译文/iu
+    const localizedDifference = /\b(?:CJK|Chinese|localized|localised|translation|translated|different language|wording|fallback|line[ -]?break|wrap(?:s|ped|ping)?|text (?:width|height)|wider|narrower)\b|中文|本地化|语言不同|字体回退|换行|字宽|文字宽度/iu
+    const intrinsicDifference = /\b(?:label|pill|badge|kicker|chip|tag)\b[\s\S]{0,120}\b(?:width|height|size|wider|narrower|larger|smaller|wrap(?:s|ped|ping)?|line[ -]?break)\b|(?:标签|徽章)[\s\S]{0,80}(?:宽|高|尺寸|大小|换行)/iu.test(content)
+    const localizedCopyClaim = copyRole.test(content) && localizedDifference.test(content)
+    if (!concretePixelFailure && (localizedCopyClaim || intrinsicDifference)) return true
+  }
   return false
 }
 
@@ -471,7 +479,7 @@ Image roles are fixed by attachment order: Image 1 is the reference. Image 2 is 
 
 Comparison request: ${prompt}
 
-Your previous response violated the exact verdict contract by mixing reserved pass text with extra prose, omitting a required pass line, or contradicting authoritative attested facts in the comparison request. Do not repeat claims about task-dependent pagination text/numbers or a computed typography alignment that the attestation says already matches. Start over. Return exactly one of these forms and nothing else.
+Your previous response violated the exact verdict contract by mixing reserved pass text with extra prose, omitting a required pass line, or contradicting authoritative attested facts in the comparison request. Do not repeat claims about task-dependent pagination text/numbers, localized/replaced copy, content-driven intrinsic label size or wrapping, or a computed property that the attestation says already matches. Only report a glyph, wrapping, or copy-region problem when candidate pixels visibly clip, collide, occlude, or become unreadable. Start over. Return exactly one of these forms and nothing else.
 
 If the candidate passes, return exactly these two lines:
 NO DEFECTS

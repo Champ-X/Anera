@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { createHash } from 'node:crypto'
 
 const base = process.env.ANERA_BASE_URL || 'http://127.0.0.1:4174'

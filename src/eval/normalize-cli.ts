@@ -5,7 +5,7 @@ const args = parseArgs(process.argv.slice(2))
 const input = args.values.input || args.positionals[0]
 if (!input) usage('Missing --input <trace.jsonl|snapshot.json|events.md>')
 const output = args.values.output || args.positionals[1]
-const serialized = serializeCanonicalTrace(loadCanonicalTrace(input))
+const serialized = serializeCanonicalTrace(await loadCanonicalTrace(input))
 if (output) writeFileSync(output, serialized, 'utf8')
 else process.stdout.write(serialized)
 

@@ -1,5 +1,7 @@
 import type { ToolExecutionResult } from './tools.js'
 
+import { isCompleteReferenceTextView } from './reference-text-edit.js'
+
 export const ARENA_PUBLIC_RESULT_TOOL_NAMES = [
   'create_file',
   'edit_file',
@@ -163,11 +165,16 @@ export function enforceArenaPublicToolResult(toolName: string, result: ToolExecu
 
 /**
  * Enforce Anera's provider-visible runtime overlays without widening Arena's
- * frozen active result unions. Today only list_files has a distinct paged
- * result; every other tool continues through the Arena validator above.
+ * frozen active result unions. list_files has a distinct paged result and
+ * read_file may return a complete source-bound text view; ordinary results
+ * continue through the Arena validator above.
  */
 export function enforceAneraRuntimeToolResult(toolName: string, result: ToolExecutionResult): ToolExecutionResult {
-  if (toolName !== 'list_files') return enforceArenaPublicToolResult(toolName, result)
+  let referenceText = false
+  if (toolName === 'read_file') {
+    try { referenceText = JSON.parse(result.content)?.kind === 'reference_text' } catch { /* Ordinary malformed-result path. */ }
+  }
+  if (toolName !== 'list_files' && !referenceText) return enforceArenaPublicToolResult(toolName, result)
   try {
     assertAneraRuntimeToolResult(toolName, result)
     return result
@@ -178,7 +185,7 @@ export function enforceAneraRuntimeToolResult(toolName: string, result: ToolExec
 }
 
 export function assertAneraRuntimeToolResult(toolName: string, result: ToolExecutionResult): void {
-  if (toolName !== 'list_files') return assertArenaActiveToolResult(toolName, result)
+  if (toolName !== 'list_files' && toolName !== 'read_file') return assertArenaActiveToolResult(toolName, result)
   let payload: unknown
   try {
     payload = JSON.parse(result.content)
@@ -186,6 +193,13 @@ export function assertAneraRuntimeToolResult(toolName: string, result: ToolExecu
     throw new Error('result content is not valid JSON')
   }
   const record = objectValue(payload, 'result')
+  if (toolName === 'read_file') {
+    if (record.kind !== 'reference_text') return assertArenaActiveToolResult(toolName, result)
+    exactKeys(record, ['status', 'path', 'kind', 'schemaVersion', 'complete', 'hash', 'language_manifest_sha256', 'source_sha256', 'slots'], [], 'result')
+    if (record.status !== 'success' || result.isError || !isCompleteReferenceTextView(record)) throw new Error('result must contain the complete current reference text view')
+    boundedString(record.path, 'result.path', 4_096)
+    return
+  }
   if (record.status === 'error') return assertErrorMessage(record)
   exactKeys(record, ['files', 'hasMore', 'truncated', 'totalFiles'], ['nextCursor'], 'result')
   const files = arrayValue(record.files, 'result.files')

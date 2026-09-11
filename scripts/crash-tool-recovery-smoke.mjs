@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { writeFile } from 'node:fs/promises'
 
 const { config } = await import('../dist-server/server/config.js')

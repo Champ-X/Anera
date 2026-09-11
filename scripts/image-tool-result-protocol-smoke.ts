@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { config } from '../src/server/config.js'

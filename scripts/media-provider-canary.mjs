@@ -15,6 +15,10 @@ if (process.argv[2] === '--reconcile') {
   process.exit()
 }
 
+// Local billing reconciliation above is free. New image/voice generation has
+// no shared write-ahead authorization and cannot opt into an unmetered run.
+await import('./legacy-live-test-disabled.mjs')
+
 const dataRoot = await mkdtemp(resolve(tmpdir(), 'anera-real-media-canary-'))
 
 let secretValues = []

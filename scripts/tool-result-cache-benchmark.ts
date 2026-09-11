@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { createHash, randomUUID } from 'node:crypto'
 import { compactHistoricalToolPayloads } from '../src/server/agent-service.js'
 import { config } from '../src/server/config.js'

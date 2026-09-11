@@ -33,11 +33,50 @@ export function applyArenaEdit(content: string, context: string, replacement: st
       matchedText,
     }
   }
+  const inlineExcerpt = closestInlineExcerpt(content, context)
+  if (inlineExcerpt) {
+    throw new Error(`Context not found. ${inlineExcerpt.diagnosis}\nClosest current excerpt (not applied):\n${inlineExcerpt.text}\nUse a short unique span of this exact current text for old_text. Encode JSON once; do not copy JSON escape backslashes into the file. No edit was applied.`)
+  }
   const nearby = closestCurrentExcerpt(content, context)
   if (nearby) {
     throw new Error(`Context not found. Closest current excerpt (not applied):\n${nearby}\nUse this exact current text for a targeted retry, or continue if the requested state is already correct.`)
   }
   throw new Error('Context not found. Read the file to verify the text exists.')
+}
+
+function closestInlineExcerpt(content: string, context: string): { text: string; diagnosis: string } | undefined {
+  // Large minified HTML/CSS lives on one line. Whole-line similarity cannot
+  // diagnose it, and rereading the same 20KB line only repeats the ambiguity.
+  // Locate one strong literal prefix; this is a diagnostic, NEVER a match
+  // strategy or an automatic unescape of the requested mutation.
+  if (context.includes('\n') || context.length < 32) return undefined
+  const firstEscape = context.indexOf('\\')
+  const prefixLength = Math.min(96, firstEscape < 0 ? context.length : firstEscape)
+  if (prefixLength < 24) return undefined
+  let prefix = ''
+  let start = -1
+  for (const length of [...new Set([prefixLength, Math.min(prefixLength, 48), 24])]) {
+    const candidate = context.slice(0, length)
+    if ((candidate.match(/[A-Za-z_$][\w$-]*/g)?.length ?? 0) < 2) continue
+    const matches = exactMatches(content, candidate)
+    if (matches.length !== 1) continue
+    prefix = candidate
+    start = matches[0]
+    break
+  }
+  if (start < 0) return undefined
+  let shared = prefix.length
+  while (shared < context.length && content[start + shared] === context[shared]) shared += 1
+  const mismatch = start + shared
+  const excerptStart = Math.max(start, mismatch - 100)
+  const excerptEnd = Math.min(content.length, mismatch + 900)
+  const actual = content[mismatch]
+  const expected = context[shared]
+  const escapeMismatch = expected === '\\' && ['"', "'", '\\'].includes(actual)
+  return {
+    text: content.slice(excerptStart, excerptEnd),
+    diagnosis: `The first mismatch is at character ${shared + 1} of old_text (file line ${content.slice(0, mismatch).split('\n').length}). ${escapeMismatch ? 'old_text contains a literal escape backslash where the file contains the character itself.' : `The file contains ${JSON.stringify(actual ?? '(end of file)')}; old_text contains ${JSON.stringify(expected ?? '(end of context)')}.`} The excerpt is a bounded raw substring, not the whole file.`,
+  }
 }
 
 function closestCurrentExcerpt(content: string, context: string): string | undefined {

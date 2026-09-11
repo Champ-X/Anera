@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import {
+  injectMaterializedReferenceFonts,
   materializeReferenceFonts,
   REFERENCE_FONT_MAX_FILE_BYTES,
   REFERENCE_FONT_MAX_FILES,
@@ -14,6 +15,7 @@ const CSS_URL = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&dis
 const SECOND_CSS_URL = 'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600&display=swap'
 const FONT_URL = 'https://fonts.gstatic.com/s/inter/v1/inter-latin.woff2'
 const SECOND_FONT_URL = 'https://fonts.gstatic.com/s/spacegrotesk/v1/space-grotesk-latin.woff2'
+const SUBSET_FONT_URL = 'https://fonts.gstatic.com/l/font?kit=fixture_subset-123&skey=37fe335b8fd815cc&v=v35'
 
 function woff2(label = 'font'): Buffer {
   return Buffer.concat([Buffer.from('wOF2', 'ascii'), Buffer.from(label, 'utf8')])
@@ -50,6 +52,69 @@ function successfulFetch(stylesheets: ReadonlyMap<string, string>, fonts: Readon
     throw new Error(`Unexpected fetch: ${url}`)
   }) as unknown as typeof fetch
 }
+
+describe('materialized reference font delivery', () => {
+  const manifestSha256 = 'a'.repeat(64)
+  const fontCss = css('Inter', 'data:font/woff2;base64,d09GMmZpeHR1cmU=')
+  const injectedStyle = `<style data-anera-reference-fonts data-manifest-sha256="${manifestSha256}">\n${fontCss}\n</style>`
+
+  it('removes supported real Google links and injects the exact private CSS without changing other bytes', () => {
+    const links = [
+      '<link rel="preconnect" href="https://fonts.googleapis.com">',
+      '<link rel="dns-prefetch" href="https://fonts.gstatic.com">',
+      `<LINK data-note="quoted > delimiter" REL="stylesheet" HREF="${CSS_URL.replaceAll('&', '&amp;')}">`,
+    ].join('\n')
+    const retained = '<link rel="stylesheet" href="https://cdn.example.com/theme.css"><main>原始内容</main>'
+    const html = `<!doctype html><html><head>${links}</head><body>${retained}</body></html>`
+
+    const delivered = injectMaterializedReferenceFonts(html, fontCss, manifestSha256)
+
+    expect(delivered).toBe(`<!doctype html>${injectedStyle}<html><head>\n\n</head><body>${retained}</body></html>`)
+    expect(delivered).not.toMatch(/fonts\.(?:googleapis|gstatic)\.com/u)
+    expect(html).toContain(links)
+  })
+
+  it('preserves link-shaped script, style, comment, text and attribute strings byte-for-byte', () => {
+    const literal = `<link rel="stylesheet" href="${CSS_URL}">`
+    const html = `<!doctype html><html><head><script>const markup = ${JSON.stringify(literal)};</script><style>.example::after { content: '${literal}'; }</style><!-- ${literal} --></head><body><textarea>${literal}</textarea><div data-markup='${literal}'>Text</div></body></html>`
+
+    expect(injectMaterializedReferenceFonts(html, fontCss, manifestSha256))
+      .toBe(html.replace('<!doctype html>', `<!doctype html>${injectedStyle}`))
+  })
+
+  it('removes real template links but preserves foreign-namespace link elements', () => {
+    const html = `<!doctype html><template><link rel="stylesheet" href="${CSS_URL}"><span>Keep</span></template><svg><link rel="stylesheet" href="${CSS_URL}"></link></svg>`
+
+    expect(injectMaterializedReferenceFonts(html, fontCss, manifestSha256)).toBe(
+      `<!doctype html>${injectedStyle}<template><span>Keep</span></template><svg><link rel="stylesheet" href="${CSS_URL}"></link></svg>`,
+    )
+  })
+
+  it('uses browser-decoded attributes when identifying supported font links', () => {
+    const html = '<!doctype html><link rel="style&#115;heet" href="https://fonts.google&#97;pis.com/css2?family=Inter">'
+
+    expect(injectMaterializedReferenceFonts(html, fontCss, manifestSha256)).toBe(`<!doctype html>${injectedStyle}`)
+  })
+
+  it.each<[string, RegExp]>([
+    [`<link rel="stylesheet" href="${CSS_URL}" href="https://other.example/font.css">`, /duplicate href/u],
+    [`<link rel="stylesheet" rel="preconnect" href="${CSS_URL}">`, /duplicate rel/u],
+    ['<link rel="stylesheet" href="https://fonts.googleapis.com.attacker.invalid/css2?family=Inter">', /ambiguous host/u],
+    ['<link rel="stylesheet" href="http://fonts.googleapis.com/css2?family=Inter">', /must use https/u],
+    ['<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter">', /must use https/u],
+    ['<link rel="preload" href="https://fonts.gstatic.com/s/inter/v1/font.woff2">', /unsupported Google Fonts link/u],
+  ])('fails closed for an unsupported or ambiguous real font declaration %s', (html, error) => {
+    expect(() => injectMaterializedReferenceFonts(html, fontCss, manifestSha256)).toThrow(error)
+  })
+
+  it('leaves non-Google external resources and empty-font evidence unchanged apart from the injection', () => {
+    const html = '<!doctype html><link rel="stylesheet" href="https://example.com/theme.css"><link rel="preconnect" href="https://example.com"><script src="https://example.com/app.js"></script>'
+
+    expect(injectMaterializedReferenceFonts(html, '', manifestSha256)).toBe(
+      html.replace('<!doctype html>', `<!doctype html><style data-anera-reference-fonts data-manifest-sha256="${manifestSha256}">\n\n</style>`),
+    )
+  })
+})
 
 describe('reference font materialization', () => {
   it('embeds two Google CSS2 stylesheets and their WOFF2 files with a path-free, aggregate-hashed manifest', async () => {
@@ -103,6 +168,71 @@ describe('reference font materialization', () => {
     const { manifestSha256, ...core } = manifest
     expect(manifestSha256).toBe(digest(JSON.stringify(core)))
     expect(JSON.stringify(manifest)).not.toMatch(/(?:file:|\/Users\/|\\Users\\)/u)
+  })
+
+  it('materializes CJK text subsets without downloading the full font collection or losing weight and glyph ranges', async () => {
+    const sheetUrl = 'https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;900&family=Noto+Sans+SC:wght@400&text=News'
+    const secondFont = SUBSET_FONT_URL.replace('fixture_subset-123', 'fixture_sans-456')
+    const serif = woff2('serif-subset')
+    const sans = woff2('sans-subset')
+    const glyphRange = 'unicode-range: U+4e2d, U+4e50, U+5a31;'
+    const source = [
+      css('Noto Serif SC', SUBSET_FONT_URL).replace('}', `${glyphRange} }`),
+      css('Noto Serif SC', SUBSET_FONT_URL).replace('400', '900').replace('}', `${glyphRange} }`),
+      css('Noto Sans SC', secondFont).replace('}', `${glyphRange} }`),
+    ].join('\n')
+    const fetchMock = successfulFetch(new Map([[sheetUrl, source]]), new Map([[SUBSET_FONT_URL, serif], [secondFont, sans]]))
+
+    const result = await materializeReferenceFonts(stylesheetHtml(sheetUrl), new AbortController().signal, fetchMock)
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(result.manifest?.fonts).toHaveLength(2)
+    expect(result.manifest?.stylesheets[0]).toMatchObject({ sha256: digest(source), fontSha256: [digest(serif), digest(sans)] })
+    expect(result.fontCss.match(/@font-face/gu)).toHaveLength(3)
+    expect(result.fontCss.match(/unicode-range:/gu)).toHaveLength(3)
+    expect(result.fontCss).toContain('font-weight: 900')
+    expect(result.fontCss).toContain(glyphRange)
+    expect(result.fontCss).not.toContain('fonts.gstatic.com')
+    expect(result.familyNames).toEqual(['Noto Serif SC', 'Noto Sans SC'])
+  })
+
+  it.each([
+    ['HTTP', SUBSET_FONT_URL.replace('https:', 'http:')],
+    ['lookalike host', SUBSET_FONT_URL.replace('fonts.gstatic.com', 'fonts.gstatic.com.attacker.invalid')],
+    ['credentials', SUBSET_FONT_URL.replace('https://', 'https://user@')],
+    ['port', SUBSET_FONT_URL.replace('.com/', '.com:8443/')],
+    ['other endpoint', SUBSET_FONT_URL.replace('/l/font?', '/l/other?')],
+    ['path suffix', SUBSET_FONT_URL.replace('/l/font?', '/l/font/other?')],
+    ['empty kit', SUBSET_FONT_URL.replace('fixture_subset-123', '')],
+    ['missing kit', SUBSET_FONT_URL.replace('kit=fixture_subset-123&', '')],
+    ['oversized kit', SUBSET_FONT_URL.replace('fixture_subset-123', 'a'.repeat(8_193))],
+    ['duplicate kit', `${SUBSET_FONT_URL}&kit=another`],
+    ['unrecognized parameter', `${SUBSET_FONT_URL}&url=https://attacker.invalid`],
+    ['fragment', `${SUBSET_FONT_URL}#unused`],
+  ])('rejects a disallowed text-subset URL (%s) before downloading a font', async (_label, fontUrl) => {
+    const fetchMock = successfulFetch(new Map([[CSS_URL, css('Noto Serif SC', fontUrl)]]), new Map())
+    await expect(materializeReferenceFonts(stylesheetHtml(), new AbortController().signal, fetchMock))
+      .rejects.toThrow(/disallowed font URL/u)
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['MIME', 'text/html', Buffer.from('wOF2pretend'), undefined, /disallowed MIME type/u],
+    ['file signature', 'font/woff2', Buffer.from('not-a-woff2'), undefined, /wOF2 magic signature/u],
+    ['file size', 'font/woff2', woff2(), REFERENCE_FONT_MAX_FILE_BYTES + 1, /exceeds/u],
+  ])('keeps the %s validation boundary for text-subset responses', async (_label, mime, body, contentLength, error) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => String(input) === CSS_URL
+      ? responseAt(CSS_URL, css('Noto Serif SC', SUBSET_FONT_URL), 'text/css')
+      : responseAt(SUBSET_FONT_URL, body, mime, { contentLength })) as unknown as typeof fetch
+    await expect(materializeReferenceFonts(stylesheetHtml(), new AbortController().signal, fetchMock)).rejects.toThrow(error)
+  })
+
+  it('rejects a text-subset response redirected to an unrelated path on the same font host', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => String(input) === CSS_URL
+      ? responseAt(CSS_URL, css('Noto Serif SC', SUBSET_FONT_URL), 'text/css')
+      : responseAt('https://fonts.gstatic.com/unrelated', woff2(), 'font/woff2')) as unknown as typeof fetch
+    await expect(materializeReferenceFonts(stylesheetHtml(), new AbortController().signal, fetchMock))
+      .rejects.toThrow(/disallowed final path/u)
   })
 
   it('returns no assets and does not fetch when no Google Fonts stylesheet is declared', async () => {
@@ -215,6 +345,62 @@ describe('reference font materialization', () => {
     }) as unknown as typeof fetch
     await expect(materializeReferenceFonts(stylesheetHtml(), new AbortController().signal, fontFailure))
       .rejects.toThrow(/HTTP 404; expected 200/u)
+  })
+
+  it('absorbs transient transport and retryable HTTP failures inside one materialization call', async () => {
+    let stylesheetAttempts = 0
+    let fontAttempts = 0
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url === CSS_URL) {
+        stylesheetAttempts += 1
+        if (stylesheetAttempts === 1) throw new Error('socket hang up')
+        return responseAt(url, css('Inter', FONT_URL), 'text/css')
+      }
+      fontAttempts += 1
+      if (fontAttempts === 1) return responseAt(url, 'temporarily unavailable', 'font/woff2', { status: 503 })
+      return responseAt(url, woff2('recovered'), 'font/woff2')
+    }) as unknown as typeof fetch
+
+    const result = await materializeReferenceFonts(
+      stylesheetHtml(),
+      new AbortController().signal,
+      fetchMock,
+    )
+
+    expect(result.familyNames).toEqual(['Inter'])
+    expect(stylesheetAttempts).toBe(2)
+    expect(fontAttempts).toBe(2)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+  })
+
+  it('downloads independent WOFF2 files concurrently while preserving manifest order', async () => {
+    let activeFontRequests = 0
+    let peakFontRequests = 0
+    const firstFont = woff2('first')
+    const secondFont = woff2('second')
+    const twoFontCss = `${css('Inter', FONT_URL)}\n${css('Space Grotesk', SECOND_FONT_URL)}`
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url === CSS_URL) return responseAt(url, twoFontCss, 'text/css')
+      activeFontRequests += 1
+      peakFontRequests = Math.max(peakFontRequests, activeFontRequests)
+      await new Promise((resolve) => setTimeout(resolve, url === FONT_URL ? 15 : 5))
+      activeFontRequests -= 1
+      return responseAt(url, url === FONT_URL ? firstFont : secondFont, 'font/woff2')
+    }) as unknown as typeof fetch
+
+    const result = await materializeReferenceFonts(
+      stylesheetHtml(),
+      new AbortController().signal,
+      fetchMock,
+    )
+
+    expect(peakFontRequests).toBe(2)
+    expect(result.manifest?.fonts).toEqual([
+      { sha256: digest(firstFont), bytes: firstFont.length },
+      { sha256: digest(secondFont), bytes: secondFont.length },
+    ])
   })
 
   it.each([

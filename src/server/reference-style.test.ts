@@ -5,8 +5,10 @@ import type { ReferenceFontEvidenceManifest, ReferenceVisualEvidenceManifest } f
 import { BLUE_PROFESSIONAL_TEMPLATE_HTML } from './fixtures/blue-professional-template.fixture.js'
 import {
   contractIsGroundedInEvidence,
+  completedReferenceStyleFetchForCall,
   extractReferenceStyleSourceProfile,
   findReferenceStyleEvidence,
+  githubAnchoredTemplateSourceUrl,
   latestSuccessfulReferenceStyleContract,
   normalizeReferenceContractMarker,
   normalizeRenderedReferenceStyleProfile,
@@ -18,6 +20,7 @@ import {
   referenceStyleEvidenceContinuation,
   referenceStyleEvidenceScore,
   referenceUrlsAreRelated,
+  referenceTextLayoutRequiresUpgrade,
   verifyHtmlAgainstReferenceStyle,
   type ReferenceStyleContract,
   type ReferenceStyleSourceProfile,
@@ -25,6 +28,7 @@ import {
 } from './reference-style.js'
 
 const REFERENCE_DIRECTORY = 'https://github.com/zarazhangrui/beautiful-html-templates/blob/main/templates/blue-professional'
+const REFERENCE_REPOSITORY = 'https://github.com/zarazhangrui/beautiful-html-templates'
 const REFERENCE_SOURCE = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/blue-professional/template.html'
 const SIBLING_SOURCE = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/dark-corporate/template.html'
 const PINK_SCRIPT_SOURCE = 'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/main/templates/pink-script/template.html'
@@ -274,6 +278,7 @@ function renderedProfile(): RenderedReferenceStyleProfile {
       content: { anchors: [structuralAnchor('.slide-header'), chromeAnchor], overlayProbes: [] },
       closing: { anchors: [structuralAnchor('.layout-closing'), chromeAnchor], overlayProbes: [] },
     },
+    sharedAnchorSelectors: ['.progress-bar'],
   }
 }
 
@@ -381,7 +386,7 @@ function expandedRenderedProfile(): RenderedReferenceStyleProfile {
 }
 
 describe('reference style evidence and verification', () => {
-  it('treats a GitHub directory listing as discovery only and relates only the requested template subtree', () => {
+  it('treats GitHub repository and directory listings as discovery only and relates only the requested template subtree', () => {
     const directoryListing = 'blue-professional\ndesign.md\ntemplate.html\ntemplate.json\nHistory\n'
     expect(referenceStyleEvidenceScore(directoryListing)).toBeLessThan(4)
     expect(findReferenceStyleEvidence(
@@ -391,9 +396,32 @@ describe('reference style evidence and verification', () => {
     const styleRichGitHubChrome = '<!doctype html><style>:root{--fg:#111111;--bg:#ffffff}.file-grid{display:grid;grid-template-columns:1fr}.nav{border-radius:8px;box-shadow:0 1px 2px #0003}body{font-family:Arial}</style><a>design.md</a><a>template.html</a>'
     expect(referenceStyleEvidenceScore(styleRichGitHubChrome)).toBeGreaterThanOrEqual(4)
     expect(findReferenceStyleEvidence(
+      fetchMessages(REFERENCE_REPOSITORY, styleRichGitHubChrome),
+      [REFERENCE_REPOSITORY],
+    )).toBeUndefined()
+    expect(findReferenceStyleEvidence(
       fetchMessages(REFERENCE_DIRECTORY, styleRichGitHubChrome),
       [REFERENCE_DIRECTORY],
     )).toBeUndefined()
+
+    expect(findReferenceStyleEvidence(
+      fetchMessages(REFERENCE_SOURCE, REFERENCE_HTML),
+      [REFERENCE_REPOSITORY],
+    )).toMatchObject({
+      requestedUrl: REFERENCE_SOURCE,
+      resolvedUrl: REFERENCE_SOURCE,
+    })
+
+    const redirectedFetch = fetchMessages(REFERENCE_SOURCE, REFERENCE_HTML)
+    redirectedFetch[1] = {
+      ...redirectedFetch[1],
+      content: JSON.stringify({
+        status: 'success',
+        url: 'https://attacker.example/template.html',
+        content: REFERENCE_HTML,
+      }),
+    }
+    expect(findReferenceStyleEvidence(redirectedFetch, [REFERENCE_DIRECTORY])).toBeUndefined()
 
     expect(referenceUrlsAreRelated(REFERENCE_DIRECTORY, REFERENCE_SOURCE)).toBe(true)
     expect(referenceUrlsAreRelated(REFERENCE_DIRECTORY, SIBLING_SOURCE)).toBe(false)
@@ -405,6 +433,81 @@ describe('reference style evidence and verification', () => {
       'https://github.com/zarazhangrui/beautiful-html-templates/tree/main/templates/blue-professional',
       'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/experimental/templates/blue-professional/template.html',
     )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/HEAD/templates/blue-professional/template.html',
+      'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/experimental/templates/blue-professional/template.html',
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      'https://raw.githubusercontent.com/Example/Templates/Feature/Theme/Template.html',
+      'https://raw.githubusercontent.com/example/templates/feature/Theme/Template.html',
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      'https://raw.githubusercontent.com/Example/Templates/Feature/Theme/Template.html',
+      'https://raw.githubusercontent.com/example/templates/Feature/theme/Template.html',
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      'https://raw.githubusercontent.com/Example/Templates/Feature/Theme/Template.html',
+      'https://raw.githubusercontent.com/example/templates/Feature/Theme/Template.html',
+    )).toBe(true)
+
+    expect(referenceUrlsAreRelated(
+      'https://reference.example/templates/paper?variant=a',
+      'https://reference.example/templates/paper?variant=b',
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      'https://reference.example/templates/paper',
+      'http://reference.example/templates/paper',
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      'https://reference.example/templates/paper',
+      'https://reference.example:444/templates/paper',
+    )).toBe(false)
+
+    const anchoredRepository = `${REFERENCE_REPOSITORY}#blue-professional`
+    expect(githubAnchoredTemplateSourceUrl(anchoredRepository)).toBe(
+      'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/HEAD/templates/blue-professional/template.html',
+    )
+    expect(githubAnchoredTemplateSourceUrl(
+      `${REFERENCE_REPOSITORY}?tab=readme-ov-file#blue-professional`,
+    )).toBe(
+      'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/HEAD/templates/blue-professional/template.html',
+    )
+    expect(githubAnchoredTemplateSourceUrl(
+      `${REFERENCE_REPOSITORY}?utm_source=copied-link#blue-professional`,
+    )).toBe(
+      'https://raw.githubusercontent.com/zarazhangrui/beautiful-html-templates/HEAD/templates/blue-professional/template.html',
+    )
+    expect(githubAnchoredTemplateSourceUrl(
+      `${REFERENCE_REPOSITORY}?variant=a#blue-professional`,
+    )).toBeUndefined()
+    expect(referenceUrlsAreRelated(
+      `${REFERENCE_SOURCE}?variant=a`,
+      `${REFERENCE_SOURCE}?variant=b`,
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(anchoredRepository, REFERENCE_SOURCE)).toBe(true)
+    expect(referenceUrlsAreRelated(
+      githubAnchoredTemplateSourceUrl(anchoredRepository) as string,
+      REFERENCE_SOURCE,
+    )).toBe(true)
+    expect(referenceUrlsAreRelated(anchoredRepository, SIBLING_SOURCE)).toBe(false)
+    expect(githubAnchoredTemplateSourceUrl(`${REFERENCE_REPOSITORY}#../blue-professional`)).toBeUndefined()
+    expect(githubAnchoredTemplateSourceUrl(`${REFERENCE_REPOSITORY}#templates/blue-professional`)).toBeUndefined()
+    expect(githubAnchoredTemplateSourceUrl('http://github.com/example/templates#paper')).toBeUndefined()
+    expect(githubAnchoredTemplateSourceUrl('https://user@github.com/example/templates#paper')).toBeUndefined()
+    expect(githubAnchoredTemplateSourceUrl('https://github.com:444/example/templates#paper')).toBeUndefined()
+
+    const ordinaryReadmeAnchor = 'https://github.com/example/product#installation'
+    const unrelatedRepositoryFile = 'https://raw.githubusercontent.com/example/product/main/templates/installation/template.html'
+    expect(githubAnchoredTemplateSourceUrl(ordinaryReadmeAnchor)).toBeUndefined()
+    expect(referenceUrlsAreRelated(ordinaryReadmeAnchor, unrelatedRepositoryFile)).toBe(false)
+    expect(referenceUrlsAreRelated(
+      ordinaryReadmeAnchor,
+      'https://github.com/example/product#usage',
+    )).toBe(false)
+    expect(referenceUrlsAreRelated(
+      ordinaryReadmeAnchor,
+      'https://github.com/example/product',
+    )).toBe(true)
   })
 
   it('accepts concrete style-bearing source and rejects a hallucinated contract', () => {
@@ -416,6 +519,16 @@ describe('reference style evidence and verification', () => {
       bytes: Buffer.byteLength(REFERENCE_HTML),
     })
     expect(contractIsGroundedInEvidence(CONTRACT, evidence!)).toBe(true)
+    const redirectedEvidence = {
+      ...evidence!,
+      resolvedUrl: 'https://attacker.example/template.html',
+    }
+    expect(contractIsGroundedInEvidence(CONTRACT, redirectedEvidence)).toBe(false)
+    expect(referenceStyleGroundingGaps(CONTRACT, redirectedEvidence)).toBeUndefined()
+    expect(normalizeReferenceStyleContractAgainstEvidence(CONTRACT, redirectedEvidence)).toEqual({
+      contract: CONTRACT,
+      omittedVisuallyInertColors: [],
+    })
     expect(contractIsGroundedInEvidence({
       ...CONTRACT,
       colors: ['#081426', '#d4af37', '#ffffff'],
@@ -506,6 +619,122 @@ describe('reference style evidence and verification', () => {
     expect(referenceStyleGroundingGaps(CONTRACT, unrelatedEvidence)).toBeUndefined()
   })
 
+  it('grounds equivalent leading-decimal colors without admitting a different alpha or unused variable', () => {
+    const html = REFERENCE_HTML.replace('rgba(30, 43, 250, 0.2)', 'rgba(30, 43, 250, .2)')
+      .replace(':root {', ':root { --unused: rgba(30,43,250,.32);')
+    const evidence = findReferenceStyleEvidence(fetchMessages(REFERENCE_SOURCE, html), [REFERENCE_DIRECTORY])!
+    const shortDecimalContract = { ...CONTRACT, colors: CONTRACT.colors.map((color) => color.replace(',0.2)', ',.2)')) }
+    expect(referenceStyleGroundingGaps(shortDecimalContract, evidence)).toEqual({ colors: [], fonts: [], markers: [] })
+    expect(contractIsGroundedInEvidence(shortDecimalContract, evidence)).toBe(true)
+    expect(verifyHtmlAgainstReferenceStyle(html, shortDecimalContract).fidelity).toBe('pass')
+    const normalized = normalizeReferenceStyleContractAgainstEvidence({
+      ...shortDecimalContract, colors: [...shortDecimalContract.colors, 'rgba(30,43,250,.32)'],
+    }, evidence)
+    expect(normalized.omittedVisuallyInertColors).toEqual(['rgba(30,43,250,.32)'])
+    expect(normalized.contract.colors).toEqual(shortDecimalContract.colors)
+    expect(referenceStyleGroundingGaps({
+      ...CONTRACT, colors: [...CONTRACT.colors, 'rgba(30,43,250,.21)'],
+    }, evidence)?.colors).toEqual(['rgba(30,43,250,.21)'])
+  })
+
+  it('requires the palette of selected source layouts without borrowing colors from an omitted chart', () => {
+    const matrix = '<section class="slide matrix"><h1>Chart</h1><p>Demo statistics</p></section>'
+    const source = `<!doctype html><html><head><title>Reference</title><style>
+      body{background:#fdfae7;color:#111111;font-family:Inter,sans-serif}
+      h1{font-family:"Space Grotesk",sans-serif}
+      .slide{position:relative;width:1440px;height:900px}
+      .cover,.closing{color:#111111}.text{color:#1e2bfa}
+      .matrix{color:#060507;background:rgba(30,43,250,.2)}
+      </style></head><body><main>
+      <section class="slide cover"><h1>Cover</h1></section>
+      <section class="slide text"><h1>Story</h1></section>${matrix}
+      <section class="slide closing"><h1>Closing</h1></section>
+      </main></body></html>`
+    const contract = { ...CONTRACT,
+      colors: [...CONTRACT.colors, '#060507'], requiredMarkers: ['.slide', '.cover', '.text', '.matrix', '.closing'],
+    }
+    const profile = extractReferenceStyleSourceProfile(source, contract)!
+    expect(profile).toBeDefined()
+    const evidence = findReferenceStyleEvidence(fetchMessages(REFERENCE_SOURCE, source), [REFERENCE_DIRECTORY])!
+    const candidate = source.replace(matrix, '')
+    const baseOptions = { authoritativeRenderedReference: true, alternativeLayoutSelectors: ['.text', '.matrix'] }
+    const before = verifyHtmlAgainstReferenceStyle(candidate, contract, profile, baseOptions)
+    expect(before.missing.colors).toEqual(['rgba(30,43,250,0.2)', '#060507'])
+    const options = { ...baseOptions, boundTemplateSource: evidence }
+    const after = verifyHtmlAgainstReferenceStyle(candidate, contract, profile, options)
+    expect(after.fidelity).toBe('pass')
+    expect(after.score).toBe(100)
+    expect(after.missing.colors).toEqual([])
+    expect(after.omittedAlternativeLayoutColors).toEqual(['rgba(30,43,250,0.2)', '#060507'])
+
+    // A selected/global color remains mandatory, even if the candidate hides
+    // its only consumer. Fabricated contract colors are never silently waived.
+    expect(verifyHtmlAgainstReferenceStyle(candidate.replace('.text{color:#1e2bfa}', '.text{color:#111111}'), contract, profile, options)
+      .missing.colors).toContain('#1e2bfa')
+    expect(verifyHtmlAgainstReferenceStyle(candidate.replace('background:#fdfae7', 'background:#111111'), contract, profile, options)
+      .missing.colors).toContain('#fdfae7')
+    expect(verifyHtmlAgainstReferenceStyle(candidate, { ...contract, colors: [...contract.colors, '#123456'] }, profile, options)
+      .missing.colors).toContain('#123456')
+    expect(verifyHtmlAgainstReferenceStyle(source.replace('background:rgba(30,43,250,.2)', 'background:#111111'), contract, profile, options)
+      .missing.colors).toContain('rgba(30,43,250,0.2)')
+    expect(() => verifyHtmlAgainstReferenceStyle(candidate, contract, profile, {
+      ...options, boundTemplateSource: { ...evidence, sha256: '0'.repeat(64) },
+    })).toThrow(/source-bound/)
+    expect(() => verifyHtmlAgainstReferenceStyle(candidate, contract, profile, {
+      ...options, boundTemplateSource: { ...evidence, requestedUrl: SIBLING_SOURCE },
+    })).toThrow(/source-bound/)
+  })
+
+  it.each(['aria-hidden="true"', 'inert'])(
+    'keeps painted decorative DOM visually connected when it is marked %s',
+    (semanticAttribute) => {
+      const decorativeColor = '#fbd0e3'
+      const decorated = REFERENCE_HTML
+        .replace(':root {', `:root { --decorative-pink: ${decorativeColor};`)
+        .replace(
+          '</style>',
+          '.poster .lever { background: var(--decorative-pink); border: 4px solid var(--primary); }</style>',
+        )
+        .replace(
+          '<h1>Reference title</h1>',
+          `<h1>Reference title</h1><div class="poster" ${semanticAttribute}><div class="lever"></div></div>`,
+        )
+      const evidence = findReferenceStyleEvidence(
+        fetchMessages(REFERENCE_SOURCE, decorated),
+        [REFERENCE_DIRECTORY],
+      )!
+
+      const normalized = normalizeReferenceStyleContractAgainstEvidence(CONTRACT, evidence)
+
+      expect(normalized.contract.colors).toContain(decorativeColor)
+      expect(normalized.omittedVisuallyInertColors).not.toContain(decorativeColor)
+      expect(verifyHtmlAgainstReferenceStyle(decorated, normalized.contract).violations.colors).toEqual([])
+    },
+  )
+
+  it('defers exhaustive compact-palette policing to bound rendered evidence', () => {
+    const decorativeColor = '#fbd0e3'
+    const source = REFERENCE_HTML
+      .replace('</style>', `.poster { background: ${decorativeColor}; }</style>`)
+      .replace(
+        '<h1>Reference title</h1>',
+        '<h1>Reference title</h1><div class="poster" aria-hidden="true"></div>',
+      )
+    const profile = extractReferenceStyleSourceProfile(source, CONTRACT)!
+
+    expect(verifyHtmlAgainstReferenceStyle(source, CONTRACT, profile)).toMatchObject({
+      fidelity: 'mismatch',
+      violations: { colors: [decorativeColor] },
+    })
+    expect(verifyHtmlAgainstReferenceStyle(source, CONTRACT, profile, {
+      authoritativeRenderedReference: true,
+    })).toMatchObject({
+      fidelity: 'pass',
+      score: 100,
+      violations: { colors: [], source: [] },
+    })
+  })
+
   it('adds omitted DOM-connected semantic colors to an exact compact contract', () => {
     const semanticGreen = '#059669'
     const connectedStatusHtml = REFERENCE_HTML
@@ -528,6 +757,15 @@ describe('reference style evidence and verification', () => {
           declarations: expect.arrayContaining([{ property: 'color', value: semanticGreen }]),
         }),
       ]))
+  })
+
+  it('decodes inline CSS attribute entities without treating body text as a font declaration', () => {
+    for (const quote of ['&quot;', '&#34;', '&#x22;']) {
+      const html = REFERENCE_HTML.replace('</body>', `<p style="font-family:${quote}Inter${quote},sans-serif">Literal font-family: Example; prose</p></body>`)
+      expect(verifyHtmlAgainstReferenceStyle(html, CONTRACT).violations.fonts).toEqual([])
+      const changed = html.replace(`${quote}Inter${quote}`, `${quote}Roboto${quote}`)
+      expect(verifyHtmlAgainstReferenceStyle(changed, CONTRACT).violations.fonts).toContain('Roboto')
+    }
   })
 
   it('does not confuse color/font substrings or token stuffing in unused selectors with exact grounding', () => {
@@ -591,7 +829,37 @@ describe('reference style evidence and verification', () => {
     expect(findReferenceStyleEvidence(fetchPageMessages(earlyTerminal), [REFERENCE_DIRECTORY])).toBeUndefined()
   })
 
-  it('fails closed on inconsistent totals and duplicate fetch_page chunk indexes', () => {
+  it('deduplicates byte-identical fetch_page replay while conflicting duplicates fail closed', () => {
+    const replayed = completeReferencePageChunks()
+    const duplicate = { ...replayed[1], id: 'fetch-page-1-replayed' }
+    const replayMessages = fetchPageMessages([
+      replayed[0],
+      replayed[1],
+      duplicate,
+      replayed[2],
+    ])
+    expect(findReferenceStyleEvidence(replayMessages, [REFERENCE_DIRECTORY])).toMatchObject({
+      content: REFERENCE_HTML,
+      callIds: ['fetch-page-0', 'fetch-page-1-replayed', 'fetch-page-2'],
+    })
+    expect(completedReferenceStyleFetchForCall(
+      replayMessages,
+      [REFERENCE_DIRECTORY],
+      'fetch-page-1-replayed',
+    )).toMatchObject({ content: REFERENCE_HTML })
+
+    const continuing = completeReferencePageChunks()
+    expect(referenceStyleEvidenceContinuation(fetchPageMessages([
+      continuing[0],
+      { ...continuing[0], id: 'fetch-page-0-replayed' },
+    ]), [REFERENCE_DIRECTORY])).toEqual({
+      url: REFERENCE_SOURCE,
+      format: 'raw',
+      nextChunkIndex: 1,
+      totalChunks: 3,
+      callIds: ['fetch-page-0-replayed'],
+    })
+
     const inconsistentTotals = completeReferencePageChunks()
     inconsistentTotals[1] = { ...inconsistentTotals[1], totalChunks: 4 }
     expect(findReferenceStyleEvidence(fetchPageMessages(inconsistentTotals), [REFERENCE_DIRECTORY])).toBeUndefined()
@@ -642,6 +910,7 @@ describe('reference style evidence and verification', () => {
       format: 'raw',
       nextChunkIndex: 1,
       totalChunks: 3,
+      callIds: ['fetch-page-0', 'fetch-page-2'],
     })
     expect(referenceStyleEvidenceContinuation(
       fetchPageMessages(chunks),
@@ -849,6 +1118,63 @@ describe('reference style evidence and verification', () => {
       .toMatch(/layout-agenda \.agenda-grid display.*block/iu)
   })
 
+  it('treats a Browser-attested active slide override as connected while deferring runtime stacking mechanics', () => {
+    const contract: ReferenceStyleContract = {
+      sourceUrl: 'https://example.com/runtime-deck.html',
+      strictness: 'exact',
+      colors: ['#000000', '#f5edf1', '#1a1218', '#0a0709', '#ed3d8c'],
+      fonts: ['Inter'],
+      layout: ['fixed viewport stage', 'state-controlled slide stack'],
+      components: ['slide root', 'runner chrome'],
+      requiredMarkers: ['deck-stage>section.slide', '.runner'],
+      signature: 'Dark editorial runtime deck.',
+      avoid: ['card shadows'],
+      viewport: { width: 1440, height: 900 },
+    }
+    const source = `<!doctype html><html><head><style>
+      body{background:#000000;color:#f5edf1;font-family:Inter,sans-serif}
+      deck-stage>section.slide{position:relative;width:100vw;height:100vh;background:linear-gradient(135deg,#1a1218,#0a0709);color:#f5edf1}
+      .runner{color:#ed3d8c}
+    </style></head><body><deck-stage>
+      <section class="slide"><div class="runner">Cover</div></section>
+      <section class="slide"><div class="runner">Content</div></section>
+      <section class="slide"><div class="runner">Closing</div></section>
+    </deck-stage></body></html>`
+    const profile = extractReferenceStyleSourceProfile(source, contract)!
+    const standalone = source
+      .replace(
+        'position:relative;width:100vw',
+        'position:absolute;inset:0;opacity:0;visibility:hidden;width:100vw',
+      )
+      .replace('</style>', 'deck-stage>section.slide.active{opacity:1;visibility:visible}</style>')
+      .replace('class="slide"', 'class="slide active"')
+
+    const legacy = verifyHtmlAgainstReferenceStyle(standalone, contract, profile)
+    expect(legacy.fidelity).toBe('mismatch')
+    expect(legacy.missing.colors).toEqual(expect.arrayContaining(['#1a1218', '#0a0709']))
+    expect(legacy.missing.markers).toContain('deck-stage>section.slide')
+
+    const runtimeAware = verifyHtmlAgainstReferenceStyle(standalone, contract, profile, {
+      runtimeManagedSlideSelectors: ['deck-stage>section.slide'],
+    })
+    expect(runtimeAware, runtimeAware.violations.source.join('\n')).toMatchObject({
+      fidelity: 'pass',
+      score: 100,
+      missing: { colors: [], fonts: [], markers: [] },
+      violations: { source: [] },
+    })
+
+    const unactivated = standalone.replace(
+      'deck-stage>section.slide.active{opacity:1;visibility:visible}',
+      'deck-stage>section.unrelated.active{opacity:1;visibility:visible}',
+    )
+    const rejected = verifyHtmlAgainstReferenceStyle(unactivated, contract, profile, {
+      runtimeManagedSlideSelectors: ['deck-stage>section.slide'],
+    })
+    expect(rejected.fidelity).toBe('mismatch')
+    expect(rejected.missing.markers).toContain('deck-stage>section.slide')
+  })
+
   it('retains real blue-professional semantic palette carriers after compact-profile bounding', () => {
     const semanticGreen = '#059669'
     const semanticRed = '#dc2626'
@@ -952,6 +1278,95 @@ describe('reference style evidence and verification', () => {
     expect(sourceViolations).toMatch(/split-highlight border-radius/iu)
     expect(sourceViolations).toMatch(/step-circle inline opacity.*variant/iu)
     expect(sourceViolations).toMatch(/keyboard-hint/iu)
+  })
+
+  it('reports a missing inline variant as one complete set invariant', () => {
+    const profile: ReferenceStyleSourceProfile = {
+      version: 1,
+      rules: [],
+      dom: [{
+        className: 'mono',
+        occurrences: 2,
+        required: true,
+        inlineStyleVariants: [{ property: 'opacity', values: ['0.5', '0.7'] }],
+      }],
+    }
+    const onlySeven = REFERENCE_HTML.replace(
+      '</body>',
+      '<span class="mono" style="opacity:.7">07</span></body>',
+    )
+    const mismatch = verifyHtmlAgainstReferenceStyle(onlySeven, CONTRACT, profile)
+    expect(mismatch.inlineVariantGaps).toEqual([{
+      className: 'mono',
+      property: 'opacity',
+      required: ['0.5', '0.7'],
+      current: ['0.7'],
+      missing: ['0.5'],
+    }])
+    expect(mismatch.violations.source).toHaveLength(1)
+    expect(mismatch.violations.source[0]).toContain('required ["0.5","0.7"]')
+    expect(mismatch.violations.source[0]).toContain('current ["0.7"]')
+    expect(mismatch.violations.source[0]).toContain('missing ["0.5"]')
+    expect(mismatch.violations.source[0]).toContain('instead of replacing one required variant with another')
+
+    const both = REFERENCE_HTML.replace(
+      '</body>',
+      '<span class="mono" style="opacity:.7">07</span><span class="mono" style="opacity:.5">05</span></body>',
+    )
+    const converged = verifyHtmlAgainstReferenceStyle(both, CONTRACT, profile)
+    expect(converged.inlineVariantGaps).toEqual([])
+    expect(converged.violations.source).toEqual([])
+  })
+
+  it('treats Browser-captured interior layout roots as alternatives for shorter decks', () => {
+    const contract: ReferenceStyleContract = {
+      sourceUrl: 'https://example.com/editorial.html',
+      strictness: 'exact',
+      colors: ['#ffffff', '#111111'],
+      fonts: ['Arial'],
+      layout: ['fixed slide stage', 'alternative interior layouts'],
+      components: ['cover', 'closing'],
+      requiredMarkers: ['.cover', '.layout-a .a-card', '.layout-b .b-chart', '.closing'],
+      signature: 'A small exact reference fixture.',
+      avoid: ['gradients'],
+      viewport: { width: 1440, height: 900 },
+    }
+    const source = `<style>
+      body{background:#ffffff;color:#111111;font-family:Arial,sans-serif}
+      .cover,.closing{position:relative;width:100vw;height:100vh}
+      .layout-a{position:relative;display:grid;grid-template-columns:1fr 1fr}
+      .layout-a .a-card{display:flex;gap:12px}
+      .layout-b{position:relative;display:flex;gap:24px}
+      .layout-b .b-chart{display:grid;grid-template-columns:2fr 1fr}
+    </style><body><section class="cover"></section><section class="layout-a"><div class="a-card"></div></section><section class="layout-b"><div class="b-chart"></div></section><section class="closing"></section></body>`
+    const profile = extractReferenceStyleSourceProfile(source, contract)!
+    const shorter = source.replace('<section class="layout-b"><div class="b-chart"></div></section>', '')
+
+    const legacy = verifyHtmlAgainstReferenceStyle(shorter, contract, profile)
+    expect(legacy.fidelity).toBe('mismatch')
+    expect(legacy.missing.markers).toContain('.layout-b .b-chart')
+
+    const adapted = verifyHtmlAgainstReferenceStyle(shorter, contract, profile, {
+      alternativeLayoutSelectors: ['.layout-a', '.layout-b'],
+    })
+    expect(adapted, adapted.violations.source.join('\n')).toMatchObject({
+      fidelity: 'pass',
+      score: 100,
+      missing: { markers: [] },
+      violations: { source: [] },
+    })
+
+    const stacked = shorter
+      .replace('class="cover"', 'class="cover slide"')
+      .replace('class="layout-a"', 'class="layout-a layout-b slide"')
+      .replace('class="closing"', 'class="closing slide"')
+    const rejectedStack = verifyHtmlAgainstReferenceStyle(stacked, contract, profile, {
+      alternativeLayoutSelectors: ['.layout-a', '.layout-b'],
+    })
+    expect(rejectedStack.fidelity).toBe('mismatch')
+    expect(rejectedStack.violations.source.join('\n')).toMatch(
+      /interior slide 2 stacks alternative layout roots.*\.layout-a.*\.layout-b.*remove every surplus root class/iu,
+    )
   })
 
   it('applies the same source-profile gate to an unrelated template vocabulary', () => {
@@ -1121,6 +1536,33 @@ describe('reference style evidence and verification', () => {
     }, { evidenceSha256: profile.evidenceSha256, viewport: CONTRACT.viewport })).toThrow(/viewport.*StyleContract/iu)
   })
 
+  it('retains bounded text-layout evidence and upgrades legacy interior baselines without fabricating measurements', () => {
+    const profile = renderedProfile()
+    expect(referenceTextLayoutRequiresUpgrade(profile)).toBe(true)
+    for (const phase of Object.values(profile.phases)) {
+      phase.textLayout = { version: 2, complete: true, collisions: [] }
+    }
+    profile.interiorVariants = [{ layoutSelector: '.layout-content', profile: structuredClone(profile.phases.content) }]
+    profile.interiorVariants[0].profile.anchors[0].selector = '.layout-content'
+    const normalized = normalizeRenderedReferenceStyleProfile(profile)
+    expect(normalized).toEqual(profile)
+    expect(referenceTextLayoutRequiresUpgrade(normalized)).toBe(false)
+    const oldFontBoxes = structuredClone(normalized)
+    oldFontBoxes.phases.cover.textLayout!.version = 1
+    expect(normalizeRenderedReferenceStyleProfile(oldFontBoxes).phases.cover.textLayout!.version).toBe(1)
+    expect(referenceTextLayoutRequiresUpgrade(oldFontBoxes)).toBe(true)
+    delete normalized.interiorVariants![0].profile.textLayout
+    expect(referenceTextLayoutRequiresUpgrade(normalized)).toBe(true)
+    expect(profile.interiorVariants[0].profile.textLayout).toBeDefined()
+    normalized.interiorVariants![0].profile.textLayout = { version: 2, complete: false, collisions: [] }
+    // A measured overflow is a real observation failure, not a legacy record
+    // that can be cured by endlessly recording the same reference again.
+    expect(referenceTextLayoutRequiresUpgrade(normalized)).toBe(false)
+    expect(() => normalizeRenderedReferenceStyleProfile({ ...profile, phases: {
+      ...profile.phases, cover: { ...profile.phases.cover, textLayout: { version: 2, complete: true, collisions: [{}] } },
+    } })).toThrow(/text layout evidence/iu)
+  })
+
   it('retains full reference profiles durably while projecting a deterministic compact provider attestation', () => {
     const sourceProfile = extractReferenceStyleSourceProfile(REFERENCE_HTML, CONTRACT)!
     const expanded = expandedRenderedProfile()
@@ -1220,7 +1662,7 @@ describe('reference style evidence and verification', () => {
     }
   })
 
-  it('requires a strict structural anchor and persistent chrome in every rendered phase', () => {
+  it('requires strict phase structure while validating only browser-attested shared anchors', () => {
     const profile = renderedProfile()
     expect(() => normalizeRenderedReferenceStyleProfile({
       ...profile,
@@ -1235,7 +1677,7 @@ describe('reference style evidence and verification', () => {
         ...profile.phases,
         content: { anchors: profile.phases.content.anchors.slice(0, 1), overlayProbes: [] },
       },
-    })).toThrow(/content.*persistent chrome/iu)
+    })).toThrow(/content.*shared anchor.*progress-bar/iu)
     expect(() => normalizeRenderedReferenceStyleProfile({
       ...profile,
       phases: {
@@ -1253,5 +1695,26 @@ describe('reference style evidence and verification', () => {
         profile: profile.phases.content,
       }],
     })).toThrow(/interiorVariants\[0\].*structural anchor/iu)
+
+    const phaseLocalOnly = {
+      ...profile,
+      phases: Object.fromEntries((['cover', 'content', 'closing'] as const).map((phase) => [phase, {
+        ...profile.phases[phase],
+        anchors: profile.phases[phase].anchors.slice(0, 1),
+      }])) as RenderedReferenceStyleProfile['phases'],
+      sharedAnchorSelectors: undefined,
+    }
+    expect(normalizeRenderedReferenceStyleProfile(phaseLocalOnly)).not.toHaveProperty('sharedAnchorSelectors')
+
+    expect(() => normalizeRenderedReferenceStyleProfile({
+      ...profile,
+      interiorVariants: [{
+        layoutSelector: '.layout-content',
+        profile: {
+          anchors: [{ ...profile.phases.content.anchors[0], selector: '.layout-content' }],
+          overlayProbes: [],
+        },
+      }],
+    })).toThrow(/interiorVariants\[0\].*shared anchor.*progress-bar/iu)
   })
 })

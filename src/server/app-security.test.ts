@@ -117,10 +117,8 @@ describe('workspace active-content policy', () => {
       return { session, fontEvidence }
     }
 
-    const exact = await createPreview(
-      'exact',
-      '<!doctype html><html><head><title>Exact</title></head><body><main>EXACT_PREVIEW</main></body></html>',
-    )
+    const exactSource = '<!doctype html><html><head><title>Exact</title><link rel="preconnect" href="https://fonts.gstatic.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter"></head><body><main>EXACT_PREVIEW</main></body></html>'
+    const exact = await createPreview('exact', exactSource)
     const inspired = await createPreview(
       'inspired',
       '<!doctype html><html><body><main>INSPIRED_PREVIEW</main></body></html>',
@@ -151,6 +149,7 @@ describe('workspace active-content policy', () => {
       expect(exactHtml).toContain(fixture.fontCss)
       expect(exactHtml).toContain('data:font/woff2;base64,')
       expect(exactHtml).toContain('data-anera-element-picker-bootstrap')
+      expect(exactHtml).not.toMatch(/fonts\.(?:googleapis|gstatic)\.com/u)
       expect(exactHtml.match(/<style data-anera-reference-fonts\b/gu)).toHaveLength(1)
 
       const exactAsset = await fetch(`${base}/workspace/${exact.session.summary.id}/preview/styles.css`)
@@ -191,10 +190,11 @@ describe('workspace active-content policy', () => {
       const downloadedHtml = await exactDownload.text()
       expect(downloadedHtml).toContain(fixture.fontCss)
       expect(downloadedHtml).toContain('data-anera-reference-fonts')
+      expect(downloadedHtml).not.toMatch(/fonts\.(?:googleapis|gstatic)\.com/u)
       await expect(readFile(resolve(
         created.store.workspaceDir(exact.session.summary.id),
         'index.html',
-      ), 'utf8')).resolves.not.toContain('data-anera-reference-fonts')
+      ), 'utf8')).resolves.toBe(exactSource)
 
       const inspiredResponse = await fetch(`${base}/workspace/${inspired.session.summary.id}/preview/index.html`)
       expect(inspiredResponse.status).toBe(200)

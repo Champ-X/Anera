@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { appendFile, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -467,6 +467,618 @@ describe('session store', () => {
     await expect(store.events(session.summary.id)).resolves.toEqual([])
     await mkdir(eventPath)
     await expect(store.events(session.summary.id)).rejects.toMatchObject({ code: 'EISDIR' })
+    await expect((store as unknown as { repairEventLog(id: string): Promise<void> })
+      .repairEventLog(session.summary.id)).rejects.toMatchObject({ code: 'EISDIR' })
+  })
+
+  it('stores repeated large Unicode event strings once and transparently restores full events', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-dedup-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const result = `${'大型结果🙂包含换行\n'.repeat(8_000)}结尾完整`
+    const markerLikeUserData = {
+      __aneraEventPayload: {
+        schemaVersion: 1,
+        encoding: 'utf8',
+        sha256: testSha256(result),
+        bytes: Buffer.byteLength(result),
+      },
+    }
+    const calls = ['call_large_first', 'call_large_second'].map((id) => ({
+      id,
+      name: 'fetch_page',
+      arguments: { url: 'https://example.test/large', chunkIndex: 0 },
+    }))
+
+    const observed: string[] = []
+    const unsubscribe = store.subscribe(session.summary.id, (event) => {
+      if (event.type === 'tool.completed') observed.push(String(event.data.result))
+    })
+    for (const call of calls) {
+      await store.append(session.summary.id, 'tool.completed', {
+        call,
+        result,
+        isError: false,
+        ...(call.id === 'call_large_first' ? { markerLikeUserData } : {}),
+      }, { turnId: 'turn_large', stepId: 'step_large', callId: call.id })
+    }
+    unsubscribe()
+
+    expect(observed).toEqual([result, result])
+    const eventPath = resolve(store.sessionDir(session.summary.id), 'events.jsonl')
+    const persisted = (await readFile(eventPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as {
+      type: string
+      data: Record<string, unknown>
+      _aneraStorage?: { eventPayloads?: number; references?: Array<Array<string | number>> }
+    })
+    const terminals = persisted.filter((event) => event.type === 'tool.completed')
+    expect(terminals).toHaveLength(2)
+    const references = terminals.map((event) => (
+      event.data.result as { __aneraEventPayload: { schemaVersion: number; encoding: string; sha256: string; bytes: number } }
+    ).__aneraEventPayload)
+    expect(references).toEqual([
+      {
+        schemaVersion: 1,
+        encoding: 'utf8',
+        sha256: testSha256(result),
+        bytes: Buffer.byteLength(result),
+      },
+      {
+        schemaVersion: 1,
+        encoding: 'utf8',
+        sha256: testSha256(result),
+        bytes: Buffer.byteLength(result),
+      },
+    ])
+    expect(terminals.map((event) => event._aneraStorage)).toEqual([
+      { eventPayloads: 1, references: [['result']] },
+      { eventPayloads: 1, references: [['result']] },
+    ])
+    expect(await readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1')))
+      .toEqual([testSha256(result)])
+    expect((await lstat(resolve(store.sessionDir(session.summary.id), 'event-payloads'))).mode & 0o777).toBe(0o700)
+    expect((await lstat(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1'))).mode & 0o777).toBe(0o700)
+    expect((await lstat(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1', testSha256(result)))).mode & 0o777).toBe(0o600)
+    expect(Buffer.byteLength(await readFile(eventPath, 'utf8'))).toBeLessThan(Buffer.byteLength(result))
+
+    const payloadReader = vi.spyOn(store as unknown as {
+      readEventPayload(id: string, manifest: Record<string, unknown>): Promise<string>
+    }, 'readEventPayload')
+    const restored = (await store.events(session.summary.id)).filter((event) => event.type === 'tool.completed')
+    expect(payloadReader).toHaveBeenCalledTimes(1)
+    payloadReader.mockRestore()
+    expect(restored.map((event) => event.data.result)).toEqual([result, result])
+    expect(restored[0].data.markerLikeUserData).toEqual(markerLikeUserData)
+    expect(restored.every((event) => !Object.prototype.hasOwnProperty.call(event, '_aneraStorage'))).toBe(true)
+
+    await appendFile(eventPath, '{"id":"evt_torn_payload_ref","sessionId":', 'utf8')
+    const restarted = new SessionStore(root, 'test-model')
+    await restarted.initialize()
+    expect((await restarted.events(session.summary.id))
+      .filter((event) => event.type === 'tool.completed')
+      .map((event) => event.data.result)).toEqual([result, result])
+    const repairedLog = await readFile(eventPath, 'utf8')
+    expect(repairedLog).toContain('_aneraStorage')
+    expect(repairedLog).not.toContain('evt_torn_payload_ref')
+  })
+
+  it('externalizes only the already-redacted visible event payload', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-redaction-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const workspace = store.workspaceDir(session.summary.id)
+    const secret = 'sk-event-payload-secret-1234567890'
+    store.registerSensitiveValues(session.summary.id, [secret])
+    const result = `${'redaction filler🙂'.repeat(6_000)}\nsecret=${secret}\npath=${workspace}/private.txt`
+    const visibleResult = result
+      .split(secret).join('[REDACTED_SECRET]')
+      .split(workspace).join('<workspace>')
+    const call = { id: 'call_redacted_large', name: 'fetch_page', arguments: { url: 'https://example.test/redacted' } }
+
+    await store.append(session.summary.id, 'tool.completed', { call, result, isError: false }, {
+      turnId: 'turn_redacted', stepId: 'step_redacted', callId: call.id,
+    })
+
+    const eventLog = await readFile(resolve(store.sessionDir(session.summary.id), 'events.jsonl'), 'utf8')
+    const payloadPath = resolve(
+      store.sessionDir(session.summary.id),
+      'event-payloads',
+      'v1',
+      testSha256(visibleResult),
+    )
+    const payload = await readFile(payloadPath, 'utf8')
+    expect(eventLog).not.toContain(secret)
+    expect(eventLog).not.toContain(workspace)
+    expect(payload).toBe(visibleResult)
+    expect(payload).not.toContain(secret)
+    expect(payload).not.toContain(workspace)
+    expect((await store.events(session.summary.id)).find((event) => event.callId === call.id)?.data.result)
+      .toBe(visibleResult)
+  })
+
+  it('removes unreachable event payload targets and exact crash-temp links without touching referenced blobs', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-gc-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const retained = [
+      'retained payload alpha🙂'.repeat(6_000),
+      'retained payload beta界'.repeat(6_000),
+    ]
+    for (const [index, result] of retained.entries()) {
+      await store.append(session.summary.id, 'tool.completed', { result, isError: false }, {
+        turnId: 'turn_payload_gc',
+        stepId: `step_payload_gc_${index}`,
+        callId: `call_payload_gc_${index}`,
+      })
+    }
+
+    const payloadDirectory = resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1')
+    const retainedDigests = retained.map((value) => testSha256(value))
+    const orphan = Buffer.from('unreachable payload bytes', 'utf8')
+    const orphanDigest = testSha256(orphan)
+    await writeFile(resolve(payloadDirectory, orphanDigest), orphan, { mode: 0o600, flag: 'wx' })
+    const crashTemp = `.${retainedDigests[0]}-epay_${'a'.repeat(20)}.tmp`
+    await link(resolve(payloadDirectory, retainedDigests[0]), resolve(payloadDirectory, crashTemp))
+    await writeFile(resolve(payloadDirectory, '.operator-note'), 'leave this unknown file alone', { mode: 0o600 })
+
+    const restarted = new SessionStore(root, 'test-model')
+    await restarted.initialize()
+
+    expect((await readdir(payloadDirectory)).sort()).toEqual([
+      '.operator-note',
+      ...retainedDigests,
+    ].sort())
+    expect((await restarted.events(session.summary.id))
+      .filter((event) => event.type === 'tool.completed')
+      .map((event) => event.data.result)).toEqual(retained)
+  })
+
+  it('does not collect any event payload when a sidecar manifest or digest inode is unsafe', async () => {
+    const cases = ['malformed-manifest', 'malformed-storage', 'digest-symlink'] as const
+    for (const fixture of cases) {
+      const root = await mkdtemp(resolve(tmpdir(), `anera-store-event-payload-gc-${fixture}-`))
+      roots.push(root)
+      const store = new SessionStore(root, 'test-model')
+      await store.initialize()
+      const session = await store.create()
+      const result = `retained ${fixture}🙂`.repeat(7_000)
+      await store.append(session.summary.id, 'tool.completed', { result, isError: false }, {
+        turnId: `turn_${fixture}`,
+        stepId: `step_${fixture}`,
+        callId: `call_${fixture}`,
+      })
+      const sessionDirectory = store.sessionDir(session.summary.id)
+      const payloadDirectory = resolve(sessionDirectory, 'event-payloads', 'v1')
+      const orphan = Buffer.from(`orphan ${fixture}`, 'utf8')
+      const orphanDigest = testSha256(orphan)
+      const orphanPath = resolve(payloadDirectory, orphanDigest)
+      await writeFile(orphanPath, orphan, { mode: 0o600, flag: 'wx' })
+
+      if (fixture !== 'digest-symlink') {
+        const eventPath = resolve(sessionDirectory, 'events.jsonl')
+        const events = (await readFile(eventPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as {
+          type: string
+          _aneraStorage?: { references: Array<Array<string | number>> } | null
+        })
+        const terminal = events.find((event) => event.type === 'tool.completed')
+        if (!terminal?._aneraStorage) throw new Error('expected externalized terminal fixture')
+        if (fixture === 'malformed-storage') terminal._aneraStorage = null
+        else terminal._aneraStorage.references.push([...terminal._aneraStorage.references[0]])
+        await writeFile(eventPath, `${events.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8')
+      } else {
+        await symlink(
+          resolve(sessionDirectory, 'state.json'),
+          resolve(payloadDirectory, testSha256('unsafe digest symlink')),
+        )
+      }
+
+      const restarted = new SessionStore(root, 'test-model')
+      await restarted.initialize()
+      await expect(lstat(orphanPath)).resolves.toMatchObject({ size: orphan.length })
+    }
+  })
+
+  it('defers event payload GC for a repaired malformed log until the next clean startup', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-gc-malformed-log-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const result = 'retained after torn log🙂'.repeat(7_000)
+    await store.append(session.summary.id, 'tool.completed', { result, isError: false }, {
+      turnId: 'turn_gc_torn', stepId: 'step_gc_torn', callId: 'call_gc_torn',
+    })
+    const sessionDirectory = store.sessionDir(session.summary.id)
+    const payloadDirectory = resolve(sessionDirectory, 'event-payloads', 'v1')
+    const orphan = Buffer.from('orphan surviving repaired startup', 'utf8')
+    const orphanPath = resolve(payloadDirectory, testSha256(orphan))
+    await writeFile(orphanPath, orphan, { mode: 0o600, flag: 'wx' })
+    await appendFile(resolve(sessionDirectory, 'events.jsonl'), '{"torn":', 'utf8')
+
+    const repairingRestart = new SessionStore(root, 'test-model')
+    await repairingRestart.initialize()
+    await expect(lstat(orphanPath)).resolves.toMatchObject({ size: orphan.length })
+    expect(await readFile(resolve(sessionDirectory, 'events.jsonl'), 'utf8')).not.toContain('{"torn":')
+
+    const cleanRestart = new SessionStore(root, 'test-model')
+    await cleanRestart.initialize()
+    await expect(lstat(orphanPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await cleanRestart.events(session.summary.id)).find((event) => event.callId === 'call_gc_torn')?.data.result)
+      .toBe(result)
+  })
+
+  it('bounds event payload deletion work and drains excess orphans over clean restarts', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-gc-delete-bound-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const retained = 'retained while GC is bounded🙂'.repeat(7_000)
+    await store.append(session.summary.id, 'tool.completed', { result: retained, isError: false }, {
+      turnId: 'turn_gc_bound', stepId: 'step_gc_bound', callId: 'call_gc_bound',
+    })
+    const payloadDirectory = resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1')
+    const orphanDigests = Array.from({ length: 129 }, (_, index) => testSha256(`bounded orphan ${index}`))
+    await Promise.all(orphanDigests.map((digest, index) => writeFile(
+      resolve(payloadDirectory, digest),
+      `bounded orphan ${index}`,
+      { mode: 0o600, flag: 'wx' },
+    )))
+
+    const firstRestart = new SessionStore(root, 'test-model')
+    await firstRestart.initialize()
+    const afterFirst = await readdir(payloadDirectory)
+    expect(afterFirst).toContain(testSha256(retained))
+    expect(afterFirst.filter((name) => orphanDigests.includes(name))).toHaveLength(1)
+
+    const secondRestart = new SessionStore(root, 'test-model')
+    await secondRestart.initialize()
+    expect(await readdir(payloadDirectory)).toEqual([testSha256(retained)])
+    expect((await secondRestart.events(session.summary.id)).find((event) => event.callId === 'call_gc_bound')?.data.result)
+      .toBe(retained)
+  })
+
+  it('externalizes oversized JSON subtrees made from small values and restores repeated values independently', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-json-subtrees-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const largeLeaf = 'large nested leaf🙂'.repeat(5_000)
+    const smallFields = Object.fromEntries(Array.from({ length: 4_000 }, (_, index) => [
+      `field_${String(index).padStart(4, '0')}`,
+      `small_${index}_界`,
+    ]))
+    const repeatedObject = { ...smallFields, largeLeaf }
+    const repeatedArray = Array.from({ length: 8_000 }, (_, index) => `small-array-${index}-🙂`)
+    const nestedData = {
+      structures: { first: repeatedObject, second: repeatedObject },
+      arrays: { first: repeatedArray, second: repeatedArray },
+    }
+    const rootData = Object.fromEntries(Array.from({ length: 5_000 }, (_, index) => [
+      `root_${String(index).padStart(4, '0')}`,
+      `small-root-${index}-界`,
+    ]))
+
+    const nestedEvent = await store.append(session.summary.id, 'assistant.thought.completed', nestedData, {
+      turnId: 'turn_json_subtrees', stepId: 'step_json_subtrees',
+    })
+    const rootEvent = await store.append(session.summary.id, 'assistant.thought.completed', rootData, {
+      turnId: 'turn_json_root', stepId: 'step_json_root',
+    })
+
+    const eventPath = resolve(store.sessionDir(session.summary.id), 'events.jsonl')
+    const lines = (await readFile(eventPath, 'utf8')).trim().split('\n')
+    const persisted = lines.map((line) => JSON.parse(line) as {
+      id: string
+      data: Record<string, unknown>
+      _aneraStorage?: { eventPayloads: number; references: Array<Array<string | number>> }
+    })
+    const nestedStored = persisted.find((event) => event.id === nestedEvent.id)
+    const rootStored = persisted.find((event) => event.id === rootEvent.id)
+    expect(nestedStored?._aneraStorage?.references).toEqual([
+      ['structures', 'first'],
+      ['structures', 'second'],
+      ['arrays', 'first'],
+      ['arrays', 'second'],
+    ])
+    expect((nestedStored?.data.structures as { first: { __aneraEventPayload: { encoding: string } } })
+      .first.__aneraEventPayload.encoding).toBe('json')
+    expect(rootStored?._aneraStorage?.references).toEqual([[]])
+    expect((rootStored?.data as unknown as { __aneraEventPayload: { encoding: string } })
+      .__aneraEventPayload.encoding).toBe('json')
+    expect(Buffer.byteLength(lines.find((line) => JSON.parse(line).id === nestedEvent.id) ?? '')).toBeLessThan(64 * 1024)
+    expect(Buffer.byteLength(lines.find((line) => JSON.parse(line).id === rootEvent.id) ?? '')).toBeLessThan(64 * 1024)
+
+    const payloadFiles = await readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1'))
+    expect(payloadFiles).toHaveLength(3)
+    const reader = vi.spyOn(store as unknown as {
+      readEventPayload(id: string, manifest: Record<string, unknown>): Promise<string>
+    }, 'readEventPayload')
+    const events = await store.events(session.summary.id)
+    expect(reader).toHaveBeenCalledTimes(3)
+    reader.mockRestore()
+    const restoredNested = events.find((event) => event.id === nestedEvent.id)?.data as typeof nestedData
+    expect(restoredNested).toEqual(nestedData)
+    expect(restoredNested.structures.first).not.toBe(restoredNested.structures.second)
+    expect(restoredNested.arrays.first).not.toBe(restoredNested.arrays.second)
+    expect(events.find((event) => event.id === rootEvent.id)?.data).toEqual(rootData)
+  })
+
+  it('bounds a JSONL row when exact descendant paths would make its reference manifest oversized', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-manifest-bound-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const repeatedPath = `branch_${'k'.repeat(30_000)}`
+    const largeLeaf = 'large-leaf🙂'.repeat(7_000)
+    const data = {
+      [repeatedPath]: {
+        first: largeLeaf,
+        second: largeLeaf,
+      },
+    }
+
+    const event = await store.append(session.summary.id, 'assistant.thought.completed', data, {
+      turnId: 'turn_manifest_bound', stepId: 'step_manifest_bound',
+    })
+
+    const eventPath = resolve(store.sessionDir(session.summary.id), 'events.jsonl')
+    const line = (await readFile(eventPath, 'utf8')).trim().split('\n')
+      .find((candidate) => JSON.parse(candidate).id === event.id)
+    expect(Buffer.byteLength(line ?? '')).toBeLessThan(64 * 1024)
+    const stored = JSON.parse(line ?? '{}') as {
+      data: { __aneraEventPayload: { encoding: string; sha256: string } }
+      _aneraStorage: { references: Array<Array<string | number>> }
+    }
+    expect(stored._aneraStorage.references).toEqual([[]])
+    expect(stored.data.__aneraEventPayload.encoding).toBe('json')
+    const rootDigest = testSha256(JSON.stringify(data))
+    expect(stored.data.__aneraEventPayload.sha256).toBe(rootDigest)
+    // Child plans are superseded before publication, so aggregation does not
+    // leave a redundant copy of the repeated large leaf in the CAS.
+    expect(await readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1')))
+      .toEqual([rootDigest])
+    expect((await store.events(session.summary.id)).find((candidate) => candidate.id === event.id)?.data)
+      .toEqual(data)
+  })
+
+  it('uses a lightweight event-id index and hydrates only an idempotent replay match', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-id-index-'))
+    roots.push(root)
+    const first = new SessionStore(root, 'test-model')
+    await first.initialize()
+    const session = await first.create()
+    const firstResult = 'indexed-first🙂'.repeat(7_000)
+    const secondResult = 'indexed-second界'.repeat(7_000)
+    const firstEvent = await first.append(session.summary.id, 'tool.completed', {
+      result: firstResult,
+      isError: false,
+    }, { eventId: 'evt_indexed_large_first' })
+    await first.append(session.summary.id, 'tool.completed', {
+      result: secondResult,
+      isError: false,
+    }, { eventId: 'evt_indexed_large_second' })
+
+    const restarted = new SessionStore(root, 'test-model')
+    await restarted.initialize()
+    const payloadReader = vi.spyOn(restarted as unknown as {
+      readEventPayload(id: string, manifest: Record<string, unknown>): Promise<string>
+    }, 'readEventPayload')
+
+    await restarted.append(session.summary.id, 'usage.updated', { source: 'index-regression' }, {
+      eventId: 'evt_indexed_new_metadata_only',
+    })
+    expect(payloadReader).not.toHaveBeenCalled()
+
+    const replay = await restarted.append(session.summary.id, 'tool.completed', {
+      result: 'replay input must not replace the durable result',
+      isError: true,
+    }, { eventId: firstEvent.id })
+    expect(payloadReader).toHaveBeenCalledTimes(1)
+    expect(payloadReader.mock.calls[0]?.[1]).toMatchObject({ sha256: testSha256(firstResult) })
+    expect(replay).toEqual(firstEvent)
+    payloadReader.mockRestore()
+    expect((await restarted.events(session.summary.id)).filter((candidate) => candidate.id === firstEvent.id))
+      .toHaveLength(1)
+  })
+
+  it('keeps small event strings inline without creating a payload store', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-inline-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const call = { id: 'call_small', name: 'fetch_page', arguments: { url: 'https://example.test/small' } }
+    const result = JSON.stringify({ status: 'success', content: 'small' })
+
+    await store.append(session.summary.id, 'tool.completed', { call, result, isError: false }, {
+      turnId: 'turn_small', stepId: 'step_small', callId: call.id,
+    })
+
+    const persisted = (await readFile(resolve(store.sessionDir(session.summary.id), 'events.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line) as { type: string; data: Record<string, unknown>; _aneraStorage?: unknown })
+      .find((event) => event.type === 'tool.completed')
+    expect(persisted?.data.result).toBe(result)
+    expect(persisted?._aneraStorage).toBeUndefined()
+    await expect(readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('reads legacy inline large event payloads and migrates them atomically on restart', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-legacy-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const result = 'legacy🙂'.repeat(12_000)
+    const legacy = {
+      id: 'evt_legacy_large_payload',
+      sessionId: session.summary.id,
+      seq: 2,
+      type: 'tool.completed',
+      at: '2026-09-03T00:00:00.000Z',
+      turnId: 'turn_legacy',
+      stepId: 'step_legacy',
+      callId: 'call_legacy',
+      data: {
+        call: { id: 'call_legacy', name: 'fetch_page', arguments: { url: 'https://example.test/legacy' } },
+        result,
+        isError: false,
+      },
+    }
+    const eventPath = resolve(store.sessionDir(session.summary.id), 'events.jsonl')
+    await appendFile(eventPath, `${JSON.stringify(legacy)}\n`, 'utf8')
+
+    expect((await store.events(session.summary.id)).find((event) => event.id === legacy.id)?.data.result).toBe(result)
+    expect((await readFile(eventPath, 'utf8')).includes('_aneraStorage')).toBe(false)
+    const restarted = new SessionStore(root, 'test-model')
+    await restarted.initialize()
+    expect((await restarted.events(session.summary.id)).find((event) => event.id === legacy.id)?.data.result).toBe(result)
+    const migrated = await readFile(eventPath, 'utf8')
+    expect(migrated).toContain('_aneraStorage')
+    expect(migrated).not.toContain(result)
+    expect(await readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1')))
+      .toEqual([testSha256(result)])
+
+    const migratedBytes = Buffer.byteLength(migrated)
+    const restartedAgain = new SessionStore(root, 'test-model')
+    await restartedAgain.initialize()
+    expect(await readFile(eventPath, 'utf8')).toBe(migrated)
+    expect(Buffer.byteLength(await readFile(eventPath, 'utf8'))).toBe(migratedBytes)
+  })
+
+  it('leaves a legacy log intact and readable when payload migration is interrupted', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-migration-interrupted-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const session = await store.create()
+    const firstResult = 'first legacy payload🙂'.repeat(6_000)
+    const secondResult = 'second legacy payload界'.repeat(6_000)
+    const eventPath = resolve(store.sessionDir(session.summary.id), 'events.jsonl')
+    const legacyEvents = [firstResult, secondResult].map((result, index) => ({
+      id: `evt_legacy_migration_${index}`,
+      sessionId: session.summary.id,
+      seq: index + 2,
+      type: 'tool.completed',
+      at: `2026-09-03T00:00:0${index}.000Z`,
+      turnId: 'turn_legacy_migration',
+      stepId: `step_legacy_migration_${index}`,
+      callId: `call_legacy_migration_${index}`,
+      data: {
+        call: {
+          id: `call_legacy_migration_${index}`,
+          name: 'fetch_page',
+          arguments: { url: `https://example.test/legacy/${index}` },
+        },
+        result,
+        isError: false,
+      },
+    }))
+    await appendFile(eventPath, `${legacyEvents.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8')
+    const legacyLog = await readFile(eventPath, 'utf8')
+    const internals = store as unknown as {
+      commitEventPayload(id: string, value: string, encoding: 'utf8' | 'json', digest: string, bytes: number): Promise<unknown>
+      repairEventLog(id: string): Promise<void>
+    }
+    const commitEventPayload = internals.commitEventPayload.bind(store)
+    let commits = 0
+    const interrupted = vi.spyOn(internals, 'commitEventPayload').mockImplementation(async (...arguments_) => {
+      commits += 1
+      if (commits === 2) throw new Error('simulated payload migration interruption')
+      return await commitEventPayload(...arguments_)
+    })
+
+    await expect(internals.repairEventLog(session.summary.id)).rejects.toThrow('simulated payload migration interruption')
+    expect(await readFile(eventPath, 'utf8')).toBe(legacyLog)
+    expect((await store.events(session.summary.id))
+      .filter((event) => event.type === 'tool.completed')
+      .map((event) => event.data.result)).toEqual([firstResult, secondResult])
+    expect(await readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1')))
+      .toEqual([testSha256(firstResult)])
+
+    interrupted.mockRestore()
+    await internals.repairEventLog(session.summary.id)
+    expect((await store.events(session.summary.id))
+      .filter((event) => event.type === 'tool.completed')
+      .map((event) => event.data.result)).toEqual([firstResult, secondResult])
+    expect((await readdir(resolve(store.sessionDir(session.summary.id), 'event-payloads', 'v1'))).sort())
+      .toEqual([testSha256(firstResult), testSha256(secondResult)].sort())
+    expect(await readFile(eventPath, 'utf8')).not.toBe(legacyLog)
+  })
+
+  it('fails closed with terminal identity when a durable event payload is missing or tampered', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-store-event-payload-integrity-'))
+    roots.push(root)
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const result = 'durable terminal🙂'.repeat(8_000)
+    const createTerminal = async (suffix: string) => {
+      const session = await store.create()
+      const call = { id: `call_${suffix}`, name: 'fetch_page', arguments: { url: `https://example.test/${suffix}` } }
+      const event = await store.append(session.summary.id, 'tool.completed', { call, result, isError: false }, {
+        turnId: `turn_${suffix}`, stepId: `step_${suffix}`, callId: call.id,
+      })
+      const payloadPath = resolve(
+        store.sessionDir(session.summary.id),
+        'event-payloads',
+        'v1',
+        testSha256(result),
+      )
+      return { sessionId: session.summary.id, call, event, payloadPath }
+    }
+
+    const missing = await createTerminal('missing_payload')
+    await rm(missing.payloadPath)
+    await expect(store.events(missing.sessionId)).rejects.toMatchObject({
+      name: 'EventPayloadIntegrityError',
+      code: 'EVENT_PAYLOAD_INTEGRITY',
+      eventId: missing.event.id,
+      eventType: 'tool.completed',
+      callId: missing.call.id,
+    })
+    const missingRaw = await readFile(resolve(store.sessionDir(missing.sessionId), 'events.jsonl'), 'utf8')
+    expect(missingRaw).toContain(`\"id\":\"${missing.event.id}\"`)
+    expect(missingRaw).toContain('\"type\":\"tool.completed\"')
+    expect(missingRaw).not.toContain('\"type\":\"tool.failed\"')
+    const restartedMissing = new SessionStore(root, 'test-model')
+    await restartedMissing.initialize()
+    expect(await readFile(resolve(store.sessionDir(missing.sessionId), 'events.jsonl'), 'utf8')).toBe(missingRaw)
+    await expect(restartedMissing.events(missing.sessionId)).rejects.toMatchObject({
+      code: 'EVENT_PAYLOAD_INTEGRITY',
+      eventId: missing.event.id,
+      eventType: 'tool.completed',
+    })
+
+    const tampered = await createTerminal('tampered_payload')
+    const corrupted = Buffer.from(await readFile(tampered.payloadPath))
+    corrupted[0] ^= 0xff
+    await writeFile(tampered.payloadPath, corrupted)
+    await expect(store.events(tampered.sessionId)).rejects.toMatchObject({
+      name: 'EventPayloadIntegrityError',
+      code: 'EVENT_PAYLOAD_INTEGRITY',
+      eventId: tampered.event.id,
+      eventType: 'tool.completed',
+      callId: tampered.call.id,
+    })
+    await expect(store.append(tampered.sessionId, 'tool.completed', {
+      call: { ...tampered.call, id: 'call_tampered_retry' },
+      result,
+      isError: false,
+    }, {
+      turnId: 'turn_tampered', stepId: 'step_tampered_retry', callId: 'call_tampered_retry',
+    })).rejects.toThrow(/payload bytes do not match/iu)
+    const tamperedRaw = (await readFile(resolve(store.sessionDir(tampered.sessionId), 'events.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line) as { type: string })
+    expect(tamperedRaw.filter((event) => event.type === 'tool.completed')).toHaveLength(1)
   })
 
   it('materializes honest empty model-accounting defaults for new and legacy sessions', async () => {

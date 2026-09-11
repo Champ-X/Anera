@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { resolveAgentModels } from './agent-models.js'
 import {
   DEFAULT_DEEPSEEK_VISION_PRICING,
   type DeepSeekVisionPricing,
@@ -40,6 +41,20 @@ function env(name: string, fallback = ''): string {
   return process.env[name]?.trim() || dotEnv[name]?.trim() || fallback
 }
 
+export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-flash'
+
+export function resolveDeepSeekModel(value?: string): string {
+  return value?.trim() || DEFAULT_DEEPSEEK_MODEL
+}
+
+/** Zero explicitly disables the cumulative token stop; usage is still metered. */
+export function resolveAgentTokenLimit(value: string): number {
+  if (!value.trim()) return 0
+  const limit = Number(value)
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new Error('ANERA_MAX_AGENT_TOTAL_TOKENS_PER_TURN must be a non-negative safe integer (0 disables the limit)')
+  return limit
+}
+
 export function resolveTavilyApiKey(read: (name: string) => string): string {
   return read('TAVILY_API_KEY') || read('TAVILY_API_KRY')
 }
@@ -47,6 +62,19 @@ export function resolveTavilyApiKey(read: (name: string) => string): string {
 export function resolveModelTemperature(value: string): number {
   const parsed = Number.parseFloat(value)
   return Number.isFinite(parsed) && parsed >= 0 && parsed <= 2 ? parsed : 0
+}
+
+export function resolveModelThinking(value: string): 'enabled' | 'disabled' | undefined {
+  const normalized = value.trim().toLowerCase()
+  if (['auto', ''].includes(normalized)) return undefined
+  if (['enabled', 'true', '1'].includes(normalized)) return 'enabled'
+  if (['disabled', 'false', '0'].includes(normalized)) return 'disabled'
+  throw new Error('DEEPSEEK_THINKING must be enabled, disabled, or auto')
+}
+
+export function resolveModelReasoningEffort(value: string): 'low' | 'high' | 'max' {
+  if (value === 'low' || value === 'high' || value === 'max') return value
+  throw new Error('DEEPSEEK_REASONING_EFFORT must be low, high, or max')
 }
 
 export function resolveTestLoopbackDeepSeekProvider(input: {
@@ -142,21 +170,13 @@ function customFeedbackArm(): 'control' | 'treatment-1' | 'treatment-2' {
   throw new Error('ANERA_CUSTOM_FEEDBACK_ARM must be control, treatment-1, or treatment-2')
 }
 
-function modelList(primary: string): string[] {
-  const configured = env('ANERA_AGENT_MODELS', primary)
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean)
-  return [...new Set([primary, ...configured])]
-}
-
 function configuredList(value: string): string[] {
   return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))]
 }
 
 const deepseekApiKey = env('DEEPSEEK_API_KEY')
 const deepseekBaseUrl = env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-const primaryModel = env('DEEPSEEK_MODEL', 'deepseek-chat')
+const primaryModel = resolveDeepSeekModel(env('DEEPSEEK_MODEL'))
 const speechModel = env('ANERA_SPEECH_MODEL', 'gpt-4o-mini-tts')
 const imageModel = env('ANERA_IMAGE_MODEL', 'gpt-image-1')
 const githubAppPrivateKeyPath = env('ANERA_GITHUB_APP_PRIVATE_KEY_PATH')
@@ -204,14 +224,25 @@ export const config = {
   speechModel,
   model: primaryModel,
   modelTemperature: resolveModelTemperature(env('DEEPSEEK_TEMPERATURE', '0')),
-  agentModels: modelList(primaryModel),
+  modelThinking: resolveModelThinking(env('DEEPSEEK_THINKING', 'enabled')),
+  modelReasoningEffort: resolveModelReasoningEffort(env('DEEPSEEK_REASONING_EFFORT', 'low')),
+  agentModels: resolveAgentModels(primaryModel, env('ANERA_AGENT_MODELS'), deepseekBaseUrl),
   customFeedbackArm: customFeedbackArm(),
   visionModel: env('DEEPSEEK_VISION_MODEL', 'deepseek-v4-flash-vision-exp'),
   maxToolCallsPerStep: positiveInt('ANERA_MAX_TOOL_CALLS_PER_STEP', 16),
   maxParallelToolCalls: positiveInt('ANERA_MAX_PARALLEL_TOOL_CALLS', 6),
-  runTimeoutMs: positiveInt('ANERA_RUN_TIMEOUT_MS', 30 * 60 * 1000),
+  // Per user/operator turn, recovered from durable settlements. The request
+  // guard remains bounded; cumulative token stopping is opt-in (0 = off).
+  // Metering always includes Agent and compaction, including after restart.
+  maxAgentModelRequestsPerTurn: positiveInt('ANERA_MAX_AGENT_MODEL_REQUESTS_PER_TURN', 96),
+  maxAgentTotalTokensPerTurn: resolveAgentTokenLimit(env('ANERA_MAX_AGENT_TOTAL_TOKENS_PER_TURN')),
+  // Visual runs legitimately span several source, render, and Vision passes.
+  // Keep a harness escape hatch for genuinely orphaned work, but do not cut a
+  // progressing workflow off at the old 30-minute wall-clock boundary.
+  runTimeoutMs: positiveInt('ANERA_RUN_TIMEOUT_MS', 2 * 60 * 60 * 1000),
   websiteIdleSleepMs: positiveInt('ANERA_WEBSITE_IDLE_SLEEP_MS', 5 * 60 * 1000),
-  maxOutputTokens: positiveInt('ANERA_MAX_OUTPUT_TOKENS', 8192),
+  // Reasoning and the complete tool JSON share this output allowance.
+  maxOutputTokens: positiveInt('ANERA_MAX_OUTPUT_TOKENS', 16384),
   // A stall before the first SSE frame is safe to retry because no content or
   // tool call has been emitted. Two bounded retries should not turn a brief
   // provider stall into a multi-minute Agent run.
@@ -227,6 +258,8 @@ export const config = {
   attachmentPageBytes: positiveInt('ANERA_ATTACHMENT_PAGE_BYTES', 120_000),
   contextWindowTokens,
   contextCompactionThresholdTokens,
+  // Serialized provider context (including system/tool schemas), not the
+  // larger private/durable message representation retained for verification.
   contextSerializationHardLimitBytes: positiveInt(
     'ANERA_CONTEXT_SERIALIZATION_HARD_LIMIT_BYTES',
     positiveInt('ANERA_CONTEXT_COMPACTION_BYTES', 1_000_000),

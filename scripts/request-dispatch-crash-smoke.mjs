@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { randomUUID } from 'node:crypto'
 import { readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'

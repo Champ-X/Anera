@@ -27,6 +27,7 @@ import {
   type AgentServiceOptions,
 } from './agent-service.js'
 import { config } from './config.js'
+import { assertReferenceLanguageDelivery } from './reference-language.js'
 import { osSandboxStatus } from './os-sandbox.js'
 import { DailyCreditStore } from './credit-store.js'
 import {
@@ -419,7 +420,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     const id = request.params.id
     const workspace = store.workspaceDir(id)
     const bytes = await workspaceSize(workspace)
-    const state = await store.update(id, (next) => { next.summary.workspaceBytes = bytes })
+    const state = await store.get(id)
     const inventory = await listWorkspaceEntryInventoryPage({
       workspaceRoot: workspace,
       manifestDirectory: resolve(store.sessionDir(id), 'workspace-inventory', 'ui'),
@@ -429,7 +430,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     const processes = new Map(state.processes.map((process) => [process.id, process]))
     for (const process of agent.processes.list(id)) processes.set(process.id, process)
     response.json({
-      session: store.redactForDisplay(id, state.summary),
+      session: store.redactForDisplay(id, { ...state.summary, workspaceBytes: bytes }),
       events: await store.events(id),
       plan: store.redactForDisplay(id, state.plan),
       workspace: workspaceInventoryTree(inventory.entries),
@@ -505,7 +506,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   })
 
   app.post('/api/sessions/:id/resume', async (request, response) => {
-    const result = await agent.resume(request.params.id)
+    const model = request.body?.model
+    if (model !== undefined && (typeof model !== 'string' || !model.trim())) throw statusError('model must be a non-empty string', 400)
+    const result = await agent.resume(request.params.id, model)
     response.status(202).json(result)
   })
 
@@ -809,8 +812,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
           throw statusError('Exact reference download is unavailable because its font evidence is bound to another source', 409)
         }
         const resolvedFonts = await store.resolveReferenceFontEvidence(id, fontEvidence)
+        const sourceHtml = await readFile(target, 'utf8')
+        assertReferenceLanguageDelivery(sourceHtml, resolvedFonts.fontCss, referenceStyle.languageVariant)
         const html = injectWorkspaceReferenceFonts(
-          await readFile(target, 'utf8'),
+          sourceHtml,
           resolvedFonts.fontCss,
           fontEvidence.manifestSha256,
         )
@@ -970,6 +975,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
             throw statusError('Exact reference preview is unavailable because its font evidence is bound to another source', 409)
           }
           const resolvedFonts = await store.resolveReferenceFontEvidence(id, fontEvidence)
+          assertReferenceLanguageDelivery(html, resolvedFonts.fontCss, referenceStyle?.languageVariant)
           html = injectWorkspaceReferenceFonts(html, resolvedFonts.fontCss, fontEvidence.manifestSha256)
           response.setHeader('cache-control', 'private, no-store')
         }

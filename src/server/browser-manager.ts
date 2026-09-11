@@ -1,20 +1,29 @@
 import { createHash } from 'node:crypto'
+import { ToolCapabilityUnavailableError } from './tool-recovery.js'
 import type { Browser, BrowserContext, ConsoleMessage, Page } from 'playwright-core'
 import { chromium } from 'playwright-core'
 import { findBrowserExecutable } from './browser-executable.js'
 import { config } from './config.js'
 import { REFERENCE_FONT_MAX_FILES, REFERENCE_RENDER_FONT_CSS_MAX_BYTES } from './reference-fonts.js'
+import { assertReferenceTemplateDependency, REFERENCE_TEMPLATE_MAX_DEPENDENCIES, type ReferenceTemplateDependency, type ReferenceTemplateTextParent } from './reference-template.js'
+import { normalizeReferenceLanguageVariant, REFERENCE_LANGUAGE_ROLES, type ReferenceLanguageVariant } from './reference-language.js'
+import { RENDERED_TEXT_LAYOUT_SCRIPT, renderedTextLayoutFindings } from './rendered-text-layout.js'
+import { PRESENTATION_ACTIVE_STATE_SCRIPT, compactPresentationViewport, presentationActiveState, presentationStageViolations, type PresentationStateSnapshot } from './presentation-state.js'
+import { RENDERED_CONTROL_OCCLUSION_SCRIPT, type RenderedControlOcclusion } from './rendered-control-occlusion.js'
 import {
   normalizeRenderedReferenceStyleProfile,
+  renderedReferenceRuntimeManagedSlideSelectors,
   type ReferenceRenderGeometryPolicy,
   type ReferenceRenderPhase,
   type ReferenceStyleSourceProfile,
   type RenderedReferenceAnchorProfile,
+  type RenderedReferenceContainingBlockOffsetProfile,
   type RenderedReferenceInteriorAttestation,
   type RenderedReferenceLayoutVariantProfile,
   type RenderedReferencePhaseProfile,
   type RenderedReferenceStyleProfile,
   type RenderedReferenceStyleVerification,
+  type RenderedReferenceSurfaceAttestation,
   type RenderedReferenceTypographyProbe,
 } from './reference-style.js'
 
@@ -48,15 +57,21 @@ export interface ReferenceRenderFontOptions {
   fontCss?: string
   /** Every named family must expose at least one successfully loaded face. */
   expectedFontFamilies?: readonly string[]
+  languageVariant?: ReferenceLanguageVariant
 }
 
 export interface CaptureReferenceRenderBundleOptions extends ReferenceRenderFontOptions {
   signal?: AbortSignal
+  /** Private, source-declared snapshots; executed only in a fresh network-denied context. */
+  runtimeScripts?: readonly ReferenceTemplateDependency[]
+  /** Source-derived text-parent paths, used only by documented language adapters. */
+  textParents?: readonly ReferenceTemplateTextParent[]
 }
 
 export interface ReferenceRenderCaptureBundle {
   profile: RenderedReferenceStyleProfile
   screenshots: Record<ReferenceRenderPhase, Buffer>
+  textFontFamilies?: string[]
 }
 
 // Playwright serializes page callbacks with Function#toString before running
@@ -108,7 +123,8 @@ const VISIBLE_TEXT_SNAPSHOT_SCRIPT = String.raw`() => {
   const tokens = []
   const rendered = (element) => {
     for (let current = element; current; current = current.parentElement) {
-      if (current.hasAttribute('hidden') || current.getAttribute('aria-hidden') === 'true') return false
+      // aria-hidden/inert affect accessibility and interaction, not paint.
+      if (current.hasAttribute('hidden')) return false
       const style = getComputedStyle(current)
       if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) return false
       const opacity = Number.parseFloat(style.opacity)
@@ -150,10 +166,40 @@ const VISIBLE_TEXT_SNAPSHOT_SCRIPT = String.raw`() => {
     .trim()
 }`
 
-const PRESENTATION_STATE_SNAPSHOT_SCRIPT = String.raw`() => {
-  const candidates = [...document.querySelectorAll(
+// Exact references are not required to use Anera's generated `.slide` class.
+// Several real templates use a custom <deck-stage> whose direct <section>
+// children are the slide roots. Keep discovery deliberately bounded and
+// structural: explicit slide semantics win, then labelled sibling roots, then
+// direct section/article children of a custom element. Ordinary main>section
+// documents remain ineligible, so a generic page cannot masquerade as a deck.
+const REFERENCE_SLIDE_ELEMENTS_SCRIPT = String.raw`() => {
+  const bounded = (values) => values.length >= 3 ? values.slice(0, 64) : undefined
+  const explicit = bounded([...document.querySelectorAll(
     '.slide,[role="tabpanel"],[aria-roledescription="slide"]'
-  )].slice(0, 64)
+  )])
+  if (explicit) return explicit
+
+  const labelled = [...document.querySelectorAll('[data-screen-label],[data-slide]')].slice(0, 256)
+  const labelledParents = [...new Set(labelled.map((element) => element.parentElement).filter(Boolean))].slice(0, 32)
+  for (const parent of labelledParents) {
+    const siblings = bounded([...parent.children].filter((element) => (
+      element.matches('[data-screen-label],[data-slide]')
+    )))
+    if (siblings) return siblings
+  }
+
+  const customRoots = [...document.querySelectorAll('body *')]
+    .filter((element) => element.localName.includes('-'))
+    .slice(0, 32)
+  for (const root of customRoots) {
+    const children = bounded([...root.children].filter((element) => element.matches('section,article')))
+    if (children) return children
+  }
+  return []
+}`
+
+const PRESENTATION_STATE_SNAPSHOT_SCRIPT = String.raw`() => {
+  const candidates = (${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()
   return candidates.map((element, index) => {
     const style = getComputedStyle(element)
     const rect = element.getBoundingClientRect()
@@ -174,6 +220,7 @@ const PRESENTATION_STATE_SNAPSHOT_SCRIPT = String.raw`() => {
     return {
       index,
       className: element.getAttribute('class') || '',
+      deckActive: element.hasAttribute('data-deck-active'),
       ariaHidden: element.getAttribute('aria-hidden'),
       hidden: element.hasAttribute('hidden'),
       inert: element.hasAttribute('inert'),
@@ -197,7 +244,10 @@ const REFERENCE_RENDER_SNAPSHOT_SCRIPT = String.raw`(payload) => {
   const typographySpecs = payload.typographySpecs || []
   const rendered = (element) => {
     for (let current = element; current; current = current.parentElement) {
-      if (current.hasAttribute('hidden') || current.getAttribute('aria-hidden') === 'true' || current.hasAttribute('inert')) return false
+      // Phase-inactive slides are hidden by the injected
+      // data-anera-reference-phase-hidden rule. aria-hidden/inert decorations
+      // still paint and therefore belong in visual reference evidence.
+      if (current.hasAttribute('hidden')) return false
       const style = getComputedStyle(current)
       if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false
       const opacity = Number.parseFloat(style.opacity)
@@ -242,10 +292,14 @@ const REFERENCE_RENDER_SNAPSHOT_SCRIPT = String.raw`(payload) => {
     if (visible.length === 0) continue
     const samples = visible.slice(0, 12).map((element) => {
       const rect = element.getBoundingClientRect()
+      const hostStyle = getComputedStyle(element)
       const style = getComputedStyle(element, spec.pseudo || null)
       const styles = {}
       for (const property of spec.properties) {
-        const value = style.getPropertyValue(property).replace(/\s+/g, ' ').trim().toLowerCase()
+        const authored = spec.authoredBox && ['top','right','bottom','left','width','height','grid-template-columns'].includes(property)
+          ? element.computedStyleMap?.().get(property) : undefined
+        if (spec.authoredBox && ['top','right','bottom','left','width','height'].includes(property) && authored === undefined) throw new Error('Source-authored box evidence requires CSS Typed OM');
+        const value = String(authored ?? style.getPropertyValue(property)).replace(/\s+/g, ' ').trim().toLowerCase()
         if (value) styles[property] = value.slice(0, 240)
       }
       return {
@@ -255,9 +309,22 @@ const REFERENCE_RENDER_SNAPSHOT_SCRIPT = String.raw`(payload) => {
           width: rounded(rect.width / innerWidth),
           height: rounded(rect.height / innerHeight),
         },
+        containingBlockOffset: (() => {
+          if (spec.pseudo || !['absolute', 'fixed', 'sticky'].includes(hostStyle.position)) return null
+          const offsetParent = element.offsetParent
+          const containingRect = hostStyle.position === 'fixed' || !offsetParent
+            ? { left: 0, top: 0, right: innerWidth, bottom: innerHeight }
+            : offsetParent.getBoundingClientRect()
+          return {
+            left: rounded((rect.left - containingRect.left) / innerWidth),
+            top: rounded((rect.top - containingRect.top) / innerHeight),
+            right: rounded((containingRect.right - rect.right) / innerWidth),
+            bottom: rounded((containingRect.bottom - rect.bottom) / innerHeight),
+          }
+        })(),
         styles,
         occlusion: Math.round(occlusionRatio(element, rect) * 100) / 100,
-        position: getComputedStyle(element).position,
+        position: hostStyle.position,
         inlineFlowIntrinsic: (() => {
           const parentStyle = element.parentElement ? getComputedStyle(element.parentElement) : null
           return Boolean(
@@ -284,7 +351,11 @@ const REFERENCE_RENDER_SNAPSHOT_SCRIPT = String.raw`(payload) => {
       selector: spec.selector,
       count: visible.length,
       geometry: spec.geometry || (heterogeneousIntrinsicInline ? 'intrinsic-size' : strictGeometry ? 'strict' : 'size'),
+      ...(spec.authoredBox ? { authoredBox: true } : {}),
       rects: samples.map((sample) => sample.rect),
+      ...(samples.some((sample) => sample.containingBlockOffset !== null)
+        ? { containingBlockOffsets: samples.map((sample) => sample.containingBlockOffset) }
+        : {}),
       styles: samples.map((sample) => sample.styles),
       occlusion: samples.map((sample) => sample.occlusion),
     })
@@ -376,7 +447,9 @@ const REFERENCE_RENDER_SNAPSHOT_SCRIPT = String.raw`(payload) => {
     .sort((left, right) => right.coverage - left.coverage || left.order - right.order)
     .slice(0, 12)
     .map(({ order: _order, ...probe }) => probe)
-  const activeSlide = document.querySelector('.slide.active') || document.querySelector('.slide') || document.body
+  const presentationSlides = (${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()
+  const activeState = (${PRESENTATION_ACTIVE_STATE_SCRIPT})((${PRESENTATION_STATE_SNAPSHOT_SCRIPT})())
+  const activeSlide = presentationSlides[activeState.indices[0]] || document.body
   const typographyProbes = typographySpecs.flatMap((spec) => {
     let target
     try { target = [...activeSlide.querySelectorAll(spec.selector)].find(rendered) } catch { return [] }
@@ -403,17 +476,20 @@ const REFERENCE_RENDER_SNAPSHOT_SCRIPT = String.raw`(payload) => {
     synthetic?.remove()
     return [{ selector: spec.selector, styles }]
   })
-  return { anchors, overlayProbes, typographyProbes }
+  const textLayout = (${RENDERED_TEXT_LAYOUT_SCRIPT})(activeSlide)
+  return { anchors, overlayProbes, typographyProbes, textLayout }
 }`
 
 const SET_REFERENCE_RENDER_PHASE_SCRIPT = String.raw`(phase) => {
-  const slides = [...document.querySelectorAll('.slide')]
+  const slides = (${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()
   if (slides.length === 0) return
   const requestedIndex = typeof phase === 'number' ? phase : Number.NaN
   const index = Number.isInteger(requestedIndex)
     ? Math.max(0, Math.min(slides.length - 1, requestedIndex))
     : phase === 'cover' ? 0 : phase === 'closing' ? slides.length - 1 : Math.min(1, slides.length - 1)
+  const nativeActive = slides.some((slide) => slide.hasAttribute('data-deck-active'))
   slides.forEach((slide, slideIndex) => {
+    if (nativeActive) slide.toggleAttribute('data-deck-active', slideIndex === index)
     slide.classList.toggle('active', slideIndex === index)
     slide.classList.toggle('prev', slideIndex < index)
     slide.setAttribute('aria-hidden', slideIndex === index ? 'false' : 'true')
@@ -456,6 +532,7 @@ const REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`() => {
     hidden: element.hasAttribute('hidden'),
     inert: element.hasAttribute('inert'),
     phaseHidden: element.getAttribute('data-anera-reference-phase-hidden'),
+    deckActive: element.getAttribute('data-deck-active'),
   })
   const textNodes = (element) => {
     const values = []
@@ -463,7 +540,7 @@ const REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`() => {
     while (walker.nextNode()) values.push(String(walker.currentNode.nodeValue || ''))
     return values
   }
-  const slides = [...document.querySelectorAll('.slide')]
+  const slides = (${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()
   return {
     slides: slides.map(attributes),
     progress: [...document.querySelectorAll('.progress-bar')].map(attributes),
@@ -475,7 +552,7 @@ const REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`() => {
       ...attributes(element),
       disabled: element instanceof HTMLButtonElement ? element.disabled : undefined,
     })),
-    activeIndex: slides.findIndex((slide) => slide.classList.contains('active')),
+    activeIndex: (${PRESENTATION_ACTIVE_STATE_SCRIPT})((${PRESENTATION_STATE_SNAPSHOT_SCRIPT})()).indices[0] ?? -1,
   }
 }`
 
@@ -486,6 +563,7 @@ const RESTORE_REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`(state) => {
       ['style', snapshot.style],
       ['aria-hidden', snapshot.ariaHidden],
       ['data-anera-reference-phase-hidden', snapshot.phaseHidden],
+      ['data-deck-active', snapshot.deckActive],
     ]) {
       if (value === null || value === undefined) element.removeAttribute(name)
       else element.setAttribute(name, value)
@@ -493,8 +571,7 @@ const RESTORE_REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`(state) => {
     element.toggleAttribute('hidden', snapshot.hidden === true)
     element.toggleAttribute('inert', snapshot.inert === true)
   }
-  const restoreList = (selector, snapshots, restoreExtra) => {
-    const elements = [...document.querySelectorAll(selector)]
+  const restoreElements = (elements, snapshots, restoreExtra) => {
     if (elements.length !== snapshots.length) return false
     let extrasRestored = true
     elements.forEach((element, index) => {
@@ -503,6 +580,9 @@ const RESTORE_REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`(state) => {
     })
     return extrasRestored
   }
+  const restoreList = (selector, snapshots, restoreExtra) => (
+    restoreElements([...document.querySelectorAll(selector)], snapshots, restoreExtra)
+  )
   const restoreTextNodes = (element, values) => {
     const nodes = []
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
@@ -511,7 +591,7 @@ const RESTORE_REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`(state) => {
     nodes.forEach((node, index) => { node.nodeValue = values[index] })
     return true
   }
-  const slidesRestored = restoreList('.slide', state.slides)
+  const slidesRestored = restoreElements((${REFERENCE_SLIDE_ELEMENTS_SCRIPT})(), state.slides)
   const progressRestored = restoreList('.progress-bar', state.progress)
   const countersRestored = restoreList('.slide-counter', state.counters, (element, snapshot) => restoreTextNodes(element, snapshot.textNodes))
   const buttonsRestored = restoreList('.nav-btn, .nav-controls button', state.buttons, (element, snapshot) => {
@@ -521,7 +601,7 @@ const RESTORE_REFERENCE_RENDER_PAGE_STATE_SCRIPT = String.raw`(state) => {
 }`
 
 const REFERENCE_INTERIOR_LAYOUT_SCRIPT = String.raw`(slideIndex) => {
-  const slides = [...document.querySelectorAll('.slide')]
+  const slides = (${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()
   const slide = slides[slideIndex]
   if (!slide) return { layoutSelectors: [], specs: [] }
   const stateClasses = new Set(['slide', 'active', 'prev', 'current', 'visible', 'hidden', 'entering', 'leaving'])
@@ -544,6 +624,23 @@ const REFERENCE_INTERIOR_LAYOUT_SCRIPT = String.raw`(slideIndex) => {
     'width', 'height', 'min-width', 'min-height',
     'overflow', 'background-color', 'background-image', 'border', 'border-radius', 'clip-path',
   ]
+  // Positioned text boxes are frequently shrink-to-fit and inherit UA
+  // margins from the chosen semantic tag. Capture their actual anchors and
+  // box-model defaults instead of treating localized text width/height as
+  // fixed template geometry. Keep this list bounded to the durable profile's
+  // existing 24-property limit.
+  const intrinsicTextProperties = [
+    'display', 'position', 'visibility', 'opacity', 'transform', 'pointer-events',
+    'top', 'right', 'bottom', 'left', 'inset', 'margin',
+    'width', 'height', 'max-width', 'max-height', 'min-width', 'min-height',
+    'font-family', 'font-size', 'font-weight', 'line-height', 'letter-spacing', 'text-transform',
+  ]
+  const authoredBoxProperties = [
+    'display','position','opacity','transform','top','right','bottom','left',
+    'width','height','max-width','max-height','min-width','min-height',
+    'flex-direction','align-items','justify-content','gap','row-gap','column-gap',
+    'grid-template-columns','overflow','background-color','border',
+  ]
   const candidates = [slide, ...slide.querySelectorAll('*')].flatMap((element, order) => {
     const rect = element.getBoundingClientRect()
     const style = getComputedStyle(element)
@@ -554,6 +651,34 @@ const REFERENCE_INTERIOR_LAYOUT_SCRIPT = String.raw`(slideIndex) => {
     const media = ['CANVAS', 'SVG', 'IMG', 'VIDEO', 'PICTURE'].includes(element.tagName)
     const structuralDisplay = ['flex', 'inline-flex', 'grid', 'inline-grid'].includes(style.display)
     const positioned = ['absolute', 'fixed', 'sticky'].includes(style.position)
+    const authoredHeight = (() => {
+      try { return String(element.computedStyleMap?.().get('height') || '').trim().toLowerCase() }
+      catch { return '' }
+    })()
+    const parentStyle = element.parentElement ? getComputedStyle(element.parentElement) : null
+    const intrinsicInlineFlowChild = Boolean(
+      parentStyle
+      && parentStyle.display === 'flex'
+      && !String(parentStyle.flexDirection || 'row').startsWith('column')
+      && ['space-between', 'space-around', 'space-evenly'].includes(parentStyle.justifyContent)
+      && style.flexBasis === 'auto'
+      && style.maxWidth === 'none'
+    )
+    const intrinsicStructuralBlock = structuralDisplay
+      && !positioned
+      && ['auto', 'min-content', 'max-content', 'fit-content'].includes(authoredHeight)
+    const authored = (property) => {
+      try { return String(element.computedStyleMap?.().get(property) || '').trim().toLowerCase() }
+      catch { return '' }
+    }
+    const specified = (property) => Boolean(authored(property) && authored(property) !== 'auto')
+    const authoredAutoPositionedText = element !== slide && positioned && structuralDisplay && !media
+      && String(element.textContent || '').trim().length > 0
+      && !element.querySelector('canvas,svg,img,video,picture,iframe')
+      && authoredHeight === 'auto' && !(specified('top') && specified('bottom'))
+      && ['top','right','bottom','left','width'].every((property) => authored(property))
+    const shrinkToFitWidth = authoredAutoPositionedText && authored('width') === 'auto'
+      && !(specified('left') && specified('right'))
     const direct = element.parentElement === slide
     if (element !== slide && !media && !structuralDisplay && !positioned && !direct) return []
     const className = [...element.classList].find((value) => /^[a-z][a-z0-9-]{1,80}$/.test(value))
@@ -562,6 +687,16 @@ const REFERENCE_INTERIOR_LAYOUT_SCRIPT = String.raw`(slideIndex) => {
     else if (className) selector = scope + ' .' + className
     else if (media) selector = scope + ' ' + element.tagName.toLowerCase()
     else return []
+    const text = String(element.textContent || '').trim()
+    const textLeaf = text.length > 0 && [...element.children].every((child) => (
+      String(child.textContent || '').trim().length === 0
+    ))
+    // Paint does not make an auto-sized text label structural. Kicker chips,
+    // pills, badges, and similar reference components commonly carry a
+    // background/border while their used width still comes entirely from the
+    // copy plus padding. The source-backed geometry policy below overrides
+    // this runtime inference when the template authored fixed dimensions.
+    const intrinsicPositionedText = positioned && !media && !structuralDisplay && textLeaf
     const area = Math.min(1, Math.max(0, rect.width * rect.height / Math.max(1, innerWidth * innerHeight)))
     const score = element === slide ? 100000
       : media ? 90000
@@ -571,8 +706,19 @@ const REFERENCE_INTERIOR_LAYOUT_SCRIPT = String.raw`(slideIndex) => {
     return [{
       selector,
       querySelector: selector,
-      properties,
-      ...(element === slide ? { geometry: 'strict' } : {}),
+      properties: authoredAutoPositionedText ? authoredBoxProperties : intrinsicPositionedText ? intrinsicTextProperties : properties,
+      ...(authoredAutoPositionedText ? { authoredBox: true } : {}),
+      ...(element === slide
+        ? { geometry: 'strict' }
+        : authoredAutoPositionedText
+          ? { geometry: shrinkToFitWidth ? 'intrinsic-size' : 'intrinsic-block' }
+        : intrinsicPositionedText
+          ? { geometry: 'intrinsic-size' }
+          : intrinsicInlineFlowChild
+            ? { geometry: 'intrinsic-size' }
+          : intrinsicStructuralBlock
+            ? { geometry: 'intrinsic-block' }
+          : {}),
       score,
       order,
     }]
@@ -602,6 +748,9 @@ const REFERENCE_RENDER_SNAPSHOT_PAGE_FUNCTION = Function(
 const SET_REFERENCE_RENDER_PHASE_PAGE_FUNCTION = Function(
   `"use strict"; return (${SET_REFERENCE_RENDER_PHASE_SCRIPT})`,
 )() as (phase: string | number) => void
+const REFERENCE_SLIDE_COUNT_PAGE_FUNCTION = Function(
+  `"use strict"; return () => ((${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()).length`,
+)() as () => number
 const REFERENCE_RENDER_PAGE_STATE_PAGE_FUNCTION = Function(
   `"use strict"; return (${REFERENCE_RENDER_PAGE_STATE_SCRIPT})`,
 )() as () => ReferenceRenderPageState
@@ -613,6 +762,7 @@ const REFERENCE_INTERIOR_LAYOUT_PAGE_FUNCTION = Function(
 )() as (slideIndex: number) => ReferenceInteriorLayoutSnapshot
 
 interface ReferenceRenderSelectorSpec {
+  authoredBox?: true
   selector: string
   querySelector: string
   pseudo?: '::before' | '::after'
@@ -638,20 +788,7 @@ interface ReferenceRenderElementState {
   hidden: boolean
   inert: boolean
   phaseHidden: string | null
-}
-
-interface PresentationStateSnapshot {
-  index: number
-  className: string
-  ariaHidden: string | null
-  hidden: boolean
-  inert: boolean
-  display: string
-  position: string
-  visibility: string
-  opacity: string
-  intersectsViewport: boolean
-  rect: [number, number, number, number]
+  deckActive: string | null
 }
 
 interface ReferenceRenderPageState {
@@ -685,7 +822,7 @@ const REFERENCE_RENDER_FREEZE_CSS = `
     caret-color: transparent !important;
     scroll-behavior: auto !important;
   }
-  .slide[data-anera-reference-phase-hidden] {
+  [data-anera-reference-phase-hidden] {
     display: none !important;
     visibility: hidden !important;
     pointer-events: none !important;
@@ -765,6 +902,17 @@ interface ReferenceFontLoadResult {
 const INSTALL_AND_AWAIT_REFERENCE_FONTS_PAGE_FUNCTION = Function(
   `"use strict"; return (${INSTALL_AND_AWAIT_REFERENCE_FONTS_SCRIPT})`,
 )() as (payload: ReferenceFontLoadPayload) => Promise<ReferenceFontLoadResult>
+
+const SOURCE_TEXT_FONT_FAMILIES_PAGE_FUNCTION = Function('"use strict"; return (' + String.raw`(parents) => {
+  if (parents.length > 10240) throw new Error('Source typography probe exceeds the slot bound');
+  const slides = [...document.querySelectorAll('.slide')];
+  return parents.map((parent) => {
+    let element = slides[Number(parent.variant.slice(1)) - 1];
+    for (const index of parent.path) element = element?.children[index];
+    if (!element) throw new Error('The native runtime changed a source text-parent path');
+    return getComputedStyle(element).fontFamily;
+  });
+}` + ')')() as (parents: readonly ReferenceTemplateTextParent[]) => string[]
 
 export class BrowserManager {
   private readonly sessions = new Map<string, BrowserSession>()
@@ -894,6 +1042,9 @@ export class BrowserManager {
     const signal = options.signal
     if (signal?.aborted) throw abortReason(signal)
     const trustedFonts = normalizeReferenceRenderFontOptions(options)
+    const runtimeScripts = options.runtimeScripts ?? []
+    if (runtimeScripts.length > REFERENCE_TEMPLATE_MAX_DEPENDENCIES) throw new Error('Reference runtime script count exceeds the bounded limit')
+    for (const script of runtimeScripts) assertReferenceTemplateDependency(script)
     const specs = referenceRenderSelectorSpecs(sourceProfile)
     if (specs.length === 0) throw new Error('Reference source profile contains no required render anchors')
     const browser = await this.getBrowser()
@@ -905,12 +1056,21 @@ export class BrowserManager {
     try {
       await context.route('**/*', async (route) => await route.abort('blockedbyclient'))
       const page = await context.newPage()
-      await page.setContent(sanitizeReferenceRenderHtml(html, Boolean(trustedFonts)), { waitUntil: 'domcontentloaded', timeout: 20_000 })
-      const slideCount = await page.locator('.slide').count()
+      await page.setContent(sanitizeReferenceRenderHtml(html, Boolean(trustedFonts), runtimeScripts), { waitUntil: 'domcontentloaded', timeout: 20_000 })
+      // HTML scripts, event handlers, frames and remote requests remain
+      // stripped/blocked. Only these source-directory-scoped, hash-checked
+      // snapshots run; this is never a user browser or an authenticated page.
+      for (const script of runtimeScripts) {
+        signal?.throwIfAborted()
+        await page.addScriptTag({ content: script.content })
+      }
+      const slideCount = await page.evaluate(REFERENCE_SLIDE_COUNT_PAGE_FUNCTION)
       if (slideCount < 3) {
-        throw new Error('Exact rendered reference requires at least three .slide elements for distinct cover, content, and closing phases')
+        throw new Error('Exact rendered reference requires at least three identifiable slide roots for distinct cover, content, and closing phases (.slide, ARIA slide semantics, labelled siblings, or direct section/article children of a custom deck element)')
       }
       await installAndAwaitReferenceFonts(page, trustedFonts)
+      const textFontFamilies = options.textParents
+        ? await page.evaluate(SOURCE_TEXT_FONT_FAMILIES_PAGE_FUNCTION, options.textParents) : undefined
       await page.addStyleTag({ content: REFERENCE_RENDER_FREEZE_CSS })
       await page.evaluate(SET_REFERENCE_RENDER_PHASE_PAGE_FUNCTION, 'cover')
       await settleReferenceRender(page)
@@ -938,11 +1098,25 @@ export class BrowserManager {
         'content',
       )
       screenshots.content = await captureReferenceViewportScreenshot(page, viewport, 'content')
+      await page.evaluate(SET_REFERENCE_RENDER_PHASE_PAGE_FUNCTION, 'closing')
+      await settleReferenceRender(page)
+      const closingLayout = await page.evaluate(REFERENCE_INTERIOR_LAYOUT_PAGE_FUNCTION, slideCount - 1)
+      phases.closing = await captureReferencePhase(
+        page,
+        mergeReferenceRenderPhaseSpecs(closingLayout.specs, specs),
+        'closing',
+      )
+      screenshots.closing = await captureReferenceViewportScreenshot(page, viewport, 'closing')
+
+      // Shared chrome is a property of the rendered reference, not of its
+      // class names. Some decks repeat a footer or navigation rail on every
+      // slide; others intentionally use only phase-local editorial layouts.
+      // Derive candidates from selectors actually visible in all three
+      // sampled phases, then retain only those also visible in every interior
+      // layout below.
+      const sharedAnchorSpecs = sharedReferenceRenderSpecs(phases, specs)
       const interiorVariants: RenderedReferenceLayoutVariantProfile[] = []
       const capturedLayoutSelectors = new Set<string>()
-      const persistentChromeSpecs = specs.filter((spec) => (
-        /(?:^|[-_.#])(?:nav|progress|counter|keyboard|hint|chrome|runner|footer)(?:$|[-_.:# ])/iu.test(spec.selector)
-      )).slice(0, 6)
       for (let slideIndex = 1; slideIndex < slideCount - 1; slideIndex += 1) {
         await page.evaluate(SET_REFERENCE_RENDER_PHASE_PAGE_FUNCTION, slideIndex)
         await settleReferenceRender(page)
@@ -955,13 +1129,20 @@ export class BrowserManager {
         const layoutSourceSpecs = specs.filter((spec) => (
           spec.selector === layoutSelector || spec.selector.startsWith(`${layoutSelector} `)
         )).slice(0, 2)
-        const variantSpecs = [...layout.specs, ...layoutSourceSpecs, ...persistentChromeSpecs]
+        const variantSpecs = [...layout.specs, ...sharedAnchorSpecs, ...layoutSourceSpecs]
           .filter((spec, index, all) => all.findIndex((candidate) => candidate.selector === spec.selector) === index)
           .slice(0, 20)
-          .map((spec) => ({
-            ...spec,
-            ...referenceRenderIntrinsicBlockGeometry(sourceProfile, spec.selector),
-          }))
+          .map((spec) => {
+            const inferredGeometry = referenceRenderIntrinsicBlockGeometry(sourceProfile, spec.selector)
+            const geometry = spec.selector === layoutSelector
+              ? { geometry: 'strict' as const }
+              : spec.authoredBox ? { geometry: spec.geometry } : inferredGeometry
+            return {
+              ...spec,
+              ...geometry,
+              properties: referenceRenderPropertiesForGeometry(spec.properties, geometry.geometry ?? spec.geometry),
+            }
+          })
         const variantProfile = await captureReferencePhase(page, variantSpecs, 'content', undefined, true)
         if (!variantProfile.anchors.some((anchor) => anchor.selector === layoutSelector)) {
           throw new Error(`Exact rendered reference variant ${layoutSelector} has no visible structural root`)
@@ -969,16 +1150,18 @@ export class BrowserManager {
         capturedLayoutSelectors.add(layoutSelector)
         interiorVariants.push({ layoutSelector, profile: variantProfile })
       }
-      await page.evaluate(SET_REFERENCE_RENDER_PHASE_PAGE_FUNCTION, 'closing')
-      await settleReferenceRender(page)
-      const closingLayout = await page.evaluate(REFERENCE_INTERIOR_LAYOUT_PAGE_FUNCTION, slideCount - 1)
-      phases.closing = await captureReferencePhase(
-        page,
-        mergeReferenceRenderPhaseSpecs(closingLayout.specs, specs),
-        'closing',
-      )
-      screenshots.closing = await captureReferenceViewportScreenshot(page, viewport, 'closing')
+      const sharedAnchorSelectors = sharedAnchorSpecs
+        .filter((spec) => interiorVariants.every((variant) => (
+          variant.profile.anchors.some((anchor) => anchor.selector === spec.selector)
+        )))
+        .map((spec) => spec.selector)
       if (signal?.aborted) throw abortReason(signal)
+      if ([...Object.values(phases), ...interiorVariants.map((variant) => variant.profile)]
+        .some((phase) => !phase.textLayout?.complete)) {
+        const gaps = [...new Set([...Object.values(phases), ...interiorVariants.map((variant) => variant.profile)]
+          .filter((phase) => !phase.textLayout?.complete).flatMap((phase) => phase.textLayout?.observationGaps ?? ['unknown_observation_gap']))]
+        throw new ToolCapabilityUnavailableError(`Exact reference source text layout observation unavailable (${gaps.join(', ')}); no rendered baseline was established. Changing style arguments cannot repair an unsupported observation capability.`)
+      }
       if (
         screenshots.cover.equals(screenshots.content)
         || screenshots.cover.equals(screenshots.closing)
@@ -991,9 +1174,10 @@ export class BrowserManager {
         evidenceSha256,
         viewport,
         phases,
+        ...(sharedAnchorSelectors.length > 0 ? { sharedAnchorSelectors } : {}),
         ...(interiorVariants.length > 0 ? { interiorVariants } : {}),
       }, { evidenceSha256, viewport })
-      return { profile, screenshots }
+      return { profile, screenshots, ...(textFontFamilies ? { textFontFamilies } : {}) }
     } finally {
       await context.close().catch(() => undefined)
     }
@@ -1048,19 +1232,10 @@ export class BrowserManager {
   }
 
   async closeEverything(): Promise<void> {
-    await Promise.allSettled([...this.sessionCreations.values()])
-    const sessions = [...this.sessions.values()]
-    this.sessions.clear()
-    await Promise.allSettled(sessions.map(async (session) => await session.context.close()))
-    const launching = this.browserLaunch
-    if (launching) await launching.catch(() => undefined)
-    const browser = this.browser
-    this.browser = undefined
-    try {
-      if (browser?.isConnected()) await browser.close()
-    } finally {
-      this.lastOpenedUrls.clear()
-    }
+    // A reusable reset needs the same transport-first drain as shutdown.
+    // Waiting for Context.close first can stall after every render check has
+    // finished. Do not flip the permanent shutdown admission flag here.
+    await this.drainBrowserResources()
   }
 
   async shutdown(): Promise<void> {
@@ -1069,12 +1244,12 @@ export class BrowserManager {
       // Browser launches. Any operation that crossed this boundary has already
       // registered its creation promise and is therefore included in the drain.
       this.shuttingDown = true
-      this.shutdownWork = this.drainForShutdown()
+      this.shutdownWork = this.drainBrowserResources()
     }
     await this.shutdownWork
   }
 
-  private async drainForShutdown(): Promise<void> {
+  private async drainBrowserResources(): Promise<void> {
     await Promise.allSettled([...this.sessionCreations.values()])
     const sessions = [...this.sessions.values()]
     this.sessions.clear()
@@ -1277,8 +1452,10 @@ export class BrowserManager {
 const REFERENCE_RENDER_BASE_PROPERTIES = [
   'display', 'position', 'visibility', 'opacity', 'transform', 'pointer-events',
 ] as const
+const REFERENCE_RENDER_MAX_SHARED_ANCHORS = 8
+const REFERENCE_CHROME_SELECTOR_PATTERN = /(?:^|[-_.#])(?:nav|progress|counter|keyboard|hint|chrome|runner|footer|topbar|top-bar|slide-meta)(?:$|[-_.:# ])/iu
 
-function sanitizeReferenceRenderHtml(html: string, allowInlineFontData = false): string {
+function sanitizeReferenceRenderHtml(html: string, allowInlineFontData = false, runtimeScripts: readonly ReferenceTemplateDependency[] = []): string {
   const sanitized = html
     .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/giu, ' ')
     .replace(/<script\b[^>]*\/?\s*>/giu, ' ')
@@ -1291,7 +1468,13 @@ function sanitizeReferenceRenderHtml(html: string, allowInlineFontData = false):
     .replace(/\s+on[a-z][\w:-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/giu, ' ')
     .replace(/\s+(?:href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\1/giu, ' ')
   const fontSource = allowInlineFontData ? 'data:' : "'none'"
-  const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src ${fontSource}; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">`
+  // Static captures remain script-src none. Native captures authorize only
+  // the exact hash-checked dependency bodies, not arbitrary inline code,
+  // external scripts, blob loaders, eval, or event handlers.
+  const scriptSources = runtimeScripts.length
+    ? runtimeScripts.map((script) => `'sha256-${Buffer.from(script.sha256, 'hex').toString('base64')}'`).join(' ')
+    : "'none'"
+  const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${scriptSources}; style-src 'unsafe-inline'; img-src 'none'; font-src ${fontSource}; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">`
   if (/<head\b[^>]*>/iu.test(sanitized)) return sanitized.replace(/<head\b[^>]*>/iu, (head) => `${head}${policy}`)
   if (/<html\b[^>]*>/iu.test(sanitized)) return sanitized.replace(/<html\b[^>]*>/iu, (root) => `${root}<head>${policy}</head>`)
   return `<head>${policy}</head>${sanitized}`
@@ -1317,19 +1500,37 @@ function referenceRenderSelectorSpecs(sourceProfile: ReferenceStyleSourceProfile
     .map((rule) => {
       const pseudoMatch = rule.selector.match(/::(?:before|after)\b/iu)?.[0].toLowerCase() as '::before' | '::after' | undefined
       const querySelector = pseudoMatch ? rule.selector.replace(/::(?:before|after)\b/giu, '') : rule.selector
-      const properties = [...new Set([
+      const geometry = referenceRenderIntrinsicBlockGeometry(sourceProfile, rule.selector)
+      const properties = referenceRenderPropertiesForGeometry([
         ...REFERENCE_RENDER_BASE_PROPERTIES,
         ...rule.declarations.map((entry) => entry.property),
         ...(rule.effectiveFontFamily ? ['font-family'] : []),
-      ])].slice(0, 24)
+      ], geometry.geometry)
       return {
         selector: rule.selector,
         querySelector,
         ...(pseudoMatch ? { pseudo: pseudoMatch } : {}),
         properties,
-        ...referenceRenderIntrinsicBlockGeometry(sourceProfile, rule.selector),
+        ...geometry,
       }
     })
+}
+
+function referenceRenderPropertiesForGeometry(
+  properties: readonly string[],
+  geometry?: ReferenceRenderGeometryPolicy,
+): string[] {
+  if (geometry !== 'flow-size') return [...new Set(properties)].slice(0, 24)
+  // A fixed-size component may move with an intrinsic-height parent, but a
+  // newly injected relative/absolute offset is still real style drift. Keep
+  // the authored positioning and margin surface in the bounded fingerprint;
+  // rect geometry independently verifies its fixed width and height.
+  const usedSizeProperties = new Set(['width', 'height', 'min-width', 'min-height', 'max-width', 'max-height'])
+  return [...new Set([
+    ...REFERENCE_RENDER_BASE_PROPERTIES,
+    'top', 'right', 'bottom', 'left', 'inset', 'margin',
+    ...properties.filter((property) => !usedSizeProperties.has(property)),
+  ])].slice(0, 24)
 }
 
 function mergeReferenceRenderPhaseSpecs(
@@ -1337,7 +1538,7 @@ function mergeReferenceRenderPhaseSpecs(
   sourceSpecs: readonly ReferenceRenderSelectorSpec[],
 ): ReferenceRenderSelectorSpec[] {
   const nonDuplicatePhaseSpecs = phaseSpecs.filter((phaseSpec) => !sourceSpecs.some((sourceSpec) => (
-    /(?:^|[-_.#])(?:runner|footer|counter|keyboard|hint)(?:$|[-_.:# ])/iu.test(sourceSpec.selector)
+    REFERENCE_CHROME_SELECTOR_PATTERN.test(sourceSpec.selector)
     && phaseSpec.selector.endsWith(` ${sourceSpec.selector}`)
     && phaseSpec.pseudo === sourceSpec.pseudo
   )))
@@ -1353,15 +1554,65 @@ function mergeReferenceRenderPhaseSpecs(
     const sourceSpec = inheritedSourceSpec
     if (!sourceSpec) return phaseSpec
     if (exactSourceSpec) sourceBySelector.delete(phaseSpec.selector)
+    const intrinsicPhaseText = phaseSpec.geometry === 'intrinsic-inline'
+      || phaseSpec.geometry === 'intrinsic-size'
+    const phaseRootGeometry = phaseSpec.geometry === 'strict'
+      && /^[.#][-_a-z][\w-]*$/iu.test(phaseSpec.selector)
     return {
       ...sourceSpec,
       ...phaseSpec,
-      properties: [...new Set([...sourceSpec.properties, ...phaseSpec.properties])].slice(0, 24),
-      geometry: phaseSpec.geometry ?? sourceSpec.geometry,
+      properties: phaseSpec.authoredBox ? phaseSpec.properties : [...new Set([
+        ...sourceSpec.properties,
+        ...(intrinsicPhaseText ? ['margin'] : phaseSpec.properties),
+      ])].slice(0, 24),
+      // A source-backed geometry policy knows whether width/height were
+      // authored. Prefer it over the runtime text heuristic; the latter is
+      // only authoritative for low-salience phase anchors omitted from the
+      // bounded source profile. A Browser-identified slide root is always a
+      // fixed stage anchor even when its source rule contains padding that
+      // would make an ordinary descendant look like an intrinsic text chip.
+      geometry: phaseRootGeometry ? 'strict' : phaseSpec.authoredBox ? phaseSpec.geometry : sourceSpec.geometry ?? phaseSpec.geometry,
     }
   })
   return [...mergedPhaseSpecs, ...sourceSpecs.filter((spec) => sourceBySelector.has(spec.selector))]
     .slice(0, 48)
+}
+
+/**
+ * Find selectors whose rendered anchors exist in every canonical phase.
+ * Familiar chrome names receive ordering priority, but they are neither
+ * required nor sufficient: visibility in the captured Browser evidence is
+ * what makes a selector shared. This keeps the profile compatible with
+ * editorial decks that intentionally have no global navigation/footer DOM.
+ */
+function sharedReferenceRenderSpecs(
+  phases: Record<ReferenceRenderPhase, RenderedReferencePhaseProfile>,
+  sourceSpecs: readonly ReferenceRenderSelectorSpec[],
+): ReferenceRenderSelectorSpec[] {
+  const phaseSelectors = (['cover', 'content', 'closing'] as const).map((phase) => (
+    new Set(phases[phase].anchors.map((anchor) => anchor.selector))
+  ))
+  const sourceBySelector = new Map(sourceSpecs.map((spec) => [spec.selector, spec]))
+  return phases.cover.anchors
+    .filter((anchor, index, anchors) => (
+      anchors.findIndex((candidate) => candidate.selector === anchor.selector) === index
+      && phaseSelectors.every((selectors) => selectors.has(anchor.selector))
+    ))
+    .map((anchor, order) => ({
+      anchor,
+      order,
+      spec: sourceBySelector.get(anchor.selector) ?? referenceRenderSelectorSpecFromAnchor(anchor),
+    }))
+    .sort((left, right) => (
+      Number(REFERENCE_CHROME_SELECTOR_PATTERN.test(right.anchor.selector))
+      - Number(REFERENCE_CHROME_SELECTOR_PATTERN.test(left.anchor.selector))
+      || Number(right.anchor.geometry === 'strict') - Number(left.anchor.geometry === 'strict')
+      || right.anchor.occlusion.reduce((total, ratio) => total + ratio, 0)
+        - left.anchor.occlusion.reduce((total, ratio) => total + ratio, 0)
+      || left.order - right.order
+    ))
+    .slice(0, REFERENCE_RENDER_MAX_SHARED_ANCHORS)
+    .map(({ spec }) => spec)
 }
 
 /**
@@ -1374,28 +1625,64 @@ function mergeReferenceRenderPhaseSpecs(
 function referenceRenderIntrinsicBlockGeometry(
   sourceProfile: ReferenceStyleSourceProfile,
   selector: string,
-): { geometry: 'intrinsic-block' | 'intrinsic-block-center' } | Record<string, never> {
+): { geometry?: ReferenceRenderGeometryPolicy } {
   const terminal = selector.match(/(\.[a-z][a-z0-9-]*)(?::[-\w()]+)?\s*$/iu)?.[1]?.toLowerCase()
   if (!terminal) return {}
-  if (/(?:circle|dots?|decoration|accent-line|nav-btn|bar-track|bar-fill|progress|icon|badge)$/iu.test(terminal)) {
-    return {}
-  }
   const normalized = selector.replace(/\s+/gu, ' ').trim().toLowerCase()
+  // A layout-* selector used as the whole phase root fills the slide stage
+  // through the shared `.slide` rule. Its local rule may contain only
+  // alignment/text declarations, which must not let the intrinsic-copy
+  // heuristic downgrade the page-sized structural geometry.
+  if (/^\.layout-[a-z0-9-]+(?::[-\w()]+)?$/iu.test(normalized)) {
+    return { geometry: 'strict' }
+  }
   const sourceRule = sourceProfile.rules.find((rule) => {
     const candidate = rule.selector.replace(/\s+/gu, ' ').trim().toLowerCase()
     return candidate === normalized || candidate === terminal
   })
+  const declarationValue = (property: string) => sourceRule?.declarations
+    .find((declaration) => declaration.property === property)?.value.trim()
+  const positioned = sourceRule?.declarations.some(({ property, value }) => (
+    property === 'position' && /^(?:absolute|fixed|sticky)$/iu.test(value.trim())
+  )) === true
   const explicitVerticalSize = sourceRule?.declarations.some(({ property, value }) => (
     property === 'height'
     || property === 'max-height'
     || (property === 'min-height' && !/^(?:0(?:px|rem|em|%)?|auto)$/iu.test(value.trim()))
-  )) === true
-  if (explicitVerticalSize) return {}
-  const descendantBlock = /^\s*\.[a-z_][a-z0-9_-]*\s+/iu.test(selector)
-  const anchoredAutoBlock = sourceRule?.declarations.some(({ property, value }) => (
-      property === 'position' && /^(?:absolute|fixed|sticky)$/iu.test(value.trim())
-    )) === true
-    && sourceRule.declarations.some(({ property }) => property === 'top' || property === 'bottom')
+  )) === true || Boolean(
+    positioned
+    && declarationValue('top')
+    && declarationValue('top') !== 'auto'
+    && declarationValue('bottom')
+    && declarationValue('bottom') !== 'auto',
+  )
+  const explicitHorizontalSize = sourceRule?.declarations.some(({ property, value }) => (
+    property === 'width' && value.trim() !== 'auto'
+  )) === true || Boolean(
+    positioned
+    && declarationValue('left')
+    && declarationValue('left') !== 'auto'
+    && declarationValue('right')
+    && declarationValue('right') !== 'auto',
+  )
+  const fixedDecoration = /(?:circle|dots?|decoration|accent-line|nav-btn|bar-track|bar-fill|progress|icon)$/iu.test(terminal)
+  if (fixedDecoration || (explicitHorizontalSize && explicitVerticalSize)) {
+    // Fixed-size components inside a content-flow layout retain their own
+    // dimensions and horizontal alignment, but their viewport Y coordinate
+    // legitimately follows an intrinsic-height parent when copy changes.
+    // This also applies to an absolutely positioned axis/dot whose containing
+    // block is itself in content flow. Static source verification protects its
+    // authored offsets; viewport Y must not be frozen to the demo copy.
+    if (normalized.includes(' ') && (fixedDecoration || !positioned)) return { geometry: 'flow-size' }
+    return { geometry: 'strict' }
+  }
+  const intrinsicInline = positioned && !explicitHorizontalSize
+  // A phase-derived selector can be absent from the bounded source profile.
+  // Do not overwrite the Browser's stronger intrinsic-text inference merely
+  // because that selector happens to contain a descendant combinator.
+  const descendantBlock = Boolean(sourceRule) && !explicitVerticalSize && /^\s*\.[a-z_][a-z0-9_-]*\s+/iu.test(selector)
+  const anchoredAutoBlock = positioned && !explicitVerticalSize
+    && sourceRule?.declarations.some(({ property }) => property === 'top' || property === 'bottom') === true
   const verticallyCenteredAutoBlock = anchoredAutoBlock
     && sourceRule?.declarations.some(({ property, value }) => (
       property === 'top' && /^50(?:\.0+)?%$/u.test(value.trim())
@@ -1403,6 +1690,34 @@ function referenceRenderIntrinsicBlockGeometry(
     && sourceRule?.declarations.some(({ property, value }) => (
       property === 'transform' && /translatey\(\s*-50(?:\.0+)?%\s*\)/iu.test(value)
     )) === true
+  const structuralDisplay = sourceRule?.declarations.some(({ property, value }) => (
+    property === 'display' && /^(?:flex|inline-flex|grid|inline-grid)$/iu.test(value.trim())
+  )) === true
+  const inlineStructuralDisplay = sourceRule?.declarations.some(({ property, value }) => (
+    property === 'display' && /^(?:inline-flex|inline-grid)$/iu.test(value.trim())
+  )) === true
+  const semanticTextLabel = /(?:^|[-_.#])(?:badge|caption|chip|copy|eyebrow|footnote|kicker|label|note|pill|strap|tag|tagline)(?:$|[-_.:# ])/iu.test(selector)
+  const autoSizedTextLabel = !explicitHorizontalSize
+    && !explicitVerticalSize
+    // `inline-flex` is how pill/badge labels align their contents; it does not
+    // turn their copy-owned used width or flex-wrap row into fixed geometry.
+    && (!structuralDisplay || (inlineStructuralDisplay && semanticTextLabel))
+    && (
+      semanticTextLabel
+      || sourceRule?.declarations.some(({ property }) => (
+        property.startsWith('font-')
+        || property.startsWith('text-')
+        || property === 'letter-spacing'
+        || property === 'line-height'
+        || property === 'white-space'
+        || property === 'padding'
+        || property.startsWith('padding-')
+      )) === true
+    )
+  if (autoSizedTextLabel) return { geometry: 'intrinsic-size' }
+  if (verticallyCenteredAutoBlock) return { geometry: 'intrinsic-block-center' }
+  if (intrinsicInline && (descendantBlock || anchoredAutoBlock)) return { geometry: 'intrinsic-size' }
+  if (intrinsicInline) return { geometry: 'intrinsic-inline' }
   return verticallyCenteredAutoBlock
     ? { geometry: 'intrinsic-block-center' }
     : descendantBlock || anchoredAutoBlock ? { geometry: 'intrinsic-block' } : {}
@@ -1416,6 +1731,7 @@ function referenceRenderSelectorSpecFromAnchor(anchor: RenderedReferenceAnchorPr
     ...(pseudoMatch ? { pseudo: pseudoMatch } : {}),
     properties: [...new Set(anchor.styles.flatMap((styles) => Object.keys(styles)))].slice(0, 24),
     geometry: anchor.geometry,
+    ...(anchor.authoredBox ? { authoredBox: true } : {}),
   }
 }
 
@@ -1427,7 +1743,7 @@ async function settleReferenceRender(page: Page): Promise<void> {
 
 function normalizeReferenceRenderFontOptions(
   options: ReferenceRenderFontOptions | undefined,
-): Required<ReferenceRenderFontOptions> | undefined {
+): Required<Pick<ReferenceRenderFontOptions, 'fontCss' | 'expectedFontFamilies'>> | undefined {
   const hasCss = options?.fontCss !== undefined
   const hasFamilies = options?.expectedFontFamilies !== undefined
   if (!hasCss && !hasFamilies) return undefined
@@ -1504,6 +1820,73 @@ async function captureReferencePhase(
   return await page.evaluate(REFERENCE_RENDER_SNAPSHOT_PAGE_FUNCTION, { specs, typographySpecs })
 }
 
+const REFERENCE_LANGUAGE_RENDER_PAGE_FUNCTION = Function('"use strict"; return (' + String.raw`({ language, roles }) => {
+    const violations = [];
+    const add = (message) => { if (violations.length < 20 && !violations.includes(message)) violations.push(message); };
+    const family = (value) => value.toLowerCase().replace(/["'\s]/g, '');
+    const cjk = /[\p{Script=Han}\u3000-\u303f\uff01-\uff60]/u;
+    const visible = (element) => {
+      for (let node = element; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (node.hidden || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0.01) return false;
+      }
+      const box = element.getBoundingClientRect();
+      return box.width > 0 && box.height > 0 && box.right > 0 && box.bottom > 0 && box.left < innerWidth && box.top < innerHeight;
+    };
+    for (const root of document.querySelectorAll('.slide')) {
+      if (!visible(root)) continue;
+      const variant = root.getAttribute('data-anera-cjk-variant');
+      for (const group of root.querySelectorAll('[data-anera-cjk-text]')) {
+        if (!visible(group)) { add('render CJK text group ' + String(variant).slice(0, 8) + '.' + String(group.getAttribute('data-anera-cjk-text')).slice(0, 8) + ' is hidden or outside the visible source slide; inspect overlong copy in this source layout without changing its typography'); continue; }
+        const actual = getComputedStyle(group);
+        const parent = getComputedStyle(group.parentElement);
+        const display = ['flex','inline-flex','grid','inline-grid'].includes(parent.display) ? 'block' : 'inline';
+        if (actual.display !== display || actual.position !== 'static' || actual.transform !== 'none' || actual.filter !== 'none' || Number(actual.opacity) !== 1
+          || ['fontFamily','fontSize','fontWeight','fontStyle','lineHeight','letterSpacing','textTransform','color','textShadow'].some((key) => actual[key] !== parent[key])) add('render CJK text group must retain the original mixed-script formatting context');
+      }
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (!cjk.test(node.textContent || '') || !node.parentElement || !visible(node.parentElement)) continue;
+        if (!node.parentElement.hasAttribute('data-anera-cjk')) add('render CJK copy lost its documented typography run');
+      }
+      for (const run of root.querySelectorAll('[data-anera-cjk]')) {
+        if (!visible(run)) { add('render CJK run ' + String(variant).slice(0, 8) + '.' + String(run.getAttribute('data-anera-cjk-slot')).slice(0, 8) + ' is hidden or outside the visible source slide'); continue; }
+        const binding = language.bindings.find((item) => item.variant === variant && item.slot === run.getAttribute('data-anera-cjk-slot'));
+        if (!binding || run.getAttribute('data-anera-cjk') !== binding.role) { add('render CJK run changed its source role'); continue; }
+        let parent = root;
+        for (const index of binding.path) parent = parent && [...parent.children].filter((child) => !child.hasAttribute('data-anera-cjk') && !child.hasAttribute('data-anera-cjk-text') && !(child.tagName.toLowerCase() === 'a' && child.getAttribute('style') === 'color:inherit;text-decoration:inherit'))[index];
+        let actualParent = run.parentElement;
+        if (!actualParent?.hasAttribute('data-anera-cjk-text') || actualParent.getAttribute('data-anera-cjk-text') !== binding.slot) { add('render CJK run lost its original literal-text group'); continue; }
+        actualParent = actualParent.parentElement;
+        if (actualParent?.tagName.toLowerCase() === 'a' && actualParent.getAttribute('style') === 'color:inherit;text-decoration:inherit') actualParent = actualParent.parentElement;
+        if (!parent || actualParent !== parent) { add('render CJK run moved away from its source text parent'); continue; }
+        const rule = roles[binding.role];
+        const actual = getComputedStyle(run);
+        const inherited = getComputedStyle(parent);
+        const size = Number.parseFloat(inherited.fontSize);
+        const prefix = 'render CJK ' + variant + '.' + binding.slot + ' ';
+        if (family(actual.fontFamily) !== family(rule.family)) add(prefix + 'font-family differs from the documented pairing');
+        if (actual.fontWeight !== String(rule.weight)) add(prefix + 'font-weight expected ' + rule.weight + ' but found ' + actual.fontWeight);
+        if (actual.fontSize !== inherited.fontSize) add(prefix + 'font-size must inherit the original text slot');
+        if (actual.fontStyle !== 'normal' || actual.fontSynthesis !== 'none') add(prefix + 'must not synthesize bold/italic glyphs');
+        if (actual.display !== 'inline' || actual.position !== 'static' || actual.transform !== 'none' || actual.filter !== 'none'
+          || Number(actual.opacity) !== 1 || actual.color !== inherited.color || actual.textShadow !== inherited.textShadow
+          || ['marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth'].some((key) => Number.parseFloat(actual[key]) !== 0)) add(prefix + 'must preserve the source inline layout, color and glow');
+        if (!['normal', '0px'].includes(actual.letterSpacing) || actual.textTransform !== 'none') add(prefix + 'requires zero tracking and no uppercase transformation');
+        if ('lineHeight' in rule && Math.abs(Number.parseFloat(actual.lineHeight) - size * rule.lineHeight) > 0.05) add(prefix + 'line-height differs from the documented role');
+        if (!('lineHeight' in rule) && actual.lineHeight !== inherited.lineHeight) add(prefix + 'line-height must inherit the original label slot');
+      }
+    }
+    return violations;
+  }` + ')')() as (payload: { language: ReferenceLanguageVariant; roles: typeof REFERENCE_LANGUAGE_ROLES }) => string[]
+
+async function referenceLanguageRenderViolations(page: Page, value: ReferenceLanguageVariant | undefined, sourceSha256: string): Promise<string[]> {
+  if (!value) return []
+  const language = normalizeReferenceLanguageVariant(value)
+  if (language.sourceSha256 !== sourceSha256) throw new Error('Rendered CJK policy is bound to another reference source')
+  return await page.evaluate(REFERENCE_LANGUAGE_RENDER_PAGE_FUNCTION, { language, roles: REFERENCE_LANGUAGE_ROLES })
+}
+
 async function verifyRenderedReferenceStyleInSession(
   session: BrowserSession,
   profile: RenderedReferenceStyleProfile,
@@ -1515,6 +1898,9 @@ async function verifyRenderedReferenceStyleInSession(
   screenshot?: Buffer
 }> {
   const page = session.page
+  const runtimeManagedSlideSelectors = new Set(
+    renderedReferenceRuntimeManagedSlideSelectors(profile),
+  )
   const interiorVariants = phase === 'content' ? profile.interiorVariants ?? [] : []
   const startingState = phase === 'content'
     ? await page.evaluate(REFERENCE_RENDER_PAGE_STATE_PAGE_FUNCTION)
@@ -1547,6 +1933,7 @@ async function verifyRenderedReferenceStyleInSession(
   await settleReferenceRender(page)
   const presentationState = await page.evaluate(PRESENTATION_STATE_SNAPSHOT_PAGE_FUNCTION)
   const first = await captureReferencePhase(page, specs, phase, expected.typographyProbes, Boolean(currentVariant))
+  const firstLanguageViolations = await referenceLanguageRenderViolations(page, fontOptions?.languageVariant, profile.evidenceSha256)
   await page.waitForTimeout(700)
   const second = await captureReferencePhase(page, specs, phase, expected.typographyProbes, Boolean(currentVariant))
 
@@ -1574,9 +1961,15 @@ async function verifyRenderedReferenceStyleInSession(
     evidenceEpoch,
     expected,
     second,
-    { allowMissingTypography: Boolean(currentVariant) },
+    {
+      allowMissingTypography: Boolean(currentVariant),
+      runtimeManagedSlideSelectors,
+    },
   )
-  const stageViolations = renderedPresentationStageViolations(phase, presentationState)
+  const stageViolations = presentationStageViolations(phase, presentationState)
+  for (const violation of [...firstLanguageViolations, ...await referenceLanguageRenderViolations(page, fontOptions?.languageVariant, profile.evidenceSha256)]) {
+    if (!verification.violations.includes(violation)) addRenderedReferenceViolation(verification, violation)
+  }
   applyRenderedPresentationStageViolations(verification, stageViolations)
   if (!renderedPhaseSnapshotsEqual(first, second)) {
     addRenderedReferenceViolation(
@@ -1590,12 +1983,24 @@ async function verifyRenderedReferenceStyleInSession(
       `render ${phase} changed after screenshot capture`,
     )
   }
+  // Inspect the real selected state before the all-interior activator can
+  // hide sibling roots. Compact visibility supplements, never replaces, the
+  // exact design-viewport screenshot and fidelity checks above.
+  if (verification.fidelity === 'pass' && presentationState.length > 0 && startingViewport) {
+    const surface = await verifyCompactPresentationSurface(session, phase, startingViewport)
+    applyRenderedSurfaceAttestation(verification, surface)
+    if (surface.restored && !renderedPhaseSnapshotsEqual(second,
+      await captureReferencePhase(page, specs, phase, expected.typographyProbes, Boolean(currentVariant)))) {
+      addRenderedReferenceViolation(verification, `render ${phase} changed design-viewport evidence after compact surface restoration`)
+    }
+  }
   // Do not manufacture reassuring per-slide scores after the actual active
   // slide has already failed the shared-stage invariant. The forced
   // all-interior activator deliberately hides sibling slides so it can audit
   // each layout in isolation; running it after a vertical-flow failure masks
   // the root cause and sends the repair model toward unrelated pixel tweaks.
-  if (phase === 'content' && startingState && stageViolations.length === 0) {
+  if (phase === 'content' && startingState && stageViolations.length === 0
+    && !verification.surfaceAttestations?.some(surface => surface.checked !== surface.matched)) {
     const interior = await verifyAllInteriorReferenceVariants(
       session,
       profile,
@@ -1603,10 +2008,14 @@ async function verifyRenderedReferenceStyleInSession(
       startingUrl,
       startingViewport,
       startingEpoch,
+      runtimeManagedSlideSelectors,
+      fontOptions?.languageVariant,
     )
     verification.interiorAttestation = interior.attestation
     verification.checked += interior.checked
     verification.matched += interior.matched
+    verification.observationGapCount = (verification.observationGapCount ?? 0) + interior.observationGapCount
+    verification.surfaceAttestations = [...verification.surfaceAttestations ?? [], ...interior.surfaceAttestations]
     for (const violation of interior.violations) {
       if (verification.violations.length < 64) verification.violations.push(violation)
     }
@@ -1632,6 +2041,84 @@ async function verifyRenderedReferenceStyleInSession(
   return { verification, ...(screenshot ? { screenshot } : {}) }
 }
 
+async function verifyCompactPresentationSurface(
+  session: BrowserSession, phase: string, designViewport: { width: number; height: number },
+): Promise<RenderedReferenceSurfaceAttestation> {
+  const page = session.page
+  const originalViewport = page.viewportSize()
+  const originalUrl = page.url()
+  const originalEpoch = session.pageEpoch
+  const originalState = await page.evaluate(REFERENCE_RENDER_PAGE_STATE_PAGE_FUNCTION)
+  const viewport = compactPresentationViewport(designViewport)
+  const result: RenderedReferenceSurfaceAttestation = { surface: 'compact-stage-v1', phase, viewport,
+    activeIndex: originalState.activeIndex, checked: 0, matched: 0, observationGaps: 0, restored: false, violations: [] }
+  const check = (passed: boolean, violation: string) => {
+    result.checked += 1
+    if (passed) result.matched += 1
+    else result.violations.push(violation)
+  }
+  try {
+    await page.setViewportSize(viewport)
+    await settleReferenceRender(page)
+    const slides = await page.evaluate(PRESENTATION_STATE_SNAPSHOT_PAGE_FUNCTION)
+    const active = presentationActiveState(slides)
+    result.activeRect = slides.find(slide => slide.index === originalState.activeIndex)?.rect
+    const prefix = `render ${phase} compact surface ${viewport.width}x${viewport.height}`
+    check(slides.length === originalState.slides.length && active.indices.length === 1
+      && active.indices[0] === originalState.activeIndex, `${prefix} changed presentation ownership or root count during resize`)
+    const violations = presentationStageViolations(phase, slides)
+    check(slides.length > 0 && violations.length === 0,
+      `${prefix}: ${violations.join(' ') || 'no observable presentation roots'}. Active root bounds=${JSON.stringify(result.activeRect)}. Inspect the authored host/containing block together with runtime scaling; design-viewport visibility does not prove compact visibility.`)
+    if (active.indices.length === 1 && violations.length === 0) {
+      const observe = Function(`"use strict"; return (index) => (${RENDERED_CONTROL_OCCLUSION_SCRIPT})((${REFERENCE_SLIDE_ELEMENTS_SCRIPT})()[index])`)() as
+        (index: number) => RenderedControlOcclusion
+      const occlusion = await page.evaluate(observe, active.indices[0])
+      result.controlOcclusion = occlusion
+      check(occlusion.collisions.length === 0,
+        `${prefix} external controls intercept visible content text regions: ${JSON.stringify(occlusion.collisions)}. Keep navigation usable without covering content; inspect stacking, placement and redundant controls. This is hit-tested region evidence, not a full ink-occlusion measurement.`)
+      if (!occlusion.complete) {
+        result.checked += 1
+        result.observationGaps += 1
+        result.violations.push(`${prefix} control-occlusion observation reached its bounded sampling limit`)
+      }
+    }
+    // A compact probe cannot replace the document and still certify it.
+    check(page.url() === originalUrl && session.pageEpoch === originalEpoch,
+      `${prefix} changed page identity during observation`)
+  } catch (error) {
+    result.checked += 1
+    result.observationGaps += 1
+    result.violations.push(`render ${phase} compact surface could not be observed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    if (originalViewport) {
+      try {
+        await page.setViewportSize(originalViewport)
+        await settleReferenceRender(page)
+        const state = await page.evaluate(REFERENCE_RENDER_PAGE_STATE_PAGE_FUNCTION)
+        result.restored = JSON.stringify(state) === JSON.stringify(originalState)
+          && page.url() === originalUrl && session.pageEpoch === originalEpoch
+          && renderedViewportsEqual(page.viewportSize(), originalViewport)
+        // Do not silently rewrite controller state or relabel a mutation as
+        // clean. The main gate rejects any non-restoring resize transition.
+      } catch { result.restored = false }
+    }
+    check(result.restored, `render ${phase} compact surface probe did not restore its original page state and viewport`)
+  }
+  return result
+}
+
+function applyRenderedSurfaceAttestation(
+  verification: BrowserRenderedReferenceStyleVerification, surface: RenderedReferenceSurfaceAttestation,
+): void {
+  verification.surfaceAttestations = [...verification.surfaceAttestations ?? [], surface]
+  verification.checked += surface.checked
+  verification.matched += surface.matched
+  verification.observationGapCount = (verification.observationGapCount ?? 0) + surface.observationGaps
+  verification.score = Math.round(verification.matched / verification.checked * 1_000) / 10
+  if (surface.checked !== surface.matched) verification.fidelity = 'mismatch'
+  for (const violation of surface.violations) if (verification.violations.length < 64) verification.violations.push(violation)
+}
+
 async function verifyAllInteriorReferenceVariants(
   session: BrowserSession,
   profile: RenderedReferenceStyleProfile,
@@ -1639,20 +2126,26 @@ async function verifyAllInteriorReferenceVariants(
   startingUrl: string,
   startingViewport: { width: number; height: number } | null,
   startingEpoch: number,
+  runtimeManagedSlideSelectors: ReadonlySet<string>,
+  languageVariant?: ReferenceLanguageVariant,
 ): Promise<{
   attestation: RenderedReferenceInteriorAttestation
   checked: number
   matched: number
   violations: string[]
+  observationGapCount: number
+  surfaceAttestations: RenderedReferenceSurfaceAttestation[]
 }> {
   const page = session.page
   const variants = profile.interiorVariants ?? []
   const candidateSlides = Math.max(0, startingState.slides.length - 2)
   const slides: RenderedReferenceInteriorAttestation['slides'] = []
   const violations: string[] = []
+  const surfaceAttestations: RenderedReferenceSurfaceAttestation[] = []
   let checked = 0
   let matched = 0
   let matchedSlides = 0
+  let observationGapCount = 0
   if (candidateSlides > 32) {
     return {
       attestation: {
@@ -1663,6 +2156,8 @@ async function verifyAllInteriorReferenceVariants(
       },
       checked: 1,
       matched: 0,
+      observationGapCount: 1,
+      surfaceAttestations,
       violations: [`content deck has ${candidateSlides} interior slides; deterministic all-interior verification is bounded to 32`],
     }
   }
@@ -1677,8 +2172,22 @@ async function verifyAllInteriorReferenceVariants(
       // Historical render profiles predate layout libraries. Keep them safe by
       // enumerating every interior page against the legacy content fingerprint
       // instead of falling back to the former "only page 2" behavior.
+      const matchingVariants = variants.filter((variant) => layout.layoutSelectors.includes(variant.layoutSelector))
+      // A variant library is exclusive per page. Picking whichever stacked
+      // class scores best would let conflicting layout rules pass whenever a
+      // compound override visually cancels one of them.
+      if (variants.length > 0 && matchingVariants.length !== 1) {
+        checked += 1
+        slides.push({ slideIndex, ...(layoutSelector ? { layoutSelector } : {}), fidelity: 'mismatch', score: 0 })
+        if (violations.length < 64) {
+          violations.push(matchingVariants.length === 0
+            ? `content slide ${slideIndex + 1} has no real reference variant class`
+            : `content slide ${slideIndex + 1} stacks alternative reference layout variants ${matchingVariants.map((variant) => variant.layoutSelector).join(', ')}; use exactly one variant root class`)
+        }
+        continue
+      }
       const candidates: RenderedReferenceLayoutVariantProfile[] = variants.length > 0
-        ? variants.filter((variant) => layout.layoutSelectors.includes(variant.layoutSelector))
+        ? matchingVariants
         : [{ layoutSelector: layoutSelector ?? '.slide', profile: profile.phases.content }]
       if (candidates.length === 0) {
         checked += 1
@@ -1710,13 +2219,25 @@ async function verifyAllInteriorReferenceVariants(
           session.pageEpoch,
           variant.profile,
           second,
-          { allowMissingTypography: true },
+          { allowMissingTypography: true, runtimeManagedSlideSelectors },
         )
+        for (const violation of await referenceLanguageRenderViolations(page, languageVariant, profile.evidenceSha256)) {
+          addRenderedReferenceViolation(verification, violation)
+        }
         if (!renderedPhaseSnapshotsEqual(first, second)) {
           addRenderedReferenceViolation(
             verification,
             `content slide ${slideIndex + 1} (${variant.layoutSelector}) remained unstable across the verification window`,
           )
+        }
+        if (verification.fidelity === 'pass' && startingViewport) {
+          const surface = await verifyCompactPresentationSurface(session, `content slide ${slideIndex + 1}`, startingViewport)
+          surfaceAttestations.push(surface)
+          applyRenderedSurfaceAttestation(verification, surface)
+          if (surface.restored && !renderedPhaseSnapshotsEqual(second,
+            await captureReferencePhase(page, specs, 'content', variant.profile.typographyProbes, variants.length > 0))) {
+            addRenderedReferenceViolation(verification, `content slide ${slideIndex + 1} changed after compact surface restoration`)
+          }
         }
         if (!best || verification.score > best.score) {
           best = verification
@@ -1733,6 +2254,7 @@ async function verifyAllInteriorReferenceVariants(
       }
       checked += best.checked
       matched += best.matched
+      observationGapCount += best.observationGapCount ?? 0
       const passed = best.fidelity === 'pass'
       if (passed) matchedSlides += 1
       slides.push({
@@ -1795,44 +2317,9 @@ async function verifyAllInteriorReferenceVariants(
     checked,
     matched,
     violations,
+    observationGapCount,
+    surfaceAttestations,
   }
-}
-
-function renderedPresentationStageViolations(
-  phase: ReferenceRenderPhase,
-  slides: readonly PresentationStateSnapshot[],
-): string[] {
-  if (slides.length === 0) return []
-  const activeSlides = slides.filter(({ className }) => className.split(/\s+/u).includes('active'))
-  if (activeSlides.length === 0) return []
-  if (activeSlides.length !== 1) {
-    return [`render ${phase} has ${activeSlides.length} .slide.active elements; exactly one active slide must own the viewport stage`]
-  }
-
-  const active = activeSlides[0]
-  if (!active.intersectsViewport) {
-    const flowOccupyingPredecessors = slides.filter((candidate) => (
-      candidate.index < active.index
-      && candidate.display !== 'none'
-      && !candidate.hidden
-      && ['static', 'relative', 'sticky'].includes(candidate.position)
-      && candidate.rect[2] > 0.5
-      && candidate.rect[3] > 0.5
-    ))
-    const top = Number.isFinite(active.rect[1]) ? `${active.rect[1]}px` : 'outside'
-    if (flowOccupyingPredecessors.length > 0) {
-      return [
-        `render ${phase} active slide ${active.index + 1} is outside the viewport (top ${top}) because ${flowOccupyingPredecessors.length} inactive predecessor slide${flowOccupyingPredecessors.length === 1 ? '' : 's'} still occup${flowOccupyingPredecessors.length === 1 ? 'ies' : 'y'} normal vertical flow; preserve the reference base slide rule and add a separate inactive-state rule such as .slide:not(.active){display:none}, or place all slides on one shared viewport stage with an equally specific state rule`,
-      ]
-    }
-    return [`render ${phase} active slide ${active.index + 1} does not visibly intersect the viewport stage`]
-  }
-
-  const intersecting = slides.filter(({ intersectsViewport }) => intersectsViewport)
-  if (intersecting.length !== 1 || intersecting[0].index !== active.index) {
-    return [`render ${phase} has ${intersecting.length} visible slides intersecting the viewport; exactly the active slide ${active.index + 1} must intersect`]
-  }
-  return []
 }
 
 function compareRenderedReferencePhase(
@@ -1843,7 +2330,10 @@ function compareRenderedReferencePhase(
   pageEpoch: number,
   expectedPhase: RenderedReferencePhaseProfile,
   actualPhase: RenderedReferencePhaseProfile,
-  options: { allowMissingTypography?: boolean } = {},
+  options: {
+    allowMissingTypography?: boolean
+    runtimeManagedSlideSelectors?: ReadonlySet<string>
+  } = {},
 ): BrowserRenderedReferenceStyleVerification {
   const expectedAnchors = expectedPhase.anchors
   const actualAnchors = actualPhase.anchors
@@ -1862,10 +2352,42 @@ function compareRenderedReferencePhase(
   )
   for (const expected of expectedAnchors) {
     const actual = actualBySelector.get(expected.selector)
+    const directlyRuntimeManagedSlideRoot = options.runtimeManagedSlideSelectors?.has(expected.selector) === true
+    // The same slide-root element is commonly captured twice: once through
+    // its structural selector (`deck-stage>section.slide`) and once through
+    // its phase/layout class (`.s-cover`, `.s-toc`, ...). Computed `position`
+    // changes on both aliases when an external controller's relative-flow
+    // root becomes a self-contained absolute stack. Treat the alias as the
+    // same runtime surface only after Browser proves both snapshots still own
+    // the exact full viewport; size and position checks below remain strict.
+    const runtimeManagedSlideRoot = directlyRuntimeManagedSlideRoot || Boolean(
+      actual
+      && (options.runtimeManagedSlideSelectors?.size ?? 0) > 0
+      && expected.geometry === 'strict'
+      && expected.rects.length > 0
+      && actual.rects.length === expected.rects.length
+      && expected.rects.every((rect) => (
+        Math.abs(rect.x) <= 0.01
+        && Math.abs(rect.y) <= 0.01
+        && rect.width >= 0.98
+        && rect.height >= 0.98
+      ))
+      && actual.rects.every((rect) => (
+        Math.abs(rect.x) <= 0.01
+        && Math.abs(rect.y) <= 0.01
+        && rect.width >= 0.98
+        && rect.height >= 0.98
+      )),
+    )
     check(Boolean(actual), `render ${phase} is missing visible anchor ${expected.selector}`)
     if (!actual) continue
-    check(actual.count === expected.count, `render ${phase} ${expected.selector} count expected ${expected.count} but found ${actual.count}`)
+    check(actual.count === expected.count, `render ${phase} ${expected.selector} count expected ${expected.count} but found ${actual.count}. This counts visible in-viewport matches, not all DOM nodes. Check whether source elements are missing, hidden, or pushed outside the viewport by overlong copy before changing their count; preserve the source geometry and typography.`)
     const samples = Math.min(expected.rects.length, actual.rects.length)
+    // getBoundingClientRect() on a pseudo selector measures its host element,
+    // not the generated ::before/::after box. Retain pseudo count and computed
+    // style evidence, but never turn the host's content-sized geometry or hit
+    // testing into a pseudo-element fidelity defect.
+    const pseudoGeometryUnavailable = /::(?:before|after)\b/iu.test(expected.selector)
     const variableProgressFill = phase !== 'closing' && /(?:^|[-_.#])progress(?:$|[-_.:# ])/iu.test(expected.selector)
     const intrinsicContentHeader = /(?:^|[-_.#])slide-header(?:$|[-_.:# ])/iu.test(expected.selector)
     // Repeated flex children whose reference samples already have materially
@@ -1891,12 +2413,56 @@ function compareRenderedReferencePhase(
     const fullyIntrinsicTextChrome = /(?:^|[-_.#])(?:slide-counter|keyboard-hint)(?:$|[-_.:# ])/iu.test(expected.selector)
     const centeredIntrinsicTextChrome = /(?:^|[-_.#])keyboard-hint(?:$|[-_.:# ])/iu.test(expected.selector)
     const bottomAnchoredTextChrome = /(?:^|[-_.#])(?:slide-counter|keyboard-hint|footer)(?:$|[-_.:# ])/iu.test(expected.selector)
+    // Profiles captured before auto-sized label inference marked painted
+    // kicker chips, pills, and badges as strict or vertical-only merely
+    // because they had a background/border. Preserve those durable contracts
+    // across upgrades while keeping structural flex/grid panels strict.
+    const legacyTerminalClass = expected.selector
+      .match(/\.([a-z][a-z0-9-]*)(?::[-\w()]+)?\s*$/iu)?.[1]?.toLowerCase()
+    const legacyIntrinsicAutoSizedText = ['strict', 'intrinsic-block'].includes(expected.geometry)
+      && /^(?:badge|caption|chip|copy|eyebrow|footnote|kicker|label|note|pill|strap|tag|tagline)$/u.test(legacyTerminalClass ?? '')
+      && expected.styles.every((style) => !['flex', 'inline-flex', 'grid', 'inline-grid'].includes(style.display ?? ''))
+    // Early v1 profiles represented unpositioned descendant text such as
+    // `.s-cover .title .l2` as `intrinsic-block` and omitted directional
+    // padding from their bounded style surface. Its width is owned by the
+    // replacement glyphs (and can change across languages), not by template
+    // geometry. Recognize that old shape without weakening structural flex,
+    // grid, media, fixed-size, or positioned anchors. Newly captured profiles
+    // carry padding-left/right explicitly and classify the same node as
+    // intrinsic-size, so authored spacing drift remains directly testable.
+    const legacyIntrinsicDescendantText = expected.geometry === 'intrinsic-block'
+      && expected.selector.includes(' ')
+      && expected.styles.length > 0
+      && expected.styles.every((style) => (
+        ['block', 'inline', 'inline-block'].includes(style.display ?? '')
+        && !['absolute', 'fixed', 'sticky'].includes(style.position ?? '')
+        && typeof style['font-family'] === 'string'
+        && !['width', 'height', 'min-width', 'min-height', 'max-width', 'max-height']
+          .some((property) => property in style)
+      ))
+    // Older persisted profiles classified absolutely positioned vertical
+    // stacks of pills/tags as strict merely because the wrapper itself is a
+    // flex container. Its horizontal used size still comes from replacement
+    // copy in the children. Preserve the authored top/right edge and the
+    // stack's fixed vertical geometry, but do not force localized labels to
+    // reproduce the reference demo text's aggregate width/left coordinate.
+    const legacyIntrinsicInlineTextCollection = ['strict', 'intrinsic-block'].includes(expected.geometry)
+      && /(?:^|-)(?:(?:badges?|chips?|kickers?|labels?|pills?|straps?|tags?)|(?:badge|chip|kicker|label|pill|strap|tag)-(?:cluster|group|list|stack|wrap|wrapper))$/u.test(legacyTerminalClass ?? '')
+      && expected.styles.every((style) => (
+        ['absolute', 'fixed', 'sticky'].includes(style.position ?? '')
+        && ['flex', 'inline-flex'].includes(style.display ?? '')
+        && String(style['flex-direction'] ?? '').startsWith('column')
+      ))
     const fullyIntrinsicSize = expected.geometry === 'intrinsic-size'
+      || legacyIntrinsicAutoSizedText
+      || legacyIntrinsicDescendantText
     // Profiles captured before intrinsic-block-center existed serialized
     // translateY(-50%) as a matrix whose Y translation is exactly half the
     // element's used height. Recover that authored centering relationship so
     // persisted Sessions do not turn localized copy into false template drift.
     const centeredIntrinsicBlock = expected.geometry === 'intrinsic-block-center'
+      || (expected.authoredBox === true && expected.styles.some((style, index) =>
+        style.top === '50%' && halfHeightCenteredTransform(style, expected.rects[index], expectedViewport.height)))
       || (
         expected.geometry === 'strict'
         && expected.styles.some((style, index) => halfHeightCenteredTransform(
@@ -1905,14 +2471,30 @@ function compareRenderedReferencePhase(
           expectedViewport.height,
         ))
       )
+    // Durable profiles captured before content-flow inference treated these
+    // auto-height composite containers as fixed rectangles. Their unchanged
+    // CSS and child anchor counts are verified elsewhere; translated or
+    // shortened copy may legitimately change their used height.
+    const legacyIntrinsicContentContainer = ['strict', 'size'].includes(expected.geometry)
+      && /^(?:breakdown|track)$/u.test(legacyTerminalClass ?? '')
+    // The same historical profiles froze the viewport Y of fixed-size axes,
+    // dots, and similar decoration even when their positioned ancestor moves
+    // with an intrinsic-height heading.
+    const legacyFixedDecorationInFlow = expected.geometry === 'strict'
+      && expected.selector.includes(' ')
+      && /(?:^|-)(?:axis|bar|circle|dot|line|progress|track)(?:$|-)/u.test(legacyTerminalClass ?? '')
     const intrinsicBlockSize = expected.geometry === 'intrinsic-block'
       || centeredIntrinsicBlock
       || fullyIntrinsicSize
+      || heterogeneousRepeatedInlineSize
       || intrinsicTextChrome
+      || legacyIntrinsicContentContainer
+    const fixedSizeInFlow = expected.geometry === 'flow-size' || legacyFixedDecorationInFlow
     const intrinsicInlineSize = expected.geometry === 'intrinsic-inline'
       || fullyIntrinsicSize
       || heterogeneousRepeatedInlineSize
       || fullyIntrinsicTextChrome
+      || legacyIntrinsicInlineTextCollection
     for (let index = 0; index < samples; index += 1) {
       const expectedRect = expected.rects[index]
       const actualRect = actual.rects[index]
@@ -1920,16 +2502,20 @@ function compareRenderedReferencePhase(
       const heightTolerance = intrinsicContentHeader
         ? Math.max(4 / expectedViewport.height, expectedRect.height * 0.15)
         : Math.max(2 / expectedViewport.height, expectedRect.height * 0.05)
-      check(
-        (variableProgressFill || intrinsicInlineSize || Math.abs(actualRect.width - expectedRect.width) <= widthTolerance)
-          && (intrinsicBlockSize || Math.abs(actualRect.height - expectedRect.height) <= heightTolerance),
-        `render ${phase} ${expected.selector}[${index}] size expected ${renderedRectSummary(expectedRect)} but found ${renderedRectSummary(actualRect)}`,
-      )
+      if (!pseudoGeometryUnavailable) {
+        check(
+          (variableProgressFill || intrinsicInlineSize || Math.abs(actualRect.width - expectedRect.width) <= widthTolerance)
+            && (intrinsicBlockSize || Math.abs(actualRect.height - expectedRect.height) <= heightTolerance),
+          `render ${phase} ${expected.selector}[${index}] size expected ${renderedRectSummary(expectedRect)} but found ${renderedRectSummary(actualRect)}`,
+        )
+      }
       const expectedStyles = expected.styles[index] ?? {}
       const actualStyles = actual.styles[index] ?? {}
       const positionedIntrinsicBlock = intrinsicBlockSize
         && ['absolute', 'fixed', 'sticky'].includes(expectedStyles.position ?? '')
-      if (expected.geometry === 'strict' || positionedIntrinsicBlock || intrinsicInlineSize) {
+      const unpositionedIntrinsicFlowItem = (fullyIntrinsicSize || heterogeneousRepeatedInlineSize)
+        && !['absolute', 'fixed', 'sticky'].includes(expectedStyles.position ?? '')
+      if (!pseudoGeometryUnavailable && (expected.geometry === 'strict' || positionedIntrinsicBlock || intrinsicInlineSize || fixedSizeInFlow)) {
         const expectedBottom = expectedRect.y + expectedRect.height
         const actualBottom = actualRect.y + actualRect.height
         const expectedCenterX = expectedRect.x + expectedRect.width / 2
@@ -1939,17 +2525,96 @@ function compareRenderedReferencePhase(
         const explicitBottomAnchor = expectedStyles.bottom !== undefined
           && expectedStyles.bottom !== 'auto'
           && (expectedStyles.top === undefined || expectedStyles.top === 'auto')
-        const horizontalPositionMatches = intrinsicInlineSize && !intrinsicTextChrome
+        const inferredStableBottomAnchor = legacyIntrinsicContentContainer
+          && ['absolute', 'fixed', 'sticky'].includes(expectedStyles.position ?? '')
+          && Math.abs(actualBottom - expectedBottom) <= Math.max(4 / expectedViewport.height, 0.01)
+        const explicitLeftAnchor = expectedStyles.left !== undefined
+          && expectedStyles.left !== 'auto'
+          && (expectedStyles.right === undefined || expectedStyles.right === 'auto')
+        const explicitRightAnchor = expectedStyles.right !== undefined
+          && expectedStyles.right !== 'auto'
+          && (expectedStyles.left === undefined || expectedStyles.left === 'auto')
+        const positionedIntrinsicInline = intrinsicInlineSize
+          && ['absolute', 'fixed', 'sticky'].includes(expectedStyles.position ?? '')
+        const positionedAnchor = ['absolute', 'fixed', 'sticky'].includes(expectedStyles.position ?? '')
+        const expectedContainingBlockOffset = expected.containingBlockOffsets?.[index]
+        const actualContainingBlockOffset = actual.containingBlockOffsets?.[index]
+        const expectedDirectionalProperties = ['top', 'right', 'bottom', 'left', 'inset']
+          .filter((property) => expectedStyles[property] !== undefined && expectedStyles[property] !== 'auto')
+        const positionedDecorationWithStableInsets = positionedAnchor
+          && /(?:^|[-_.#])(?:accent|decoration|doodle|ornament|pin|post-it|shape)(?:$|[-_.:# 0-9])/iu.test(expected.selector)
+          && (
+            expected.containingBlockOffsets === undefined
+            || ((intrinsicBlockSize || intrinsicInlineSize) && Boolean(expectedStyles.transform && expectedStyles.transform !== 'none'))
+          )
+          && (
+            expectedDirectionalProperties.length > 0
+              ? expectedDirectionalProperties.every((property) => actualStyles[property] === expectedStyles[property])
+              // A legacy repeated base-class anchor can omit the subtype's
+              // inset properties. Its subtype anchors still verify those
+              // exact declarations, so the base anchor contributes only
+              // count/size/non-geometric style evidence.
+              : expected.containingBlockOffsets === undefined
+                && /(?:^|[-_.#])post-it(?:$|[-_.:# 0-9])/iu.test(expected.selector)
+          )
+        const containingBlockOffsetsUsable = positionedAnchor
+          && expectedContainingBlockOffset != null
+          && actualContainingBlockOffset != null
+          // Intrinsic translated boxes serialize a used transform that changes
+          // with replacement copy. Their established center/edge policies are
+          // more authoritative than the transformed bounding-box gap.
+          && (!(intrinsicBlockSize || intrinsicInlineSize) || !expectedStyles.transform || expectedStyles.transform === 'none')
+        const positionToleranceX = Math.max(4 / expectedViewport.width, 0.01)
+        const positionToleranceY = Math.max(4 / expectedViewport.height, 0.01)
+        const relativeHorizontalPositionMatches = containingBlockOffsetsUsable
+          ? explicitRightAnchor
+            ? Math.abs(actualContainingBlockOffset.right - expectedContainingBlockOffset.right) <= positionToleranceX
+            : Math.abs(actualContainingBlockOffset.left - expectedContainingBlockOffset.left) <= positionToleranceX
+          : undefined
+        const relativeVerticalPositionMatches = containingBlockOffsetsUsable
+          ? explicitBottomAnchor
+            ? Math.abs(actualContainingBlockOffset.bottom - expectedContainingBlockOffset.bottom) <= positionToleranceY
+            : Math.abs(actualContainingBlockOffset.top - expectedContainingBlockOffset.top) <= positionToleranceY
+          : undefined
+        const horizontalPositionMatches = positionedDecorationWithStableInsets
           ? true
+          : relativeHorizontalPositionMatches ?? (fixedSizeInFlow
+          ? Math.abs(actualRect.x - expectedRect.x) <= Math.max(4 / expectedViewport.width, 0.01)
+          : positionedIntrinsicInline && explicitLeftAnchor
+            ? Math.abs(actualRect.x - expectedRect.x) <= Math.max(4 / expectedViewport.width, 0.01)
+          : positionedIntrinsicInline && explicitRightAnchor
+            ? Math.abs(
+                (actualRect.x + actualRect.width) - (expectedRect.x + expectedRect.width),
+              ) <= Math.max(4 / expectedViewport.width, 0.01)
+          : positionedIntrinsicInline
+            ? Math.min(
+                Math.abs(actualRect.x - expectedRect.x),
+                Math.abs(
+                  (actualRect.x + actualRect.width) - (expectedRect.x + expectedRect.width),
+                ),
+              ) <= Math.max(4 / expectedViewport.width, 0.01)
+          : fullyIntrinsicSize
+            ? true
+          : intrinsicInlineSize && !intrinsicTextChrome
+            ? true
           : centeredIntrinsicTextChrome
             ? Math.abs(actualCenterX - expectedCenterX) <= Math.max(4 / expectedViewport.width, 0.01)
-            : Math.abs(actualRect.x - expectedRect.x) <= Math.max(4 / expectedViewport.width, 0.01)
-        const verticalPositionMatches = intrinsicBlockSize
-          ? positionedIntrinsicBlock
+            : Math.abs(actualRect.x - expectedRect.x) <= Math.max(4 / expectedViewport.width, 0.01))
+        const verticalPositionMatches = positionedDecorationWithStableInsets
+          ? true
+          : relativeVerticalPositionMatches ?? (fixedSizeInFlow || unpositionedIntrinsicFlowItem
+          ? true
+          : intrinsicBlockSize
+            ? positionedIntrinsicBlock
             ? centeredIntrinsicBlock
               ? Math.abs(actualCenterY - expectedCenterY) <= Math.max(4 / expectedViewport.height, 0.01)
-              : bottomAnchoredTextChrome || explicitBottomAnchor
+              : bottomAnchoredTextChrome || explicitBottomAnchor || inferredStableBottomAnchor
               ? Math.abs(actualBottom - expectedBottom) <= Math.max(4 / expectedViewport.height, 0.01)
+              : fullyIntrinsicSize
+                ? Math.min(
+                    Math.abs(actualRect.y - expectedRect.y),
+                    Math.abs(actualBottom - expectedBottom),
+                  ) <= Math.max(4 / expectedViewport.height, 0.01)
               : Math.abs(actualRect.y - expectedRect.y) <= Math.max(4 / expectedViewport.height, 0.01)
             : fullyIntrinsicSize
               ? Math.min(
@@ -1957,24 +2622,60 @@ function compareRenderedReferencePhase(
                 Math.abs(actualBottom - expectedBottom),
               ) <= Math.max(4 / expectedViewport.height, 0.01)
               : true
-          : Math.abs(actualRect.y - expectedRect.y) <= Math.max(4 / expectedViewport.height, 0.01)
+          : Math.abs(actualRect.y - expectedRect.y) <= Math.max(4 / expectedViewport.height, 0.01))
         check(
           horizontalPositionMatches && verticalPositionMatches,
-          `render ${phase} ${expected.selector}[${index}] position expected ${renderedRectSummary(expectedRect)} but found ${renderedRectSummary(actualRect)}`,
+          `render ${phase} ${expected.selector}[${index}] position expected ${renderedRectSummary(expectedRect)} but found ${renderedRectSummary(actualRect)}${renderedPositionRepairHint({
+            expectedRect,
+            actualRect,
+            expectedStyles,
+            actualStyles,
+            viewport: expectedViewport,
+            centeredIntrinsicBlock,
+            explicitBottomAnchor,
+            explicitRightAnchor,
+            fullyIntrinsicSize,
+            expectedContainingBlockOffset: containingBlockOffsetsUsable ? expectedContainingBlockOffset : undefined,
+            actualContainingBlockOffset: containingBlockOffsetsUsable ? actualContainingBlockOffset : undefined,
+            horizontalPositionMatches,
+            verticalPositionMatches,
+          })}`,
         )
-      } else if (intrinsicBlockSize) {
+      } else if (!pseudoGeometryUnavailable && intrinsicBlockSize) {
         check(
           Math.abs(actualRect.x - expectedRect.x) <= Math.max(4 / expectedViewport.width, 0.01),
           `render ${phase} ${expected.selector}[${index}] horizontal position expected ${renderedRectSummary(expectedRect)} but found ${renderedRectSummary(actualRect)}`,
         )
       }
       for (const [property, expectedValue] of Object.entries(expectedStyles)) {
+        if (expected.authoredBox && ['top','right','bottom','left','width','height','max-width','max-height','min-width','min-height','grid-template-columns'].includes(property)) {
+          check(actualStyles[property] === expectedValue,
+            `render ${phase} ${expected.selector}[${index}] authored ${property} expected ${expectedValue} but found ${actualStyles[property] ?? 'missing'}`)
+          continue
+        }
         if (variableProgressFill && property === 'width') continue
+        // `position:relative` in a template backed by an external custom
+        // element and `position:absolute` in a self-contained replacement are
+        // implementation details when the root occupies the same strict
+        // viewport rect. The presentation-state invariant above independently
+        // proves that exactly one active page owns the stage.
+        if (runtimeManagedSlideRoot && ['position', 'transform'].includes(property)) continue
         // Computed width/height are used values, not authored CSS. Rect
         // geometry above already verifies fixed structure, while the static
         // source gate verifies the exact declarations. Comparing these used
         // strings again makes translated text look like template drift.
         if (['width', 'height', 'min-width', 'min-height', 'max-width', 'max-height'].includes(property)) continue
+        // For intrinsic positioned text, computed opposite-edge offsets and
+        // inset are used values derived from the replacement copy's width or
+        // height. Geometry above validates the stable authored edge; static
+        // source verification validates any explicit anchor declarations.
+        if ((intrinsicBlockSize || intrinsicInlineSize) && ['top', 'right', 'bottom', 'left', 'inset'].includes(property)) continue
+        // Pseudo inset values are resolved against the host's replacement-copy
+        // geometry and Chromium reports those used pixels, even though the
+        // authored percentage/inset declaration is unchanged. Static source
+        // verification owns these declarations; the host rect cannot provide
+        // a valid pseudo box to disambiguate them here.
+        if (pseudoGeometryUnavailable && ['top', 'right', 'bottom', 'left', 'inset'].includes(property)) continue
         if (intrinsicBlockSize && property === 'grid-template-rows') continue
         // `translateX(-50%)` is serialized by computed style as a pixel
         // matrix derived from the element's intrinsic text width. Static
@@ -1999,7 +2700,7 @@ function compareRenderedReferencePhase(
       // where its localized glyphs happen to fall. It is not an occlusion
       // signal: the empty part of a runner legitimately resolves to the slide
       // behind it. Painted structural surfaces retain the strict probe below.
-      if (expectedOcclusion >= 0.4 && !intrinsicTextChrome && !intrinsicInlineSize) {
+      if (!pseudoGeometryUnavailable && expectedOcclusion >= 0.4 && !intrinsicTextChrome && !intrinsicInlineSize) {
         check(
           actualOcclusion >= Math.max(0.2, expectedOcclusion - 0.25),
           `render ${phase} ${expected.selector}[${index}] is occluded (${actualOcclusion.toFixed(2)}; reference ${expectedOcclusion.toFixed(2)})`,
@@ -2028,15 +2729,38 @@ function compareRenderedReferencePhase(
     `render ${phase} viewport-covering painted surfaces expected ${expectedPhase.overlayProbes.length} but found ${actualPhase.overlayProbes.length}`,
   )
   const overlaySamples = Math.min(expectedPhase.overlayProbes.length, actualPhase.overlayProbes.length)
+  const runtimeManagedFullViewportRoot = expectedAnchors.some((expected) => {
+    if (!options.runtimeManagedSlideSelectors?.has(expected.selector)) return false
+    const actual = actualBySelector.get(expected.selector)
+    return Boolean(actual
+      && expected.rects.some((rect) => rect.width >= 0.98 && rect.height >= 0.98)
+      && actual.rects.some((rect) => rect.width >= 0.98 && rect.height >= 0.98))
+  })
   for (let index = 0; index < overlaySamples; index += 1) {
     const expected = expectedPhase.overlayProbes[index]
     const actual = actualPhase.overlayProbes[index]
     check(actual.tag === expected.tag, `render ${phase} painted surface[${index}] tag expected ${expected.tag} but found ${actual.tag}`)
     check(Math.abs(actual.coverage - expected.coverage) <= 0.02, `render ${phase} painted surface[${index}] coverage expected ${expected.coverage} but found ${actual.coverage}`)
     for (const property of ['position', 'backgroundColor', 'backgroundImage', 'opacity', 'zIndex'] as const) {
+      if (
+        property === 'position'
+        && runtimeManagedFullViewportRoot
+        && expected.tag === actual.tag
+        && expected.coverage >= 0.98
+        && actual.coverage >= 0.98
+      ) continue
       check(actual[property] === expected[property], `render ${phase} painted surface[${index}] ${property} expected "${expected[property]}" but found "${actual[property]}"`)
     }
   }
+  // Preserve causal source/geometry diagnoses in the bounded per-interior
+  // repair projection. Moving a fixed source element can also create several
+  // text collisions; those symptoms must not displace the exact top/position
+  // drift with instructions to shorten otherwise valid copy. Collision-only
+  // defects still get the full diagnostic surface and always affect scoring.
+  const textLayout = renderedTextLayoutFindings(expectedPhase.textLayout, actualPhase.textLayout)
+  const textLayoutGaps = [...textLayout.defects, ...textLayout.observationGaps]
+  check(textLayoutGaps.length === 0, `render ${phase} ${textLayoutGaps[0]}`)
+  for (const gap of textLayoutGaps.slice(1)) check(false, `render ${phase} ${gap}`)
   const score = checked > 0 ? Math.round((matched / checked) * 1_000) / 10 : 0
   return {
     fidelity: violations.length === 0 ? 'pass' : 'mismatch',
@@ -2045,6 +2769,7 @@ function compareRenderedReferencePhase(
     matched,
     score,
     violations,
+    observationGapCount: textLayout.observationGaps.length,
     url,
     viewport: actualViewport,
     pageEpoch,
@@ -2108,6 +2833,95 @@ function halfHeightCenteredTransform(
 
 function renderedRectSummary(rect: { x: number; y: number; width: number; height: number }): string {
   return `[${rect.x.toFixed(4)},${rect.y.toFixed(4)},${rect.width.toFixed(4)},${rect.height.toFixed(4)}]`
+}
+
+function renderedPositionRepairHint(options: {
+  expectedRect: { x: number; y: number; width: number; height: number }
+  actualRect: { x: number; y: number; width: number; height: number }
+  expectedStyles: Record<string, string>
+  actualStyles: Record<string, string>
+  viewport: { width: number; height: number }
+  centeredIntrinsicBlock: boolean
+  explicitBottomAnchor: boolean
+  explicitRightAnchor: boolean
+  fullyIntrinsicSize: boolean
+  expectedContainingBlockOffset?: RenderedReferenceContainingBlockOffsetProfile | null
+  actualContainingBlockOffset?: RenderedReferenceContainingBlockOffsetProfile | null
+  horizontalPositionMatches: boolean
+  verticalPositionMatches: boolean
+}): string {
+  const {
+    expectedRect,
+    actualRect,
+    expectedStyles,
+    actualStyles,
+    viewport,
+    centeredIntrinsicBlock,
+    explicitBottomAnchor,
+    explicitRightAnchor,
+    fullyIntrinsicSize,
+    expectedContainingBlockOffset,
+    actualContainingBlockOffset,
+    horizontalPositionMatches,
+    verticalPositionMatches,
+  } = options
+  if (!verticalPositionMatches) {
+    const expectedTop = expectedRect.y
+    const actualTop = actualRect.y
+    const expectedBottom = expectedRect.y + expectedRect.height
+    const actualBottom = actualRect.y + actualRect.height
+    const inferredBottomAnchor = fullyIntrinsicSize
+      && !centeredIntrinsicBlock
+      && !explicitBottomAnchor
+      && Math.abs(actualBottom - expectedBottom) < Math.abs(actualTop - expectedTop)
+    const usesBottomEdge = explicitBottomAnchor || inferredBottomAnchor
+    const expectedCoordinate = centeredIntrinsicBlock
+      ? expectedRect.y + expectedRect.height / 2
+      : usesBottomEdge
+        ? expectedBottom
+        : expectedTop
+    const actualCoordinate = centeredIntrinsicBlock
+      ? actualRect.y + actualRect.height / 2
+      : usesBottomEdge
+        ? actualBottom
+        : actualTop
+    const deltaPx = expectedContainingBlockOffset && actualContainingBlockOffset && !centeredIntrinsicBlock
+      ? (explicitBottomAnchor
+          ? -(actualContainingBlockOffset.bottom - expectedContainingBlockOffset.bottom)
+          : actualContainingBlockOffset.top - expectedContainingBlockOffset.top) * viewport.height
+      : (actualCoordinate - expectedCoordinate) * viewport.height
+    const magnitude = Math.round(Math.abs(deltaPx) * 10) / 10
+    const edge = centeredIntrinsicBlock ? 'vertical center' : usesBottomEdge ? 'bottom edge' : 'top edge'
+    const direction = deltaPx < 0 ? 'too high' : 'too low'
+    const anchorProperty = centeredIntrinsicBlock ? undefined : usesBottomEdge ? 'bottom' : 'top'
+    const expectedAnchor = anchorProperty ? expectedStyles[anchorProperty] : undefined
+    const actualAnchor = anchorProperty ? actualStyles[anchorProperty] : undefined
+    const expectedMargin = expectedStyles.margin
+    const actualMargin = actualStyles.margin
+    if (anchorProperty && expectedAnchor && expectedAnchor === actualAnchor) {
+      const margin = expectedMargin !== undefined && actualMargin !== undefined && expectedMargin !== actualMargin
+        ? `; computed margin expected "${expectedMargin}" but found "${actualMargin}"`
+        : ''
+      return `; candidate ${edge} is ${magnitude}px ${direction}. Computed ${anchorProperty} already matches "${expectedAnchor}"${margin}; preserve that anchor and fix the differing box-model or semantic-tag default instead.`
+    }
+    if (anchorProperty && expectedAnchor && actualAnchor) {
+      const adjustment = usesBottomEdge
+        ? deltaPx < 0 ? 'decrease' : 'increase'
+        : deltaPx < 0 ? 'increase' : 'decrease'
+      return `; candidate ${edge} is ${magnitude}px ${direction}. ${anchorProperty} expected "${expectedAnchor}" but found "${actualAnchor}"; ${adjustment} the candidate ${anchorProperty} to move it ${deltaPx < 0 ? 'down' : 'up'}.`
+    }
+    return `; candidate ${edge} is ${magnitude}px ${direction}. Coordinates use the viewport top-left origin, so move it ${deltaPx < 0 ? 'down' : 'up'}; do not invert the y direction.`
+  }
+  if (!horizontalPositionMatches) {
+    const deltaPx = expectedContainingBlockOffset && actualContainingBlockOffset
+      ? (explicitRightAnchor
+          ? -(actualContainingBlockOffset.right - expectedContainingBlockOffset.right)
+          : actualContainingBlockOffset.left - expectedContainingBlockOffset.left) * viewport.width
+      : (actualRect.x - expectedRect.x) * viewport.width
+    const magnitude = Math.round(Math.abs(deltaPx) * 10) / 10
+    return `; candidate left edge is ${magnitude}px too far ${deltaPx < 0 ? 'left' : 'right'}; move it ${deltaPx < 0 ? 'right' : 'left'}.`
+  }
+  return ''
 }
 
 function previewOrigin(rawUrl: string): string {

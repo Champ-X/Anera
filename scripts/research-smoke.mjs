@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 

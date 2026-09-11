@@ -33,6 +33,15 @@ describe('Vite development proxy', () => {
 })
 
 describe('Arena-shaped desktop message transport', () => {
+  it('carries explicit models on follow-up and resume, preserving model-less resume compatibility', async () => {
+    const requests = captureRequests()
+    await api.send('ses_model', 'Follow up', [], 'deepseek-v4-pro', [])
+    await api.resume('ses_model', 'deepseek-flash')
+    await api.resume('ses_model')
+    expect(requests.map(({ body }) => body.model)).toEqual(['deepseek-v4-pro', 'deepseek-flash', undefined])
+    expect(requests[1]?.url).toBe('/api/sessions/ses_model/resume')
+    expect(requests[2]?.body).toEqual({})
+  })
   it('identifies the failed method and route when a proxy returns no JSON error', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 404 })))
 

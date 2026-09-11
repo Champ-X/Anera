@@ -4,6 +4,7 @@ import type { SessionEvent, SessionSnapshot, SessionSummary } from '../shared/ty
 import {
   AGENT_DRAFT_PATH,
   ApprovalCard,
+  ArtifactCard,
   ArenaToolGroup,
   AssistantActivityRow,
   AskUserHitl,
@@ -12,6 +13,7 @@ import {
   CONVERSATION_NEAR_BOTTOM_PX,
   HISTORY_SEARCH_PATH,
   applyEventToSnapshot,
+  applyEventsToSnapshot,
   commandToolPresentation,
   codingErrorMessage,
   conversationDistanceFromBottom,
@@ -49,6 +51,7 @@ import {
   submitApprovalDecision,
   submitWebsiteRestart,
   toolLabel,
+  ToolRow,
   validHistorySearchReturnPath,
   websiteStatusLabel,
   workspacePersistenceFromEvent,
@@ -64,6 +67,18 @@ import {
 } from './App.js'
 
 describe('streamed file-write projection', () => {
+  it('offers a keyboard-accessible HTML viewer while keeping the thumbnail out of the tab order', () => {
+    const artifact = {
+      id: 'artifact_preview', sessionId: 'ses_fixture', name: 'Weekly news', path: 'weekly.html', kind: 'website' as const,
+      mime: 'text/html', bytes: 1200, createdAt: '2026-09-07T08:00:00.000Z',
+      downloadUrl: '/download/weekly.html', previewUrl: '/preview/weekly.html',
+    }
+    const markup = renderToStaticMarkup(<ArtifactCard artifact={artifact} onPreview={() => undefined} />)
+    expect(markup).toContain('Open Weekly news in viewer')
+    expect(markup).toContain('title="Inline preview of Weekly news"')
+    expect(markup).toContain('sandbox="allow-scripts allow-modals allow-downloads"')
+    expect(markup).toContain('tabindex="-1"')
+  })
   it('decodes partial escaped JSON strings without exposing an invalid final parse', () => {
     expect(partialJsonStringField('{"path":"slides.html","content":"line 1\\n你', 'path')).toEqual({
       value: 'slides.html', complete: true,
@@ -169,6 +184,56 @@ describe('streamed file-write projection', () => {
     const settledTimeline = projectTimeline(settled)
     expect(settledTimeline.some((item) => item.kind === 'tool-draft')).toBe(false)
     expect(settledTimeline[0]).toMatchObject({ kind: 'tool-group', variant: 'files', tools: [{ name: 'write_file', status: 'succeeded' }] })
+  })
+})
+
+describe('reference composition timeline', () => {
+  const args = {
+    path: 'weekly.html', title: '本周娱乐', source_sha256: 'a'.repeat(64),
+    slides: [{ variant: 'v1', label: '封面', texts: { t1: '本周娱乐' } }],
+  }
+
+  it('waits for durable composition events without inventing an HTML write draft or byte count', () => {
+    const streamed = fixture([
+      event(1, 'assistant.started', { step: 1 }, 'step_compose'),
+      event(2, 'assistant.tool_call.delta', {
+        index: 0, nameDelta: 'compose_reference_html', argumentsDelta: JSON.stringify(args),
+      }, 'step_compose'),
+    ])
+    const streamedTimeline = projectTimeline(streamed)
+    expect(streamedTimeline.some((item) => item.kind === 'tool-draft')).toBe(false)
+    expect(workspaceWriteDraftsFromTimeline(streamedTimeline)).toEqual([])
+    expect(streamed.workspace).toEqual([])
+    const call = { id: 'call_compose', name: 'compose_reference_html', arguments: args }
+    const completed = fixture([
+      ...streamed.events,
+      event(3, 'tool.started', { call }, 'step_compose', call.id),
+      event(4, 'tool.completed', { call, result: '{"status":"success","path":"weekly.html"}', isError: false }, 'step_compose', call.id),
+    ])
+    expect(projectTimeline(completed)).toEqual([
+      expect.objectContaining({ kind: 'tool-group', variant: 'files', tools: [
+        expect.objectContaining({ name: 'compose_reference_html', status: 'succeeded' }),
+      ] }),
+    ])
+  })
+
+  it('uses the existing file operation row without a fabricated generated line count', () => {
+    const markup = renderToStaticMarkup(<ToolRow item={{
+      kind: 'tool', key: 'compose', name: 'compose_reference_html', args, status: 'succeeded',
+    }} />)
+    expect(markup).toContain('Compose')
+    expect(markup).toContain('<code>weekly.html</code>')
+    expect(markup).toContain('lucide-file-code')
+    expect(markup).not.toContain('lucide-terminal')
+    expect(markup).not.toContain(' lines')
+    expect(markup).not.toContain('streaming-file-write')
+  })
+
+  it('distinguishes running, success, failure, and timeout in composition labels', () => {
+    expect(toolLabel('compose_reference_html', args, 'running')).toBe('Composing weekly.html')
+    expect(toolLabel('compose_reference_html', args, 'succeeded')).toBe('Composed weekly.html')
+    expect(toolLabel('compose_reference_html', args, 'failed')).toBe('Composition failed: weekly.html')
+    expect(toolLabel('compose_reference_html', args, 'timed_out')).toBe('Composition stopped: weekly.html')
   })
 })
 
@@ -1297,8 +1362,9 @@ describe('client timeline projection', () => {
 
     const timeline = projectTimeline(snapshot)
     expect(timeline.filter((item) => item.kind === 'final')).toEqual([])
-    expect(timeline.filter((item) => item.kind === 'thought')).toEqual([
-      { kind: 'thought', key: 'thought-step_tool-progress', label: 'Thought for less than a second', content: 'I will inspect the input.', running: false },
+    expect(timeline.filter((item) => item.kind === 'thought')).toEqual([])
+    expect(timeline.filter((item) => item.kind === 'progress')).toEqual([
+      { kind: 'progress', key: 'progress-step_tool', content: 'I will inspect the input.', streaming: false },
     ])
     expect(timeline.filter((item) => item.kind === 'exploration')).toEqual([
       {
@@ -1329,6 +1395,26 @@ describe('client timeline projection', () => {
       feedback: null,
       messageEventId: 'evt_00000000000000000004',
     }])
+  })
+
+  it('streams progress separately from reasoning and settles the complete narration without duplicating it', () => {
+    const events = [
+      event(1, 'assistant.thought.started', {}, 'step_narration'),
+      event(2, 'assistant.thought.delta', { delta: 'Compare the sources.' }, 'step_narration'),
+      event(3, 'assistant.thought.completed', { text: 'Compare the sources.' }, 'step_narration'),
+      event(4, 'assistant.progress.delta', { delta: '正在核对' }, 'step_narration'),
+      event(5, 'assistant.progress.delta', { delta: '新闻来源。' }, 'step_narration'),
+    ]
+    const live = fixture(events)
+    live.session.status = 'running'
+    expect(projectTimeline(live).filter((item) => item.kind === 'progress')).toEqual([
+      { kind: 'progress', key: 'progress-step_narration', content: '正在核对新闻来源。', streaming: true },
+    ])
+    const completed = fixture([...events, event(6, 'assistant.progress', { content: '正在核对新闻来源。' }, 'step_narration')])
+    expect(projectTimeline(completed).filter((item) => item.kind === 'progress')).toHaveLength(1)
+    expect(projectTimeline(completed).find((item) => item.kind === 'progress')).toMatchObject({ streaming: false })
+    expect(projectTimeline(completed).find((item) => item.kind === 'thought')).toMatchObject({ content: 'Compare the sources.', running: false })
+    expect(projectTimeline(completed).some((item) => item.kind === 'final')).toBe(false)
   })
 
   it('never leaves a Thought running after a completed terminal snapshot', () => {
@@ -1649,6 +1735,36 @@ describe('live snapshot projection', () => {
     const nonAtomic = fixture([liveEvent])
     nonAtomic.website = { status: 'stopped', updatedAt: '2026-08-28T00:00:00.000Z', restartCount: 0 }
     expect(reconcileSnapshot(undefined, nonAtomic).website).toEqual(running)
+  })
+
+  it('batches streamed deltas and terminal boundaries in durable order without losing text', () => {
+    const events = [
+      event(1, 'assistant.started', { step: 1 }, 'step_batch'),
+      event(2, 'assistant.progress.delta', { delta: '正在' }, 'step_batch'),
+      event(3, 'assistant.progress.delta', { delta: '核查来源。' }, 'step_batch'),
+      event(4, 'assistant.progress', { content: '正在核查来源。' }, 'step_batch'),
+      event(5, 'run.status', { status: 'completed' }, 'step_batch'),
+    ]
+    const snapshot = fixture([])
+    const batch = applyEventsToSnapshot(snapshot, [events[4], events[2], events[0], events[1], events[3], events[2]])
+    expect(batch).toEqual(events.reduce(applyEventToSnapshot, snapshot))
+    expect(batch.events).toEqual(events)
+    expect(projectTimeline(batch).filter((item) => item.kind === 'progress')).toEqual([
+      expect.objectContaining({ content: '正在核查来源。', streaming: false }),
+    ])
+  })
+
+  it('keeps stale replay for history but rejects duplicate and cross-session projections', () => {
+    const stopped = { status: 'stopped' as const, updatedAt: '2026-08-28T00:00:00.003Z', restartCount: 0 }
+    const stop = event(3, 'website.updated', { website: stopped }, 'step_batch')
+    const snapshot = applyEventToSnapshot(fixture([]), stop)
+    const older = event(2, 'website.updated', { website: { ...stopped, status: 'running' } }, 'step_batch')
+    const foreign = { ...event(4, 'run.status', { status: 'failed' }, 'step_batch'), sessionId: 'ses_foreign' }
+    const batch = applyEventsToSnapshot(snapshot, [stop, older, older, foreign])
+    expect(batch.website).toEqual(stopped)
+    expect(batch.events).toEqual([older, stop])
+    expect(batch.session).toEqual(snapshot.session)
+    expect(applyEventsToSnapshot(batch, [stop, foreign])).toBe(batch)
   })
 })
 

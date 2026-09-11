@@ -8,7 +8,11 @@ const referencePath = args.values.reference || args.positionals[0]
 const candidatePath = args.values.candidate || args.positionals[1]
 if (!referencePath || !candidatePath) usage('Both --reference and --candidate are required')
 
-const report = diffCanonicalTraces(loadCanonicalTrace(referencePath), loadCanonicalTrace(candidatePath), {
+const [referenceTrace, candidateTrace] = await Promise.all([
+  loadCanonicalTrace(referencePath),
+  loadCanonicalTrace(candidatePath),
+])
+const report = diffCanonicalTraces(referenceTrace, candidateTrace, {
   referenceSide: args.values['reference-side'],
   candidateSide: args.values['candidate-side'],
 })

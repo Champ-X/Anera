@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 const base = process.env.ANERA_BASE_URL || 'http://127.0.0.1:4174'
 const marker = 'PAGE-CURSOR-OK-731'
 const document = minimalPdf([`${'A'.repeat(125_000)}${marker}`])

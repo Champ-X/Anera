@@ -1,0 +1,3 @@
+# Immutable upstream fixture: preserve source whitespace for SHA-256 provenance.
+# Other whitespace checks and all application-source checks remain enabled.
+src/server/fixtures/pink-script-template.fixture.html whitespace=-blank-at-eol

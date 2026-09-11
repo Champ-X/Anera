@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 const base = process.env.ANERA_TEST_URL || 'http://127.0.0.1:4174'
 const created = await fetch(`${base}/api/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then((response) => response.json())
 const id = created.session.id

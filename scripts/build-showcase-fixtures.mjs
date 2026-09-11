@@ -1,6 +1,7 @@
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { readHydratedSessionEventLog } from '../src/server/session-store.js'
 
 const projectRoot = resolve(import.meta.dirname, '..')
 const runtimeRoot = join(projectRoot, '.anera', 'sessions')
@@ -131,10 +132,7 @@ async function workspaceTree(root, current = root) {
 async function buildDemo(definition) {
   const sessionRoot = join(runtimeRoot, definition.id)
   const state = JSON.parse(await readFile(join(sessionRoot, 'state.json'), 'utf8'))
-  const events = (await readFile(join(sessionRoot, 'events.jsonl'), 'utf8'))
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line))
+  const events = await readHydratedSessionEventLog(join(sessionRoot, 'events.jsonl'))
   const workspaceRoot = join(sessionRoot, 'workspace')
   const files = await workspaceFiles(workspaceRoot)
   const tree = await workspaceTree(workspaceRoot)

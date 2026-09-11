@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { appendFile, chmod, link, lstat, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, link, lstat, mkdir, opendir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, resolve } from 'node:path'
 import type {
   ArtifactRecord,
@@ -32,6 +32,9 @@ import { createId } from './ids.js'
 import { validateAgentUploadBytes } from './agent-upload-validation.js'
 import { terminateRecoveredManagedProcess, type ManagedProcessRecoveryResult } from './process-manager.js'
 import type { DurableReferenceStyleContract } from './reference-style.js'
+import { commitReferenceRuntimeEvidence, resolveReferenceRuntimeEvidence } from './reference-runtime-evidence.js'
+import type { ReferenceTemplateDependency, ReferenceTemplateRuntimeEvidence } from './reference-template.js'
+import type { DurableReferenceSourceResolution } from './reference-source-resolution.js'
 import { findSensitiveValues, redactDisplayValue, redactText } from './redaction.js'
 import {
   assertNoSymlinkTraversal,
@@ -52,6 +55,9 @@ import {
 } from './reference-fonts.js'
 
 export interface StoredSession {
+  /** Private, source-bound review feedback; survives context compaction/resume. */
+  activeArtifactReviewRepair?: import('./visual-artifact-review.js').ArtifactReviewRepair
+  activeArtifactContentReviewReceipt?: import('./visual-artifact-review.js').ArtifactContentReviewReceipt
   summary: SessionSummary
   messages: ModelMessage[]
   /** Durable boundary between materializing a new Session and publishing session.created. */
@@ -100,6 +106,12 @@ export interface StoredSession {
    * this materialized projection.
    */
   activeTaskResearchEvidence?: DurableResearchEvidenceLedger
+  /**
+   * Server-private slide-count contract derived only from real user-authored
+   * task text. Provider-authored compaction summaries may describe individual
+   * slide numbers, so they must never be reparsed as the requested deck size.
+   */
+  activeVisualWebSlidePlan?: DurableVisualWebSlidePlan
   /** Durable identity of the current task's canonical visual HTML bytes. */
   activeVisualArtifact?: DurableVisualArtifactLedger
   /**
@@ -107,6 +119,12 @@ export interface StoredSession {
    * messages, this survives semantic context compaction and resume intact.
    */
   activeReferenceStyleContract?: DurableReferenceStyleContract
+  /**
+   * Bounded, task-local resolution state for an external visual reference.
+   * This remains separate from the StyleContract: failed concrete-source
+   * candidates must survive phase changes, provider compaction, and restart.
+   */
+  activeReferenceSourceResolution?: DurableReferenceSourceResolution
   /** Unique commit generation used to prevent stale integrity checks invalidating a newer re-record. */
   activeReferenceStyleEvidenceGeneration?: string
   /**
@@ -144,6 +162,12 @@ export interface StoredSession {
    * the same provider response twice.
    */
   usageSettlements?: Record<string, DurableUsageSettlement>
+  /**
+   * Write-ahead reservations for physical Agent/compaction HTTP dispatches.
+   * A reservation is intentionally never rolled back: a process can die after
+   * the provider received the request but before local usage is observable.
+   */
+  agentModelRequestReservations?: Record<string, DurableAgentModelRequestReservationJournal>
   plan: PlanState | null
   artifacts: ArtifactRecord[]
   processes: ProcessRecord[]
@@ -164,6 +188,20 @@ export interface DurableResearchEvidenceLedger {
   schemaVersion: 1
   sourceUrls: string[]
   toolCallIds: string[]
+  /** Additive migration: old URL-only ledgers do not attest to page-body reads. */
+  pageReads?: import('./research-evidence.js').ResearchPageRead[]
+  /** An executed fetch failed; its incomplete cursor may be replaced by another source. */
+  unavailableSourceUrls?: string[]
+  /** Excerpt-backed item plan accepted by the research completion boundary. */
+  brief?: import('./research-brief.js').ResearchBrief
+  /** Controller-owned provenance of the recorded interpretation, not sources. */
+  briefTaskBinding?: import('./task-plan.js').TaskPlanBinding
+}
+
+export interface DurableVisualWebSlidePlan {
+  schemaVersion: 1
+  count: number
+  explicitlyRequested: boolean
 }
 
 export interface DurableVisualArtifactLedger {
@@ -182,6 +220,7 @@ export type ReferenceVisualEvidencePhase = 'cover' | 'content' | 'closing'
 export type ReferenceStyleEvidenceInvalidationReason =
   | 'font_evidence_missing_or_invalid'
   | 'visual_evidence_missing_or_invalid'
+  | 'runtime_evidence_missing_or_invalid'
 
 export interface DurableReferenceStyleEvidenceInvalidation {
   version: 1
@@ -271,6 +310,39 @@ export interface DurableVisualNoProgressState {
   outcomeDigest: string
   consecutiveCount: number
   recoveryAttempted: boolean
+  /**
+   * Bounded, server-private liveness history. Legacy checkpoints omit this
+   * field and are upgraded from the scalar fields above on the next
+   * observation. Keeping more than the last few actions is what lets the
+   * Harness recognize alternating A-B and A-B-C loops instead of only an
+   * immediately repeated call.
+   */
+  history?: DurableVisualNoProgressObservation[]
+  /** Durable-work digest that resets liveness evidence after real progress. */
+  progressDigest?: string
+  /** Number of automatic liveness recoveries since the last real progress. */
+  recoveryCount?: number
+  /**
+   * Comparable observations collected after the latest recovery. Legacy
+   * states omit this and receive a fresh window on their next observation.
+   */
+  observationsSinceRecovery?: number
+  /** Description of the repeating suffix that most recently tripped the guard. */
+  cyclePeriod?: number
+  cycleOccurrences?: number
+  /** Independent trusted verification rounds, preserved through phase churn. */
+  verificationProgress?: import('./visual-verification-progress.js').DurableVisualVerificationProgress
+  /** A verifier recovery starts a fresh short-action window as well. */
+  restartActionWindow?: boolean
+}
+
+export interface DurableVisualNoProgressObservation {
+  phase: string
+  callSignature: string
+  callNames: string[]
+  outcomeDigest: string
+  /** Durable workflow state reached by this action. */
+  progressDigest?: string
 }
 
 export interface StoredVoiceSelection {
@@ -342,6 +414,9 @@ export interface CommitWorkspaceWriteOptions {
   context?: Pick<SessionEvent, 'turnId' | 'stepId' | 'callId'>
   /** Optional compare-before-write guard used by edit_file. */
   expectedBefore?: Buffer
+  /** Source-bound replacement admission guard. Checked while preparing the
+   * durable mutation; it does not alter later crash replay/materialization. */
+  expectedReferenceStyleSha256?: string
 }
 
 export interface CommitWorkspaceDeleteOptions {
@@ -589,6 +664,22 @@ export interface ContextPressureAnchor {
 
 export type DurableUsageSource = 'agent' | 'vision' | 'image_generation' | 'speech' | 'compaction'
 
+export interface DurableAgentModelRequestReservationAttempt {
+  id: string
+  stepId: string
+  source: 'agent' | 'compaction'
+  reservedAt: string
+}
+
+export interface DurableAgentModelRequestReservationJournal {
+  schemaVersion: 1
+  turnId: string
+  /** Monotonic count, initialized from legacy settled requests when needed. */
+  reservedRequests: number
+  /** Bounded diagnostic tail; reservedRequests remains authoritative. */
+  attempts: DurableAgentModelRequestReservationAttempt[]
+}
+
 export interface DurableUsageSettlement {
   id: string
   source: DurableUsageSource
@@ -628,6 +719,80 @@ export interface CreateSessionOptions {
 
 export type EventListener = (event: SessionEvent) => void
 
+const EVENT_PAYLOAD_INLINE_MAX_BYTES = 64 * 1024
+const EVENT_PAYLOAD_SCHEMA_VERSION = 1 as const
+const EVENT_PAYLOAD_TEXT_ENCODING = 'utf8' as const
+const EVENT_PAYLOAD_DIGEST_PATTERN = /^[a-f0-9]{64}$/u
+const EVENT_PAYLOAD_TEMP_PATTERN = /^\.([a-f0-9]{64})-epay_[a-f0-9]{20}\.tmp$/u
+/**
+ * Startup cleanup is deliberately incremental. A hostile or accidentally
+ * polluted directory must not turn Session recovery into an unbounded scan or
+ * deletion pass, while ordinary crash orphans disappear within one restart.
+ */
+const EVENT_PAYLOAD_GC_MAX_DIRECTORY_ENTRIES = 4_096
+const EVENT_PAYLOAD_GC_MAX_DELETIONS = 128
+
+type EventPayloadEncoding = 'utf8' | 'json'
+
+interface EventPayloadReference {
+  __aneraEventPayload: {
+    schemaVersion: typeof EVENT_PAYLOAD_SCHEMA_VERSION
+    encoding: EventPayloadEncoding
+    sha256: string
+    bytes: number
+  }
+}
+
+interface StoredSessionEvent extends Omit<SessionEvent, 'data'> {
+  data: Record<string, unknown>
+  _aneraStorage?: {
+    eventPayloads: typeof EVENT_PAYLOAD_SCHEMA_VERSION
+    references: Array<Array<string | number>>
+  }
+}
+
+export class EventPayloadIntegrityError extends Error {
+  readonly code = 'EVENT_PAYLOAD_INTEGRITY'
+
+  constructor(
+    readonly eventId: string,
+    readonly eventType: EventType,
+    readonly callId: string | undefined,
+    reason: string,
+  ) {
+    super(`Durable ${eventType} event ${eventId} has an unavailable or corrupt payload: ${reason}`)
+    this.name = 'EventPayloadIntegrityError'
+  }
+}
+
+/**
+ * Read the persisted Session event format outside a live SessionStore.
+ *
+ * Large event fields may be stored in session-local content-addressed
+ * sidecars. Raw JSONL consumers must use this entry point so they never treat
+ * an internal payload reference as user-visible event content. Unlike startup
+ * repair, standalone readers cannot safely discard malformed rows, so any
+ * invalid JSONL record fails the complete read.
+ */
+export async function readHydratedSessionEventLog(path: string): Promise<SessionEvent[]> {
+  const absolute = resolve(path)
+  const parsed = parseEventLog(await readFile(absolute, EVENT_PAYLOAD_TEXT_ENCODING))
+  if (parsed.invalidLines > 0) {
+    throw new Error(`Durable event log contains ${parsed.invalidLines} malformed JSONL record${parsed.invalidLines === 1 ? '' : 's'}`)
+  }
+  const payloads = new Map<string, Promise<string>>()
+  const sessionDirectory = dirname(absolute)
+  const events: SessionEvent[] = []
+  for (const stored of parsed.events) {
+    events.push(await hydrateStoredSessionEvent(
+      stored,
+      payloads,
+      (manifest) => readEventPayloadFromSessionDirectory(sessionDirectory, manifest),
+    ))
+  }
+  return events
+}
+
 const EMPTY_USAGE: UsageTotals = {
   promptTokens: 0,
   completionTokens: 0,
@@ -658,6 +823,8 @@ export class SessionStore {
   private readonly listeners = new Map<string, Set<EventListener>>()
   private readonly writeQueues = new Map<string, Promise<unknown>>()
   private readonly lastSeq = new Map<string, number>()
+  /** Lightweight idempotency index; durable event data remains on disk. */
+  private readonly eventTypesById = new Map<string, Map<string, EventType>>()
   private readonly sensitiveValues = new Map<string, Set<string>>()
   private initialized = false
   private initializing?: Promise<void>
@@ -841,6 +1008,21 @@ export class SessionStore {
     return { fontCss, familyNames: [...normalized.familyNames] }
   }
 
+  async commitReferenceRuntimeEvidence(id: string, sourceSha256: string, sourceUrl: string, dependencies: ReferenceTemplateDependency[]): Promise<ReferenceTemplateRuntimeEvidence> {
+    await this.initialize()
+    await this.get(id)
+    return await this.enqueue(id, async () => {
+      await this.get(id)
+      return await commitReferenceRuntimeEvidence(this.sessionDir(id), sourceSha256, sourceUrl, dependencies)
+    })
+  }
+
+  async resolveReferenceRuntimeEvidence(id: string, manifest: ReferenceTemplateRuntimeEvidence): Promise<ReferenceTemplateDependency[]> {
+    await this.initialize()
+    await this.get(id)
+    return await resolveReferenceRuntimeEvidence(this.sessionDir(id), manifest)
+  }
+
   workspacePatchTransactionDir(id: string): string {
     return resolve(this.sessionDir(id), 'patch-transactions')
   }
@@ -860,6 +1042,14 @@ export class SessionStore {
 
   private eventsPath(id: string): string {
     return resolve(this.sessionDir(id), 'events.jsonl')
+  }
+
+  private eventPayloadRoot(id: string): string {
+    return resolve(this.sessionDir(id), 'event-payloads')
+  }
+
+  private eventPayloadVersionDir(id: string): string {
+    return resolve(this.eventPayloadRoot(id), `v${EVENT_PAYLOAD_SCHEMA_VERSION}`)
   }
 
   async create(options: CreateSessionOptions = {}): Promise<StoredSession> {
@@ -920,6 +1110,7 @@ export class SessionStore {
       throw error
     }
     this.lastSeq.set(id, 0)
+    this.eventTypesById.set(id, new Map())
     await this.append(id, 'session.created', creationEventData, { eventId: creationEventId })
     return await this.update(id, (committed) => { delete committed.pendingCreation }, { updatedAt: now })
   }
@@ -945,6 +1136,7 @@ export class SessionStore {
     this.listeners.delete(id)
     this.writeQueues.delete(id)
     this.lastSeq.delete(id)
+    this.eventTypesById.delete(id)
     this.sensitiveValues.delete(id)
   }
 
@@ -1098,6 +1290,13 @@ export class SessionStore {
     try {
       pending = await this.enqueue(id, async () => {
         const state = await this.get(id)
+        if (options.expectedReferenceStyleSha256 !== undefined) {
+          const reference = state.activeReferenceStyleContract
+          if (state.referenceStyleEvidenceInvalidation || reference?.contract?.strictness !== 'exact'
+            || sha256(Buffer.from(JSON.stringify(reference))) !== options.expectedReferenceStyleSha256) {
+            throw new Error('Reference identity changed before mutation admission. Use read_reference_resource again with the current source; no artifact was changed.')
+          }
+        }
         if (Object.values(state.pendingWorkspaceMutations ?? {}).some((item) => item.path === options.path)) {
           throw new Error(`Another workspace mutation is already active for ${options.path}`)
         }
@@ -2228,8 +2427,7 @@ export class SessionStore {
     })
   }
 
-  async events(id: string, afterSeq = 0): Promise<SessionEvent[]> {
-    assertSessionId(id)
+  private async readStoredEvents(id: string): Promise<StoredSessionEvent[]> {
     let text = ''
     try {
       text = await readFile(this.eventsPath(id), 'utf8')
@@ -2238,8 +2436,50 @@ export class SessionStore {
       throw error
     }
     return parseEventLog(text).events
-      .filter((event) => event.seq > afterSeq)
-      .map((event) => event.type === 'turn.started' ? event : { ...event, data: this.redactForDisplay(id, event.data) })
+  }
+
+  private indexStoredEventTypes(id: string, storedEvents: StoredSessionEvent[]): Map<string, EventType> {
+    const eventTypes = new Map<string, EventType>()
+    for (const event of storedEvents) {
+      // Preserve the historical first-match idempotency behavior if a damaged
+      // log happens to contain a duplicate ID.
+      if (!eventTypes.has(event.id)) eventTypes.set(event.id, event.type)
+    }
+    this.eventTypesById.set(id, eventTypes)
+    return eventTypes
+  }
+
+  private async ensureEventTypeIndex(id: string): Promise<Map<string, EventType>> {
+    const indexed = this.eventTypesById.get(id)
+    if (indexed) return indexed
+    const storedEvents = await this.readStoredEvents(id)
+    if (!this.lastSeq.has(id)) {
+      this.lastSeq.set(id, storedEvents.reduce((maximum, event) => Math.max(maximum, event.seq), 0))
+    }
+    return this.indexStoredEventTypes(id, storedEvents)
+  }
+
+  private async hydrateStoredEventForDisplay(
+    id: string,
+    stored: StoredSessionEvent,
+    payloads = new Map<string, Promise<string>>(),
+  ): Promise<SessionEvent> {
+    const event = await this.hydrateStoredEvent(id, stored, payloads)
+    return event.type === 'turn.started'
+      ? event
+      : { ...event, data: this.redactForDisplay(id, event.data) }
+  }
+
+  async events(id: string, afterSeq = 0): Promise<SessionEvent[]> {
+    assertSessionId(id)
+    const storedEvents = await this.readStoredEvents(id)
+    const payloads = new Map<string, Promise<string>>()
+    const events: SessionEvent[] = []
+    for (const stored of storedEvents) {
+      if (stored.seq <= afterSeq) continue
+      events.push(await this.hydrateStoredEventForDisplay(id, stored, payloads))
+    }
+    return events
   }
 
   async append<T extends Record<string, unknown>>(
@@ -2333,7 +2573,11 @@ export class SessionStore {
       }
       state.messages = state.messages.slice(0, messageCountAfter)
       delete state.activeTaskResearchEvidence
+      delete state.activeArtifactReviewRepair
+      delete state.activeArtifactContentReviewReceipt
+      delete state.activeVisualWebSlidePlan
       delete state.activeVisualArtifact
+      delete state.activeReferenceSourceResolution
       delete state.visualNoProgress
       for (const turnId of targetTurnIds) delete state.turnMessageStarts?.[turnId]
       state.pendingTurnUndo = pending
@@ -2362,16 +2606,25 @@ export class SessionStore {
   ): Promise<SessionEvent<T>> {
     const { eventId, ...eventContext } = context
     if (eventId) {
-      const prior = (await this.events(id)).find((event) => event.id === eventId)
-      if (prior) {
-        if (prior.type !== type) throw new Error(`Event id ${eventId} is already used by ${prior.type}`)
-        return prior as SessionEvent<T>
+      const eventTypes = await this.ensureEventTypeIndex(id)
+      if (eventTypes.has(eventId)) {
+        // The index deliberately retains no payload data. An idempotent replay
+        // scans compact JSONL metadata and hydrates only the matching row.
+        const prior = (await this.readStoredEvents(id)).find((event) => event.id === eventId)
+        if (prior) {
+          if (prior.type !== type) throw new Error(`Event id ${eventId} is already used by ${prior.type}`)
+          return await this.hydrateStoredEventForDisplay(id, prior) as SessionEvent<T>
+        }
+        // Self-heal if an operator replaced the event log after initialization.
+        eventTypes.delete(eventId)
       }
     }
     let seq = this.lastSeq.get(id)
     if (seq === undefined) {
-      const prior = await this.events(id)
-      seq = prior.at(-1)?.seq ?? 0
+      const prior = await this.readStoredEvents(id)
+      seq = prior.reduce((maximum, event) => Math.max(maximum, event.seq), 0)
+      this.lastSeq.set(id, seq)
+      if (!this.eventTypesById.has(id)) this.indexStoredEventTypes(id, prior)
     }
     const visibleData = type === 'turn.started' ? data : this.redactForDisplay(id, data)
     const event: SessionEvent<T> = {
@@ -2383,10 +2636,241 @@ export class SessionStore {
       ...eventContext,
       data: visibleData,
     }
-    await appendFile(this.eventsPath(id), `${JSON.stringify(event)}\n`, 'utf8')
+    const encoded = await this.encodeEventData(id, visibleData, undefined, (candidate) => {
+      const candidateEvent: StoredSessionEvent = candidate.references.length > 0
+        ? {
+            ...event,
+            data: candidate.data,
+            _aneraStorage: {
+              eventPayloads: EVENT_PAYLOAD_SCHEMA_VERSION,
+              references: candidate.references,
+            },
+          }
+        : { ...event, data: candidate.data }
+      return Buffer.byteLength(`${JSON.stringify(candidateEvent)}\n`, EVENT_PAYLOAD_TEXT_ENCODING)
+        <= EVENT_PAYLOAD_INLINE_MAX_BYTES
+    })
+    const stored: StoredSessionEvent = encoded.references.length > 0
+      ? {
+          ...event,
+          data: encoded.data,
+          _aneraStorage: {
+            eventPayloads: EVENT_PAYLOAD_SCHEMA_VERSION,
+            references: encoded.references,
+          },
+        }
+      : event
+    await appendFile(this.eventsPath(id), `${JSON.stringify(stored)}\n`, 'utf8')
     this.lastSeq.set(id, event.seq)
+    this.eventTypesById.get(id)?.set(event.id, event.type)
     for (const listener of this.listeners.get(id) ?? []) listener(event)
     return event
+  }
+
+  private async encodeEventData(
+    id: string,
+    data: Record<string, unknown>,
+    memo = new Map<string, Promise<EventPayloadReference>>(),
+    fitsInEventRecord?: (encoded: {
+      data: Record<string, unknown>
+      references: Array<Array<string | number>>
+    }) => boolean,
+  ): Promise<{ data: Record<string, unknown>; references: Array<Array<string | number>> }> {
+    interface PayloadPlan {
+      key: string
+      value: string
+      encoding: EventPayloadEncoding
+      digest: string
+      bytes: number
+      reference: EventPayloadReference
+    }
+    interface EncodedNode {
+      value: unknown
+      references: Array<Array<string | number>>
+      payloads: Map<string, PayloadPlan>
+    }
+    const serializeJson = (value: unknown): string => {
+      const serialized = JSON.stringify(value)
+      if (serialized === undefined) throw new Error('Event payload is not JSON serializable')
+      return serialized
+    }
+    const planPayload = (value: string, encoding: EventPayloadEncoding): PayloadPlan => {
+      const bytes = Buffer.byteLength(value, EVENT_PAYLOAD_TEXT_ENCODING)
+      const digest = sha256(Buffer.from(value, EVENT_PAYLOAD_TEXT_ENCODING))
+      const key = `${encoding}:${digest}:${bytes}`
+      return {
+        key,
+        value,
+        encoding,
+        digest,
+        bytes,
+        reference: {
+          __aneraEventPayload: {
+            schemaVersion: EVENT_PAYLOAD_SCHEMA_VERSION,
+            encoding,
+            sha256: digest,
+            bytes,
+          },
+        },
+      }
+    }
+    const encodedPayload = (
+      value: string,
+      encoding: EventPayloadEncoding,
+      path: Array<string | number>,
+    ): EncodedNode => {
+      const payload = planPayload(value, encoding)
+      return {
+        value: payload.reference,
+        references: [path],
+        payloads: new Map([[payload.key, payload]]),
+      }
+    }
+    const encode = async (
+      value: unknown,
+      path: Array<string | number>,
+    ): Promise<EncodedNode> => {
+      if (typeof value === 'string') {
+        const bytes = Buffer.byteLength(value, EVENT_PAYLOAD_TEXT_ENCODING)
+        if (bytes <= EVENT_PAYLOAD_INLINE_MAX_BYTES) {
+          return { value, references: [], payloads: new Map() }
+        }
+        return encodedPayload(value, 'utf8', path)
+      }
+      if (Array.isArray(value)) {
+        const encoded: unknown[] = []
+        const references: Array<Array<string | number>> = []
+        const payloads = new Map<string, PayloadPlan>()
+        for (const [index, item] of value.entries()) {
+          const child = await encode(item, [...path, index])
+          encoded.push(child.value)
+          references.push(...child.references)
+          for (const [key, payload] of child.payloads) payloads.set(key, payload)
+        }
+        const serialized = serializeJson(encoded)
+        if (Buffer.byteLength(serialized, EVENT_PAYLOAD_TEXT_ENCODING) > EVENT_PAYLOAD_INLINE_MAX_BYTES) {
+          // A parent sidecar contains the original subtree, so descendant
+          // references and their uncommitted payloads can be discarded. This
+          // keeps the path manifest bounded even for thousands of large leaves.
+          return encodedPayload(serializeJson(value), 'json', path)
+        }
+        return { value: encoded, references, payloads }
+      }
+      if (!isPlainRecord(value)) return { value, references: [], payloads: new Map() }
+      const entries: Array<[string, unknown]> = []
+      const references: Array<Array<string | number>> = []
+      const payloads = new Map<string, PayloadPlan>()
+      for (const [key, item] of Object.entries(value)) {
+        const child = await encode(item, [...path, key])
+        entries.push([key, child.value])
+        references.push(...child.references)
+        for (const [payloadKey, payload] of child.payloads) payloads.set(payloadKey, payload)
+      }
+      const encoded = Object.fromEntries(entries)
+      const serialized = serializeJson(encoded)
+      if (Buffer.byteLength(serialized, EVENT_PAYLOAD_TEXT_ENCODING) > EVENT_PAYLOAD_INLINE_MAX_BYTES) {
+        return encodedPayload(serializeJson(value), 'json', path)
+      }
+      return { value: encoded, references, payloads }
+    }
+    let encoded = await encode(data, [])
+    let candidate = {
+      data: encoded.value as Record<string, unknown>,
+      references: encoded.references,
+    }
+    if (fitsInEventRecord && !fitsInEventRecord(candidate)) {
+      // The path manifest itself can dominate the row (for example, repeated
+      // deep keys). Collapse the complete data object into one root sidecar.
+      encoded = encodedPayload(serializeJson(data), 'json', [])
+      candidate = {
+        data: encoded.value as Record<string, unknown>,
+        references: encoded.references,
+      }
+      if (!fitsInEventRecord(candidate)) {
+        throw new Error('Event metadata exceeds the durable JSONL record size limit')
+      }
+    }
+    // No CAS bytes are published until the final reference topology is known;
+    // superseded child plans therefore do not leave permanent orphan blobs.
+    for (const payload of encoded.payloads.values()) {
+      let pending = memo.get(payload.key)
+      if (!pending) {
+        pending = this.commitEventPayload(
+          id,
+          payload.value,
+          payload.encoding,
+          payload.digest,
+          payload.bytes,
+        )
+        memo.set(payload.key, pending)
+      }
+      await pending
+    }
+    return candidate
+  }
+
+  private async commitEventPayload(
+    id: string,
+    value: string,
+    encoding: EventPayloadEncoding,
+    digest: string,
+    bytes: number,
+  ): Promise<EventPayloadReference> {
+    const reference: EventPayloadReference = {
+      __aneraEventPayload: {
+        schemaVersion: EVENT_PAYLOAD_SCHEMA_VERSION,
+        encoding,
+        sha256: digest,
+        bytes,
+      },
+    }
+    const root = this.eventPayloadRoot(id)
+    const versionDirectory = this.eventPayloadVersionDir(id)
+    for (const directory of [root, versionDirectory]) await ensurePrivateEventPayloadDirectory(directory)
+    const target = resolve(versionDirectory, digest)
+    const existing = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined
+      throw error
+    })
+    if (existing) {
+      await verifyEventPayloadFile(target, reference.__aneraEventPayload)
+      return reference
+    }
+
+    const temporary = resolve(versionDirectory, `.${digest}-${createId('epay')}.tmp`)
+    try {
+      await writeFile(temporary, value, { encoding: EVENT_PAYLOAD_TEXT_ENCODING, flag: 'wx', mode: 0o600 })
+      await chmod(temporary, 0o600)
+      await verifyEventPayloadFile(temporary, reference.__aneraEventPayload)
+      try {
+        await link(temporary, target)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+      await verifyEventPayloadFile(target, reference.__aneraEventPayload)
+    } finally {
+      await rm(temporary, { force: true })
+    }
+    return reference
+  }
+
+  private async hydrateStoredEvent(
+    id: string,
+    stored: StoredSessionEvent,
+    payloads: Map<string, Promise<string>>,
+  ): Promise<SessionEvent> {
+    return await hydrateStoredSessionEvent(
+      stored,
+      payloads,
+      (manifest) => this.readEventPayload(id, manifest),
+    )
+  }
+
+  private async readEventPayload(
+    id: string,
+    manifest: EventPayloadReference['__aneraEventPayload'],
+  ): Promise<string> {
+    return await readEventPayloadFromSessionDirectory(this.sessionDir(id), manifest)
   }
 
   subscribe(id: string, listener: EventListener): () => void {
@@ -2439,19 +2923,165 @@ export class SessionStore {
     let text = ''
     try {
       text = await readFile(this.eventsPath(id), 'utf8')
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       await writeFile(this.eventsPath(id), '', 'utf8')
       this.lastSeq.set(id, 0)
+      this.eventTypesById.set(id, new Map())
       return
     }
     const parsed = parseEventLog(text)
-    if (parsed.invalidLines > 0 || (text.length > 0 && !text.endsWith('\n'))) {
-      const repaired = parsed.events.map((event) => JSON.stringify(event)).join('\n')
-      const temporary = `${this.eventsPath(id)}.repair-${process.pid}-${Date.now()}`
-      await writeFile(temporary, repaired ? `${repaired}\n` : '', 'utf8')
-      await rename(temporary, this.eventsPath(id))
+    const migrationPayloads = new Map<string, Promise<EventPayloadReference>>()
+    const storedEvents: StoredSessionEvent[] = []
+    let migrated = false
+    for (const event of parsed.events) {
+      if (Object.prototype.hasOwnProperty.call(event, '_aneraStorage')) {
+        storedEvents.push(event)
+        continue
+      }
+      const visibleData = event.type === 'turn.started'
+        ? event.data
+        : this.redactForDisplay(id, event.data)
+      const encoded = await this.encodeEventData(id, visibleData, migrationPayloads, (candidate) => {
+        const candidateEvent: StoredSessionEvent = candidate.references.length > 0
+          ? {
+              ...event,
+              data: candidate.data,
+              _aneraStorage: {
+                eventPayloads: EVENT_PAYLOAD_SCHEMA_VERSION,
+                references: candidate.references,
+              },
+            }
+          : { ...event, data: candidate.data }
+        return Buffer.byteLength(`${JSON.stringify(candidateEvent)}\n`, EVENT_PAYLOAD_TEXT_ENCODING)
+          <= EVENT_PAYLOAD_INLINE_MAX_BYTES
+      })
+      if (encoded.references.length === 0) {
+        storedEvents.push(event)
+        continue
+      }
+      migrated = true
+      storedEvents.push({
+        ...event,
+        data: encoded.data,
+        _aneraStorage: {
+          eventPayloads: EVENT_PAYLOAD_SCHEMA_VERSION,
+          references: encoded.references,
+        },
+      })
     }
-    this.lastSeq.set(id, parsed.events.reduce((maximum, event) => Math.max(maximum, event.seq), 0))
+    if (migrated || parsed.invalidLines > 0 || (text.length > 0 && !text.endsWith('\n'))) {
+      const repaired = storedEvents.map((event) => JSON.stringify(event)).join('\n')
+      const temporary = `${this.eventsPath(id)}.repair-${createId('evlog')}.tmp`
+      try {
+        await writeFile(temporary, repaired ? `${repaired}\n` : '', { encoding: 'utf8', flag: 'wx' })
+        await rename(temporary, this.eventsPath(id))
+      } finally {
+        await rm(temporary, { force: true })
+      }
+    }
+    await this.garbageCollectEventPayloads(id, storedEvents, parsed.invalidLines > 0)
+    this.lastSeq.set(id, storedEvents.reduce((maximum, event) => Math.max(maximum, event.seq), 0))
+    this.indexStoredEventTypes(id, storedEvents)
+  }
+
+  /**
+   * Remove content-addressed event payloads that cannot be reached from the
+   * complete durable log. CAS publication intentionally precedes the JSONL
+   * append, so a process crash in that narrow window can otherwise leak one
+   * permanent blob per failed append.
+   *
+   * Cleanup is fail closed and best effort: no deletion starts until every
+   * stored manifest has been validated and the complete bounded directory has
+   * been inspected. A malformed/repaired log, malformed manifest, unsafe
+   * directory, non-regular digest entry, or oversized directory leaves every
+   * byte untouched for operator inspection. The next clean startup can retry.
+   */
+  private async garbageCollectEventPayloads(
+    id: string,
+    storedEvents: StoredSessionEvent[],
+    logWasMalformed: boolean,
+  ): Promise<void> {
+    if (logWasMalformed) return
+
+    let referenced: Map<string, EventPayloadReference['__aneraEventPayload']>
+    try {
+      referenced = collectStoredEventPayloadReferences(storedEvents)
+    } catch {
+      return
+    }
+
+    const root = this.eventPayloadRoot(id)
+    const versionDirectory = this.eventPayloadVersionDir(id)
+    try {
+      await assertPrivateEventPayloadDirectory(root)
+      await assertPrivateEventPayloadDirectory(versionDirectory)
+    } catch {
+      return
+    }
+
+    let names: string[]
+    try {
+      const bounded = await boundedDirectoryNames(
+        versionDirectory,
+        EVENT_PAYLOAD_GC_MAX_DIRECTORY_ENTRIES,
+      )
+      if (!bounded) return
+      names = bounded
+    } catch {
+      return
+    }
+
+    const candidates: Array<{
+      path: string
+      dev: number
+      ino: number
+      size: number
+    }> = []
+    try {
+      for (const name of names.sort()) {
+        const digestEntry = EVENT_PAYLOAD_DIGEST_PATTERN.test(name)
+        const temporaryEntry = EVENT_PAYLOAD_TEMP_PATTERN.exec(name)
+        if (!digestEntry && !temporaryEntry) continue
+        const path = resolve(versionDirectory, name)
+        const info = await lstat(path)
+        // Digest-shaped targets and the exact temp names produced by
+        // commitEventPayload are part of the trusted CAS namespace. Any
+        // surprising inode or permission fails the whole pass before unlink.
+        if (info.isSymbolicLink() || !info.isFile() || (info.mode & 0o777) !== 0o600) return
+        if (digestEntry) {
+          const manifest = referenced.get(name)
+          if (manifest) {
+            if (info.size !== manifest.bytes) return
+            continue
+          }
+        }
+        // A temp hardlink is never addressable by a durable manifest. It can
+        // survive a process death after link(temp, digest) but before finally
+        // removes temp, including when the digest target itself is referenced.
+        candidates.push({ path, dev: info.dev, ino: info.ino, size: info.size })
+      }
+    } catch {
+      return
+    }
+
+    for (const candidate of candidates.slice(0, EVENT_PAYLOAD_GC_MAX_DELETIONS)) {
+      try {
+        const current = await lstat(candidate.path)
+        if (
+          current.isSymbolicLink()
+          || !current.isFile()
+          || (current.mode & 0o777) !== 0o600
+          || current.dev !== candidate.dev
+          || current.ino !== candidate.ino
+          || current.size !== candidate.size
+        ) return
+        // unlink removes the directory entry itself and never follows a link.
+        await unlink(candidate.path)
+      } catch {
+        return
+      }
+    }
   }
 
   private async recoverPendingDeployment(
@@ -3882,6 +4512,269 @@ async function inspectWorkspaceFile(target: string): Promise<
 
 function sha256(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex')
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function validEventPayloadPath(value: unknown): value is Array<string | number> {
+  return Array.isArray(value)
+    && value.every((part) => (
+      typeof part === 'string'
+      || (Number.isSafeInteger(part) && Number(part) >= 0)
+    ))
+}
+
+function eventPayloadLocation(
+  root: unknown,
+  path: Array<string | number>,
+): { value: unknown; set: (value: unknown) => void } {
+  let current: unknown = root
+  for (let index = 0; index < path.length; index += 1) {
+    const part = path[index]
+    const final = index === path.length - 1
+    if (typeof part === 'number') {
+      if (!Array.isArray(current) || part >= current.length || !Object.prototype.hasOwnProperty.call(current, part)) {
+        throw new Error(`event payload path does not exist at ${JSON.stringify(path)}`)
+      }
+      const container = current
+      if (final) {
+        return {
+          value: container[part],
+          set: (value) => { container[part] = value },
+        }
+      }
+      current = container[part]
+      continue
+    }
+    if (!isPlainRecord(current) || !Object.prototype.hasOwnProperty.call(current, part)) {
+      throw new Error(`event payload path does not exist at ${JSON.stringify(path)}`)
+    }
+    const container = current
+    if (final) {
+      return {
+        value: container[part],
+        set: (value) => {
+          Object.defineProperty(container, part, {
+            value,
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          })
+        },
+      }
+    }
+    current = container[part]
+  }
+  throw new Error('event payload path is empty')
+}
+
+async function hydrateStoredSessionEvent(
+  stored: StoredSessionEvent,
+  payloads: Map<string, Promise<string>>,
+  readPayload: (manifest: EventPayloadReference['__aneraEventPayload']) => Promise<string>,
+): Promise<SessionEvent> {
+  if (!Object.prototype.hasOwnProperty.call(stored, '_aneraStorage')) return stored as SessionEvent
+  try {
+    const paths = storedEventPayloadPaths(stored)
+    let data: unknown = stored.data
+    for (const path of paths) {
+      const location = path.length === 0
+        ? {
+            value: data,
+            set: (value: unknown) => { data = value },
+          }
+        : eventPayloadLocation(data, path)
+      const reference = eventPayloadReference(location.value)
+      if (!reference) throw new Error(`event payload reference is missing at ${JSON.stringify(path)}`)
+      const manifest = reference.__aneraEventPayload
+      const key = `${manifest.sha256}:${manifest.bytes}`
+      let pending = payloads.get(key)
+      if (!pending) {
+        pending = readPayload(manifest)
+        payloads.set(key, pending)
+      }
+      const encodedPayload = await pending
+      location.set(manifest.encoding === 'utf8'
+        ? encodedPayload
+        : parseEventJsonPayload(encodedPayload))
+    }
+    if (!isPlainRecord(data)) throw new Error('hydrated event data is not a plain object')
+    const { _aneraStorage: _storage, ...event } = stored
+    return { ...event, data }
+  } catch (error) {
+    throw new EventPayloadIntegrityError(
+      stored.id,
+      stored.type,
+      stored.callId,
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+}
+
+function storedEventPayloadPaths(stored: StoredSessionEvent): Array<Array<string | number>> {
+  const storage: unknown = stored._aneraStorage
+  if (!isPlainRecord(storage)) throw new Error('event payload storage manifest is malformed')
+  if (storage.eventPayloads !== EVENT_PAYLOAD_SCHEMA_VERSION) {
+    throw new Error(`event payload storage version ${String(storage.eventPayloads)} is unsupported`)
+  }
+  const paths = storage.references
+  if (!Array.isArray(paths) || paths.length === 0 || paths.some((path) => !validEventPayloadPath(path))) {
+    throw new Error('event payload path manifest is malformed')
+  }
+  const normalized = paths as Array<Array<string | number>>
+  const uniquePaths = new Set(normalized.map((path) => JSON.stringify(path)))
+  if (uniquePaths.size !== normalized.length) throw new Error('event payload path manifest contains duplicates')
+  if (normalized.some((path) => path.length === 0) && normalized.length !== 1) {
+    throw new Error('root event payload reference cannot be combined with descendant references')
+  }
+  return normalized
+}
+
+/**
+ * Validate every path and embedded sidecar manifest before startup GC is
+ * allowed to unlink anything. A digest necessarily identifies one byte
+ * sequence, so contradictory byte lengths are also a malformed durable log.
+ */
+function collectStoredEventPayloadReferences(
+  storedEvents: StoredSessionEvent[],
+): Map<string, EventPayloadReference['__aneraEventPayload']> {
+  const references = new Map<string, EventPayloadReference['__aneraEventPayload']>()
+  for (const stored of storedEvents) {
+    if (!Object.prototype.hasOwnProperty.call(stored, '_aneraStorage')) continue
+    for (const path of storedEventPayloadPaths(stored)) {
+      const value = path.length === 0
+        ? stored.data
+        : eventPayloadLocation(stored.data, path).value
+      const reference = eventPayloadReference(value)
+      if (!reference) throw new Error(`event payload reference is missing at ${JSON.stringify(path)}`)
+      const manifest = reference.__aneraEventPayload
+      const prior = references.get(manifest.sha256)
+      if (prior && prior.bytes !== manifest.bytes) {
+        throw new Error(`event payload digest ${manifest.sha256} has contradictory byte lengths`)
+      }
+      references.set(manifest.sha256, manifest)
+    }
+  }
+  return references
+}
+
+async function boundedDirectoryNames(target: string, maximum: number): Promise<string[] | undefined> {
+  const directory = await opendir(target)
+  const names: string[] = []
+  try {
+    while (true) {
+      const entry = await directory.read()
+      if (!entry) return names
+      // Read one entry beyond the bound so exactly-maximum directories remain
+      // eligible, but never lstat or delete from an incompletely scanned set.
+      if (names.length >= maximum) return undefined
+      names.push(entry.name)
+    }
+  } finally {
+    await directory.close()
+  }
+}
+
+async function readEventPayloadFromSessionDirectory(
+  sessionDirectory: string,
+  manifest: EventPayloadReference['__aneraEventPayload'],
+): Promise<string> {
+  const root = resolve(sessionDirectory, 'event-payloads')
+  const versionDirectory = resolve(root, `v${EVENT_PAYLOAD_SCHEMA_VERSION}`)
+  for (const directory of [root, versionDirectory]) await assertPrivateEventPayloadDirectory(directory)
+  return (await verifyEventPayloadFile(resolve(versionDirectory, manifest.sha256), manifest))
+    .toString(EVENT_PAYLOAD_TEXT_ENCODING)
+}
+
+function parseEventJsonPayload(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    throw new Error('Event JSON payload is malformed')
+  }
+}
+
+function eventPayloadReference(value: unknown): EventPayloadReference | undefined {
+  if (!isPlainRecord(value) || !Object.prototype.hasOwnProperty.call(value, '__aneraEventPayload')) return undefined
+  const manifest = value.__aneraEventPayload
+  if (
+    Object.keys(value).length !== 1
+    || !isPlainRecord(manifest)
+    || Object.keys(manifest).length !== 4
+    || manifest.schemaVersion !== EVENT_PAYLOAD_SCHEMA_VERSION
+    || (manifest.encoding !== 'utf8' && manifest.encoding !== 'json')
+    || typeof manifest.sha256 !== 'string'
+    || !EVENT_PAYLOAD_DIGEST_PATTERN.test(manifest.sha256)
+    || !Number.isSafeInteger(manifest.bytes)
+    || Number(manifest.bytes) < 0
+  ) {
+    throw new Error('event payload reference is malformed')
+  }
+  return value as unknown as EventPayloadReference
+}
+
+async function ensurePrivateEventPayloadDirectory(target: string): Promise<void> {
+  try {
+    await mkdir(target, { mode: 0o700 })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+  }
+  const info = await lstat(target)
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error('Event payload directory is not a private regular directory')
+  }
+  await chmod(target, 0o700)
+  await assertPrivateEventPayloadDirectory(target)
+}
+
+async function assertPrivateEventPayloadDirectory(target: string): Promise<void> {
+  let info
+  try {
+    info = await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('Event payload directory is missing')
+    throw error
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error('Event payload directory is not a private regular directory')
+  }
+  if ((info.mode & 0o777) !== 0o700) throw new Error('Event payload directory permissions are invalid')
+}
+
+async function verifyEventPayloadFile(
+  target: string,
+  expected: EventPayloadReference['__aneraEventPayload'],
+): Promise<Buffer> {
+  let before
+  try {
+    before = await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('Event payload file is missing')
+    throw error
+  }
+  if (before.isSymbolicLink() || !before.isFile()) throw new Error('Event payload path is not a regular file')
+  if ((before.mode & 0o777) !== 0o600) throw new Error('Event payload file permissions are invalid')
+  if (before.size !== expected.bytes) throw new Error('Event payload byte size does not match its reference')
+  const content = await readFile(target)
+  const after = await lstat(target)
+  if (
+    after.isSymbolicLink()
+    || !after.isFile()
+    || (after.mode & 0o777) !== 0o600
+    || before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+  ) {
+    throw new Error('Event payload changed while it was being verified')
+  }
+  if (content.length !== expected.bytes || sha256(content) !== expected.sha256) {
+    throw new Error('Event payload bytes do not match their reference')
+  }
+  return content
 }
 
 interface PreparedReferenceFontEvidence {
@@ -5496,8 +6389,8 @@ function redactWorkspaceValue<T>(value: T, workspace: string): T {
   return value
 }
 
-function parseEventLog(text: string): { events: SessionEvent[]; invalidLines: number } {
-  const events: SessionEvent[] = []
+function parseEventLog(text: string): { events: StoredSessionEvent[]; invalidLines: number } {
+  const events: StoredSessionEvent[] = []
   let invalidLines = 0
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
@@ -5516,7 +6409,7 @@ function parseEventLog(text: string): { events: SessionEvent[]; invalidLines: nu
         invalidLines += 1
         continue
       }
-      events.push(value as SessionEvent)
+      events.push(value as StoredSessionEvent)
     } catch {
       invalidLines += 1
     }

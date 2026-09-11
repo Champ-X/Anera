@@ -1,5 +1,7 @@
 # Anera Production Canary Runbook
 
+> 2026-09-09 测试策略更新：本文下方为历史外部验收说明。无累计预算的真实模型入口现已封存，不能直接按旧命令重跑；纯对账与独立账户边界按各自权限保留。日常分层、明确的付费预检及两次追加授权后的累计 ¥70 上限以 [TESTING.md](TESTING.md) 为准。集中修改后单轮验收，降低测试频率，不降低真实模型质量配置。
+
 本手册只关闭 Anera Harness 的真实 provider、账户和主机边界，不评价 Arena parity。移动端不在实现、测试或 release gate 范围内。GitHub Connector 深化与真实账户覆盖按当前范围暂缓，以下 GitHub gate 作为未来生产关闭条件保留，不阻塞本轮普通 Agent Mode 主体封板。
 
 ## 当前状态

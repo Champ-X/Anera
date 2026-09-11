@@ -1,10 +1,104 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ModelMessage } from '../shared/types.js'
-import { DeepSeekClient, projectProviderMessages } from './deepseek.js'
+import { DeepSeekClient, ModelStreamBudgetExceededError, projectProviderMessages } from './deepseek.js'
 
 afterEach(() => vi.unstubAllGlobals())
 
 describe('DeepSeek client', () => {
+  it('scopes the JSON syntax contract without changing model quality or ordinary requests', async () => {
+    const submitted: Record<string, unknown>[] = []
+    const events: unknown[] = []
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model',
+      thinking: 'enabled', reasoningEffort: 'high', maxOutputTokens: 8192,
+      fetch: async (_url, init) => { submitted.push(JSON.parse(String(init?.body))); return streamResponse('{"final":"done"}') },
+    })
+    const common = { messages: [{ role: 'user' as const, content: 'Return JSON: {"final":"answer"}.' }], tools: [],
+      signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {}, onTransportEvent: (event: unknown) => { events.push(event) } }
+    await client.stream({ ...common, responseFormat: { type: 'json_object' } })
+    await client.stream(common)
+    expect(submitted[0]).toMatchObject({ response_format: { type: 'json_object' } })
+    expect(submitted[1]).not.toHaveProperty('response_format')
+    for (const body of submitted) expect(body).toMatchObject({ model: 'test-model', thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 8192 })
+    expect(events[0]).toMatchObject({ type: 'request', responseFormat: 'json_object' })
+    expect(events[2]).not.toHaveProperty('responseFormat')
+  })
+
+  it.each(['transport', 'empty', 'reasoning_length', 'content_length'] as const)('preserves JSON retry/continuation and accounting: %s', async (mode) => {
+    const submitted: Record<string, any>[] = []
+    const beforeRequest = vi.fn(async () => {})
+    const final = '{"final":"done"}'
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model',
+      thinking: 'enabled', reasoningEffort: 'high', maxOutputTokens: 8192, retryBaseDelayMs: 0,
+      emptyCompletionRetryBaseDelayMs: 0,
+      fetch: async (_url, init) => {
+        submitted.push(JSON.parse(String(init?.body)))
+        // This is a JSON suffix, deliberately not a standalone JSON object.
+        if (submitted.length > 1) return streamResponse(mode === 'content_length' ? '"done"}' : final)
+        if (mode === 'transport') return new Response('unavailable', { status: 503 })
+        if (mode === 'empty') return emptyCompletionResponse()
+        if (mode === 'content_length') return lengthResponse('{"final":')
+        return new Response('data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: 'Plan the JSON answer.' }, finish_reason: 'length' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } }) + '\n\ndata: [DONE]\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      },
+    })
+    const result = await client.stream({ messages: [{ role: 'user', content: 'Return JSON: {"final":"answer"}.' }], tools: [],
+      responseFormat: { type: 'json_object' }, beforeRequest, signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {} })
+    expect(JSON.parse(result.content)).toEqual({ final: 'done' })
+    expect(result).toMatchObject({ finishReason: 'stop', modelRequestCount: 2, modelCallCount: mode === 'transport' ? 1 : 2 })
+    expect(result.usage.totalTokens).toBe(mode === 'transport' ? 12 : mode === 'empty' ? 17 : 20)
+    expect(beforeRequest).toHaveBeenCalledTimes(2)
+    expect(submitted[0].response_format).toEqual({ type: 'json_object' })
+    if (mode === 'content_length') expect(submitted[1]).not.toHaveProperty('response_format')
+    else expect(submitted[1].response_format).toEqual({ type: 'json_object' })
+    if (mode === 'reasoning_length') {
+      expect(submitted[1].messages.at(-1).content).toContain('There is no answer prefix')
+      expect(submitted[1].messages.at(-1).content).not.toContain('exact prefix already shown')
+      expect(JSON.stringify(submitted[1].messages)).not.toContain('Plan the JSON answer.')
+    }
+    for (const body of submitted) expect(body).toMatchObject({ thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 8192 })
+  })
+
+  it('uses a request-scoped non-thinking checkpoint without changing the main agent mode', async () => {
+    const submitted: Record<string, unknown>[] = []
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model',
+      thinking: 'enabled', reasoningEffort: 'high', maxOutputTokens: 8192,
+      fetch: async (_url, init) => { submitted.push(JSON.parse(String(init?.body))); return streamResponse('checkpoint') },
+    })
+    const common = { messages: [{ role: 'user' as const, content: 'Summarize.' }], tools: [],
+      signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {} }
+    await client.stream({ ...common, thinking: 'disabled', toolChoice: 'none', maxOutputTokens: 1800 })
+    await client.stream(common)
+    expect(submitted[0]).toMatchObject({ thinking: { type: 'disabled' }, max_tokens: 1800 })
+    expect(submitted[0]).not.toHaveProperty('reasoning_effort')
+    expect(submitted[0]).not.toHaveProperty('tools')
+    expect(submitted[1]).toMatchObject({ thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 8192 })
+  })
+
+  it('retains the per-request thinking policy across retry and continuation with each dispatch reserved', async () => {
+    const submitted: Record<string, unknown>[] = []
+    const beforeRequest = vi.fn(async () => {})
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model',
+      thinking: 'enabled', reasoningEffort: 'high', maxOutputTokens: 8192, maxRetries: 1,
+      retryBaseDelayMs: 0, maxLengthContinuations: 1,
+      fetch: async (_url, init) => {
+        submitted.push(JSON.parse(String(init?.body)))
+        return submitted.length === 1 ? new Response('unavailable', { status: 503 })
+          : submitted.length === 2 ? lengthResponse('Earlier work completed.\n\n') : streamResponse('Remaining work is retained.')
+      },
+    })
+    const result = await client.stream({ messages: [{ role: 'user', content: 'Summarize.' }], tools: [], toolChoice: 'none',
+      thinking: 'disabled', maxOutputTokens: 1800, maxModelRequests: 3, beforeRequest,
+      signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {} })
+    expect(result).toMatchObject({ finishReason: 'stop', modelRequestCount: 3, modelCallCount: 2 })
+    expect(beforeRequest).toHaveBeenCalledTimes(3)
+    for (const body of submitted) {
+      expect(body).toMatchObject({ thinking: { type: 'disabled' }, max_tokens: 1800 })
+      expect(body).not.toHaveProperty('reasoning_effort')
+      expect(body).not.toHaveProperty('tools')
+    }
+  })
+
   it('supports a tool-free bounded completion for context checkpoints', async () => {
     let submitted: Record<string, unknown> | undefined
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
@@ -38,7 +132,66 @@ describe('DeepSeek client', () => {
     expect(submitted).not.toHaveProperty('tool_choice')
   })
 
-  it('uses a stable provider tool surface without changing the caller authorization surface', async () => {
+  it('awaits a write-ahead reservation before the initial physical request', async () => {
+    const order: string[] = []
+    const beforeRequest = vi.fn(async () => {
+      order.push('reservation:start')
+      await Promise.resolve()
+      order.push('reservation:durable')
+    })
+    const fetchMock = vi.fn(async () => {
+      order.push('fetch')
+      return streamResponse('reserved')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Reserve before sending.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      beforeRequest,
+    })
+
+    expect(result.content).toBe('reserved')
+    expect(beforeRequest).toHaveBeenCalledOnce()
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(order).toEqual(['reservation:start', 'reservation:durable', 'fetch'])
+  })
+
+  it('does not dispatch when the write-ahead reservation callback rejects', async () => {
+    // Deliberately resembles a retryable provider failure. Dispatch-gate
+    // errors must never be classified by the provider transport policy.
+    const reservationFailure = new TypeError('fetch failed while persisting durable reservation')
+    const beforeRequest = vi.fn()
+      .mockRejectedValueOnce(reservationFailure)
+      .mockResolvedValue(undefined)
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse('must not be requested'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 0,
+    })
+
+    const pending = client.stream({
+      messages: [{ role: 'user', content: 'Stop if the reservation cannot be persisted.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      beforeRequest,
+    })
+
+    await expect(pending).rejects.toBe(reservationFailure)
+    expect(beforeRequest).toHaveBeenCalledOnce()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, 'enabled', 'disabled'] as const)('uses executable schemas, never a wider provider override (thinking=%s)', async (thinking) => {
     let submitted: Record<string, unknown> | undefined
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
       submitted = JSON.parse(String(init?.body)) as Record<string, unknown>
@@ -53,16 +206,17 @@ describe('DeepSeek client', () => {
     }))
     const activeTools = [{
       type: 'function' as const,
-      function: { name: 'edit_file', description: 'Edit.', parameters: { type: 'object', properties: {} } },
+      function: { name: 'edit_file', description: 'Edit.', parameters: { type: 'object',
+        properties: { path: { type: 'string', enum: ['canonical.txt'] } }, required: ['path'] } },
     }]
     const providerTools = [
-      ...activeTools,
+      { ...activeTools[0], function: { ...activeTools[0].function, parameters: { type: 'object', properties: {} } } },
       {
         type: 'function' as const,
         function: { name: 'browser', description: 'Browse.', parameters: { type: 'object', properties: {} } },
       },
     ]
-    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192 })
+    const client = new DeepSeekClient({ apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192, thinking })
 
     await client.stream({
       messages: [{ role: 'user', content: 'Continue.' }],
@@ -73,7 +227,11 @@ describe('DeepSeek client', () => {
       onReasoning: () => {},
     })
 
-    expect(submitted).toMatchObject({ tools: providerTools, tool_choice: 'auto' })
+    expect(submitted).toMatchObject({ tools: activeTools, tool_choice: 'auto' })
+    await client.stream({ messages: [{ role: 'user', content: 'Finish.' }], tools: [], providerTools,
+      toolChoice: 'none', signal: new AbortController().signal, onContent: () => {}, onReasoning: () => {} })
+    expect(submitted).not.toHaveProperty('tools')
+    expect(submitted).not.toHaveProperty('tool_choice')
   })
 
   it('parses CRLF SSE blocks and a final event without a blank-line terminator', async () => {
@@ -150,6 +308,35 @@ describe('DeepSeek client', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
+  it('accounts for the dispatched request when reading a non-2xx response body aborts', async () => {
+    const bodyFailure = new Error('aborted')
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.error(bodyFailure) },
+    }), { status: 503 })
+    const fetchMock = vi.fn().mockResolvedValue(response)
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Fail while reading the provider error.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })).rejects.toMatchObject({
+      message: 'aborted',
+      modelRequestCount: 1,
+      modelCallCount: 0,
+      modelUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedPromptTokens: 0 },
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(response.bodyUsed).toBe(true)
+    expect(response.body?.locked).toBe(false)
+  })
+
   it('retries a transport failure only before any visible stream delta', async () => {
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(new TypeError('fetch failed'))
@@ -177,6 +364,188 @@ describe('DeepSeek client', () => {
     expect(result).toMatchObject({ modelRequestCount: 2, modelCallCount: 1 })
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(onContent).toHaveBeenCalledOnce()
+  })
+
+  it('persists a fresh reservation before every transport retry', async () => {
+    const order: string[] = []
+    let reservation = 0
+    let request = 0
+    const beforeRequest = vi.fn(async () => {
+      reservation += 1
+      order.push(`reservation:${reservation}`)
+    })
+    const fetchMock = vi.fn(async () => {
+      request += 1
+      order.push(`fetch:${request}`)
+      if (request === 1) throw new TypeError('fetch failed')
+      return streamResponse('recovered after reservation')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 1, retryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Retry with durable accounting.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      beforeRequest,
+    })
+
+    expect(result).toMatchObject({ content: 'recovered after reservation', modelRequestCount: 2 })
+    expect(beforeRequest).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(order).toEqual(['reservation:1', 'fetch:1', 'reservation:2', 'fetch:2'])
+  })
+
+  it('retries a bare provider aborted failure before any output', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error('aborted'))
+      .mockResolvedValueOnce(streamResponse('recovered from provider abort'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 1, retryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover from a provider abort.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'recovered from provider abort',
+      modelRequestCount: 2,
+      modelCallCount: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onContent.mock.calls.flat().join('')).toBe('recovered from provider abort')
+  })
+
+  it('retries a bare stream abort before any visible output', async () => {
+    const abortedStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error('aborted'))
+      },
+    })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(abortedStream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }))
+      .mockResolvedValueOnce(streamResponse('recovered from stream abort'))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 1, retryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover from an early stream abort.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent,
+      onReasoning: () => {},
+    })
+
+    expect(result).toMatchObject({
+      content: 'recovered from stream abort',
+      modelRequestCount: 2,
+      modelCallCount: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onContent.mock.calls.flat().join('')).toBe('recovered from stream abort')
+  })
+
+  it('recognizes nested undici transport aborts through the cause chain', async () => {
+    const undiciFailure = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' })
+    const nestedFailure = new TypeError('provider request failed', {
+      cause: new Error('transport wrapper failed', { cause: undiciFailure }),
+    })
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(nestedFailure)
+      .mockResolvedValueOnce(streamResponse('recovered from nested abort'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 1, retryBaseDelayMs: 0,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Recover from a nested transport abort.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })
+
+    expect(result.content).toBe('recovered from nested abort')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('bounds retries for repeated bare provider aborted failures', async () => {
+    const fetchMock = vi.fn(async () => { throw new Error('aborted') })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Fail after the bounded retry budget.' }], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {},
+    })).rejects.toMatchObject({
+      message: 'aborted',
+      modelRequestCount: 3,
+      modelCallCount: 0,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not retry a bare aborted failure caused by the parent signal', async () => {
+    const controller = new AbortController()
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => await new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      if (!signal) throw new Error('Missing provider abort signal')
+      const abort = () => reject(new Error('aborted'))
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 0,
+    })
+    const pending = client.stream({
+      messages: [{ role: 'user', content: 'Cancel this request.' }], tools: [], signal: controller.signal,
+      onContent: () => {}, onReasoning: () => {},
+    })
+    controller.abort(new DOMException('Cancelled', 'AbortError'))
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'Cancelled', modelRequestCount: 1 })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('does not dispatch when the parent signal is already aborted', async () => {
+    const controller = new AbortController()
+    controller.abort(new DOMException('Cancelled before dispatch', 'AbortError'))
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse('must not be requested'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'This run is already cancelled.' }],
+      tools: [],
+      signal: controller.signal,
+      onContent: () => {},
+      onReasoning: () => {},
+    })).rejects.toMatchObject({ name: 'AbortError', message: 'Cancelled before dispatch' })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('bounds each provider attempt until its first SSE event and safely retries a pre-stream stall', async () => {
@@ -697,6 +1066,24 @@ describe('DeepSeek client', () => {
     expect(onContent.mock.calls.flat().join('')).toBe(partial.slice(0, partial.lastIndexOf(' ', partial.length - 257) + 1))
   })
 
+  it('does not retry a provider aborted stream after visible output was emitted', async () => {
+    const partial = `${'visible-word '.repeat(30)}unfinished-tail`
+    const fetchMock = vi.fn(async () => failingAfterDeltaResponse(partial, new Error('aborted')))
+    vi.stubGlobal('fetch', fetchMock)
+    const onContent = vi.fn()
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 8192,
+      maxRetries: 2, retryBaseDelayMs: 0,
+    })
+
+    await expect(client.stream({
+      messages: [{ role: 'user', content: 'Do not replay after provider abort.' }], tools: [], signal: new AbortController().signal,
+      onContent, onReasoning: () => {},
+    })).rejects.toMatchObject({ message: 'aborted', modelRequestCount: 1 })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(onContent).toHaveBeenCalledOnce()
+  })
+
   it('rejects a gracefully truncated stream after visible content without replaying it', async () => {
     const partial = `${'visible-word '.repeat(30)}unfinished-tail`
     const fetchMock = vi.fn(async () => new Response(
@@ -878,6 +1265,7 @@ describe('DeepSeek client', () => {
 
     const result = await client.stream({
       messages: [{ role: 'user', content: 'Write a complete answer.' }], tools, signal: new AbortController().signal,
+      toolChoice: 'auto',
       onContent, onReasoning: () => {},
     })
 
@@ -888,7 +1276,10 @@ describe('DeepSeek client', () => {
       usage: { promptTokens: 15, completionTokens: 5, totalTokens: 20, cachedPromptTokens: 0 },
     })
     expect(onContent.mock.calls.map(([delta]) => delta)).toEqual(['Part one ', 'part two.'])
-    expect(submitted[0]).toMatchObject({ tools, tool_choice: 'auto' })
+    expect(submitted[0]).toMatchObject({
+      tools,
+      tool_choice: 'auto',
+    })
     expect(submitted[1]).toMatchObject({ tools, tool_choice: 'none' })
     expect(submitted[1].messages).toEqual([
       { role: 'user', content: 'Write a complete answer.' },
@@ -898,6 +1289,126 @@ describe('DeepSeek client', () => {
         content: expect.stringContaining('output only the missing suffix'),
       },
     ])
+  })
+
+  it('persists a fresh reservation before every output-length continuation', async () => {
+    const order: string[] = []
+    let reservation = 0
+    let request = 0
+    const beforeRequest = vi.fn(async () => {
+      reservation += 1
+      order.push(`reservation:${reservation}`)
+    })
+    const fetchMock = vi.fn(async () => {
+      request += 1
+      order.push(`fetch:${request}`)
+      return request === 1
+        ? lengthResponse('Reserved prefix. ')
+        : streamResponse('Reserved suffix.')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 32,
+      maxLengthContinuations: 1,
+    })
+
+    const result = await client.stream({
+      messages: [{ role: 'user', content: 'Complete this across requests.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      beforeRequest,
+    })
+
+    expect(result).toMatchObject({
+      content: 'Reserved prefix. Reserved suffix.',
+      modelCallCount: 2,
+      modelRequestCount: 2,
+    })
+    expect(beforeRequest).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(order).toEqual(['reservation:1', 'fetch:1', 'reservation:2', 'fetch:2'])
+  })
+
+  it('does not dispatch a continuation when its reservation fails and preserves prior accounting', async () => {
+    const reservationFailure = Object.assign(new Error('reservation backend unavailable'), { status: 503 })
+    const beforeRequest = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(reservationFailure)
+      .mockResolvedValue(undefined)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse('Already dispatched prefix.'))
+      .mockResolvedValueOnce(streamResponse('must not be requested'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 32,
+      maxRetries: 2, retryBaseDelayMs: 0, maxLengthContinuations: 1,
+    })
+
+    const failure = await client.stream({
+      messages: [{ role: 'user', content: 'Stop before an unreserved continuation.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      beforeRequest,
+    }).catch((error: unknown) => error)
+
+    expect(failure).toBe(reservationFailure)
+    expect(failure).toMatchObject({
+      message: 'reservation backend unavailable',
+      modelCallCount: 1,
+      modelRequestCount: 1,
+      modelUsage: { promptTokens: 5, completionTokens: 3, totalTokens: 8, cachedPromptTokens: 0 },
+    })
+    expect(beforeRequest).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    {
+      name: 'physical requests',
+      allowance: { maxModelRequests: 1, maxTotalTokens: 100 },
+      expected: { budget: 'model_requests', used: 1, limit: 1 },
+    },
+    {
+      name: 'provider tokens',
+      allowance: { maxModelRequests: 10, maxTotalTokens: 8 },
+      expected: { budget: 'total_tokens', used: 8, limit: 8 },
+    },
+  ])('does not dispatch a length continuation after the $name allowance is spent', async ({ allowance, expected }) => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(lengthResponse('Budgeted prefix.'))
+      .mockResolvedValueOnce(streamResponse('must not be requested'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'test-model', maxOutputTokens: 32,
+      maxLengthContinuations: 2,
+    })
+
+    const failure = await client.stream({
+      messages: [{ role: 'user', content: 'Write a complete answer.' }],
+      tools: [],
+      signal: new AbortController().signal,
+      onContent: () => {},
+      onReasoning: () => {},
+      ...allowance,
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(ModelStreamBudgetExceededError)
+    expect(failure).toMatchObject({
+      name: 'ModelStreamBudgetExceededError',
+      code: 'model_stream_budget_exceeded',
+      ...expected,
+      modelCallCount: 1,
+      modelRequestCount: 1,
+      modelUsage: { promptTokens: 5, completionTokens: 3, totalTokens: 8, cachedPromptTokens: 0 },
+    })
+    await expect(client.stream({
+      messages: [], tools: [], signal: new AbortController().signal,
+      onContent: () => {}, onReasoning: () => {}, maxModelRequests: 0,
+    })).rejects.toThrow('maxModelRequests must be a positive integer')
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it('preserves a delimiter-free visible prefix when continuing a long single token', async () => {
@@ -1336,7 +1847,7 @@ function reasoningOnlyResponse(reasoning: string): Response {
   ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
 }
 
-function failingAfterDeltaResponse(content = 'partial'): Response {
+function failingAfterDeltaResponse(content = 'partial', failure: Error = new TypeError('fetch failed after streaming')): Response {
   let pullCount = 0
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -1346,7 +1857,7 @@ function failingAfterDeltaResponse(content = 'partial'): Response {
         return
       }
       await new Promise((resolve) => setTimeout(resolve, 1))
-      controller.error(new TypeError('fetch failed after streaming'))
+      controller.error(failure)
     },
   })
   return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })

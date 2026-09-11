@@ -1,6 +1,10 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { CANONICAL_TRACE_VERSION, type CanonicalTrace } from '../shared/canonical-trace.js'
-import { serializeCanonicalTrace, traceFromJsonl } from './trace-io.js'
+import { SessionStore } from '../server/session-store.js'
+import { loadCanonicalTrace, serializeCanonicalTrace, traceFromJsonl } from './trace-io.js'
 
 describe('canonical trace JSONL I/O', () => {
   it('round-trips side-specific outcomes', () => {
@@ -96,6 +100,40 @@ describe('canonical trace JSONL I/O', () => {
     const trace = traceFromJsonl(raw)
     expect(trace.header.source).toBe('anera')
     expect(trace.outcome.status).toBe('succeeded')
+  })
+
+  it('hydrates persisted event sidecars from a file and fails closed without their bytes', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-trace-event-payloads-'))
+    try {
+      const store = new SessionStore(root, 'test-model')
+      await store.initialize()
+      const session = await store.create()
+      const finalText = `${'Large durable Final🙂\n'.repeat(5_000)}complete`
+      await store.append(session.summary.id, 'assistant.final', {
+        content: finalText,
+        finishReason: 'stop',
+      }, { turnId: 'turn_large_trace', stepId: 'step_large_trace' })
+      await store.append(session.summary.id, 'run.status', {
+        status: 'completed',
+      }, { turnId: 'turn_large_trace' })
+
+      const eventPath = resolve(store.sessionDir(session.summary.id), 'events.jsonl')
+      const persisted = await readFile(eventPath, 'utf8')
+      expect(persisted).toContain('_aneraStorage')
+      expect(() => traceFromJsonl(persisted)).toThrow(/durable payload references/iu)
+
+      const hydrated = await loadCanonicalTrace(eventPath)
+      expect(hydrated.outcome).toMatchObject({ status: 'succeeded', finalText })
+
+      await rm(resolve(store.sessionDir(session.summary.id), 'event-payloads'), { recursive: true })
+      await expect(loadCanonicalTrace(eventPath)).rejects.toMatchObject({
+        name: 'EventPayloadIntegrityError',
+        code: 'EVENT_PAYLOAD_INTEGRITY',
+        eventType: 'assistant.final',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('does not repair a false declared eventCount', () => {

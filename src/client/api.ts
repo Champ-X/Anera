@@ -192,8 +192,8 @@ export const api = {
   async stop(id: string): Promise<void> {
     await request(`/api/sessions/${id}/stop`, { method: 'POST', body: '{}' })
   },
-  async resume(id: string): Promise<void> {
-    await request(`/api/sessions/${id}/resume`, { method: 'POST', body: '{}' })
+  async resume(id: string, model?: string): Promise<void> {
+    await request(`/api/sessions/${id}/resume`, { method: 'POST', body: JSON.stringify({ model }) })
   },
   async feedback(id: string, messageEventId: string, value: PointwiseFeedbackValue | null): Promise<void> {
     await request(`/api/sessions/${id}/messages/${messageEventId}/feedback`, {

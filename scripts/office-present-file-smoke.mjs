@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'

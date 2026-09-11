@@ -49,6 +49,117 @@ export interface VisualWorkspacePersistenceFixture {
 
 const MODEL = 'arena-agent-fixture'
 
+const LONG_THOUGHT_TITLE = 'Synthetic Long Thought · zero provider calls'
+const LONG_THOUGHT_MODEL = 'synthetic-ui-zero-provider'
+const LONG_THOUGHT_TURN = 'turn_synthetic_long_thought'
+const LONG_THOUGHT_STEP = 'step_synthetic_long_thought_active'
+const LONG_THOUGHT_PROGRESS = '合成界面进度：演示独立进度正文与思考区滚动，未调用模型。'
+const LONG_THOUGHT_CHUNKS = [24, 12, 12].map((count, chunk) => Array.from(
+  { length: count },
+  (_, line) => `Synthetic chunk ${chunk}, line ${String(line + 1).padStart(2, '0')}: 合成思考文字，仅用于检查展开、滚动和尾部跟随。\n`,
+).join(''))
+interface LongThoughtOwner {
+  phase: number
+  lastSeq: number
+  busy: boolean
+}
+// Only sessions freshly seeded by this module and this exact Store instance
+// may advance. Reopening a historical session never grants fixture ownership.
+const longThoughtOwners = new WeakMap<SessionStore, Map<string, LongThoughtOwner>>()
+
+/** Synthetic, bounded UI data only; does not execute tools or call a provider. */
+export async function seedVisualLongThoughtFixture(store: SessionStore): Promise<VisualRunningFixture> {
+  const session = await store.create({ isFreeSession: true })
+  const id = session.summary.id
+  const prompt = 'Synthetic UI fixture: inspect thought disclosure and scrolling. No model or provider is called.'
+  const prior = { turnId: LONG_THOUGHT_TURN, stepId: 'step_synthetic_long_thought_prior' }
+  const active = { turnId: LONG_THOUGHT_TURN, stepId: LONG_THOUGHT_STEP }
+  await store.append(id, 'turn.started', { content: prompt, attachments: [] }, { turnId: LONG_THOUGHT_TURN })
+  await store.append(id, 'run.status', { status: 'running' }, { turnId: LONG_THOUGHT_TURN })
+  await store.append(id, 'assistant.started', { step: 1 }, prior)
+  await store.append(id, 'assistant.thought.started', { step: 1 }, prior)
+  await store.append(id, 'assistant.thought.completed', {
+    text: 'Synthetic prior thought: this completed disclosure starts collapsed.',
+  }, prior)
+  await store.append(id, 'assistant.started', { step: 2 }, active)
+  await store.append(id, 'assistant.thought.started', { step: 2 }, active)
+  await store.append(id, 'assistant.thought.delta', { delta: LONG_THOUGHT_CHUNKS[0] }, active)
+  const last = await store.append(id, 'assistant.progress.delta', { delta: LONG_THOUGHT_PROGRESS }, active)
+  await store.update(id, (state) => {
+    state.summary.title = LONG_THOUGHT_TITLE
+    state.summary.model = LONG_THOUGHT_MODEL
+    state.summary.status = 'running'
+    state.summary.lastMessage = prompt
+    state.summary.usage = { ...emptyUsage(), modelRequests: 0 }
+  })
+  let owners = longThoughtOwners.get(store)
+  if (!owners) longThoughtOwners.set(store, owners = new Map())
+  owners.set(id, { phase: 0, lastSeq: last.seq, busy: false })
+  return { id, title: LONG_THOUGHT_TITLE }
+}
+
+/** Append chunks 1 then 2 on demand, allowing manual scroll checks between them. */
+export async function appendVisualLongThoughtChunk(
+  store: SessionStore,
+  sessionId: string,
+  chunk: 1 | 2,
+): Promise<void> {
+  if (chunk !== 1 && chunk !== 2) throw new Error('Synthetic long-thought chunk must be 1 or 2')
+  await mutateVisualLongThought(store, sessionId, chunk, async () => {
+    const event = await store.append(sessionId, 'assistant.thought.delta', {
+      delta: LONG_THOUGHT_CHUNKS[chunk],
+    }, { turnId: LONG_THOUGHT_TURN, stepId: LONG_THOUGHT_STEP })
+    return event.seq
+  })
+}
+
+/** Complete only after both chunks; the Final describes fixture state, not task verification. */
+export async function completeVisualLongThoughtFixture(store: SessionStore, sessionId: string): Promise<void> {
+  await mutateVisualLongThought(store, sessionId, 3, async () => {
+    const context = { turnId: LONG_THOUGHT_TURN, stepId: LONG_THOUGHT_STEP }
+    await store.append(sessionId, 'assistant.progress', { content: LONG_THOUGHT_PROGRESS }, context)
+    await store.append(sessionId, 'assistant.thought.completed', { text: LONG_THOUGHT_CHUNKS.join('') }, context)
+    const finalContext = { turnId: LONG_THOUGHT_TURN, stepId: 'step_synthetic_long_thought_final' }
+    await store.append(sessionId, 'assistant.started', { step: 3 }, finalContext)
+    await store.append(sessionId, 'assistant.final', {
+      content: 'Synthetic UI fixture complete. No model or provider was called.', finishReason: 'stop',
+    }, finalContext)
+    await store.append(sessionId, 'turn.completed', { status: 'completed' }, finalContext)
+    const last = await store.append(sessionId, 'run.status', { status: 'completed' }, finalContext)
+    await store.update(sessionId, (state) => { state.summary.status = 'completed' })
+    return last.seq
+  })
+}
+
+async function mutateVisualLongThought(
+  store: SessionStore,
+  sessionId: string,
+  nextPhase: number,
+  mutate: () => Promise<number>,
+): Promise<void> {
+  const owner = longThoughtOwners.get(store)?.get(sessionId)
+  if (!owner) throw new Error('Session is not owned by this synthetic long-thought fixture')
+  if (owner.busy || owner.phase !== nextPhase - 1) {
+    throw new Error('Synthetic long-thought transition is duplicate, out of order, or already running')
+  }
+  owner.busy = true
+  try {
+    const state = await store.get(sessionId)
+    const events = await store.events(sessionId)
+    if (state.summary.model !== LONG_THOUGHT_MODEL || state.summary.title !== LONG_THOUGHT_TITLE
+      || state.summary.status !== 'running' || events.at(-1)?.seq !== owner.lastSeq
+      || Object.entries({ ...emptyUsage(), modelRequests: 0 }).some(([key, value]) => (
+        state.summary.usage[key as keyof UsageTotals] !== value
+      ))) {
+      throw new Error('Synthetic long-thought session changed outside its controlled transitions')
+    }
+    owner.lastSeq = await mutate()
+    owner.phase = nextPhase
+  } finally {
+    owner.busy = false
+  }
+}
+
 export async function seedVisualFixtureSessions(store: SessionStore): Promise<VisualFixtureSessions> {
   const empty = await seedEmpty(store)
   const free = await seedFree(store)

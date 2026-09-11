@@ -1,4 +1,8 @@
 import { createHash } from 'node:crypto'
+import { parse, type DefaultTreeAdapterMap } from 'parse5'
+import { normalizeReferenceTemplateCatalog, normalizeReferenceTemplateRuntimeEvidence, projectReferenceTemplateLayouts } from './reference-template.js'
+import { normalizeReferenceLanguageVariant, type ReferenceLanguageVariant } from './reference-language.js'
+import { normalizeRenderedTextLayout, type RenderedTextLayout } from './rendered-text-layout.js'
 import type { ModelMessage, ToolCallRecord } from '../shared/types.js'
 import {
   normalizeReferenceFontEvidenceManifest,
@@ -72,6 +76,7 @@ export type ReferenceRenderPhase = 'cover' | 'content' | 'closing'
 export type ReferenceRenderGeometryPolicy =
   | 'strict'
   | 'size'
+  | 'flow-size'
   | 'intrinsic-block'
   | 'intrinsic-block-center'
   | 'intrinsic-inline'
@@ -85,11 +90,27 @@ export interface RenderedReferenceRectProfile {
   height: number
 }
 
+export interface RenderedReferenceContainingBlockOffsetProfile {
+  /** Viewport-normalized gaps between a positioned box and its offset parent. */
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
 export interface RenderedReferenceAnchorProfile {
   selector: string
   count: number
   geometry: ReferenceRenderGeometryPolicy
+  /** Source Browser CSS Typed OM retains auto dimensions and authored insets. */
+  authoredBox?: true
   rects: RenderedReferenceRectProfile[]
+  /**
+   * Relative geometry for positioned, non-pseudo anchors. Optional for
+   * compatibility with version-1 profiles captured before this evidence was
+   * available; null denotes a sample without a usable containing block.
+   */
+  containingBlockOffsets?: Array<RenderedReferenceContainingBlockOffsetProfile | null>
   styles: Array<Record<string, string>>
   /** Fraction of five viewport samples whose topmost element belongs to the anchor. */
   occlusion: number[]
@@ -117,6 +138,8 @@ export interface RenderedReferencePhaseProfile {
   overlayProbes: RenderedReferenceOverlayProbe[]
   /** Content-independent computed typography hierarchy for the active phase. */
   typographyProbes?: RenderedReferenceTypographyProbe[]
+  /** Cross-block text intersections, captured separately from enclosing boxes. */
+  textLayout?: RenderedTextLayout
 }
 
 /**
@@ -140,6 +163,11 @@ export interface RenderedReferenceStyleProfile {
   evidenceSha256: string
   viewport: { width: number; height: number }
   phases: Record<ReferenceRenderPhase, RenderedReferencePhaseProfile>
+  /**
+   * Browser-observed selectors that remain visible in every sampled phase and
+   * interior layout. References without shared chrome legitimately omit this.
+   */
+  sharedAnchorSelectors?: string[]
   /** Bounded library of the reference deck's real interior layout variants. */
   interiorVariants?: RenderedReferenceLayoutVariantProfile[]
 }
@@ -166,10 +194,28 @@ export interface RenderedReferenceStyleVerification {
   matched: number
   score: number
   violations: string[]
+  /** Full check count, not inferred from the bounded diagnostic strings. */
+  observationGapCount?: number
   url: string
   viewport: { width: number; height: number } | null
   /** Present on the content phase when the profile has interior variants. */
   interiorAttestation?: RenderedReferenceInteriorAttestation
+  /** Supplemental visibility probes, never pixel-fidelity or all-size proof. */
+  surfaceAttestations?: RenderedReferenceSurfaceAttestation[]
+}
+
+export interface RenderedReferenceSurfaceAttestation {
+  surface: 'compact-stage-v1'
+  controlOcclusion?: import('./rendered-control-occlusion.js').RenderedControlOcclusion
+  phase: string
+  viewport: { width: number; height: number }
+  activeIndex: number
+  activeRect?: [number, number, number, number]
+  checked: number
+  matched: number
+  observationGaps: number
+  restored: boolean
+  violations: string[]
 }
 
 export interface DurableReferenceStyleContract {
@@ -181,6 +227,11 @@ export interface DurableReferenceStyleContract {
   fontEvidence?: ReferenceFontEvidenceManifest
   /** Server-private, path-free identity of the immutable reference renders. */
   visualEvidence?: ReferenceVisualEvidenceManifest
+  /** Source-derived content slots, never a replacement for the recorded source bytes. */
+  templateCatalog?: import('./reference-template.js').ReferenceTemplateCatalog
+  runtimeEvidence?: import('./reference-template.js').ReferenceTemplateRuntimeEvidence
+  /** Author-documented, source-hash-bound text-role adaptation; never a new theme. */
+  languageVariant?: ReferenceLanguageVariant
 }
 
 export interface ReferenceStyleEvidence {
@@ -201,9 +252,27 @@ export interface ReferenceStyleEvidenceContinuation {
   readonly format: 'markdown' | 'raw'
   readonly nextChunkIndex: number
   readonly totalChunks?: number
+  /** Source chunks that must remain available until this chain completes. */
+  readonly callIds: readonly string[]
+}
+
+// Persisted verdicts are evidence from one implementation, not timeless facts.
+// Bump when source/cascade semantics change so resumed runs recheck the bytes.
+export const REFERENCE_STYLE_VERIFIER_REVISION = 'source-layout-palette-v3'
+
+// Browser verdicts have their own freshness boundary: a source-only pass
+// cannot attest checks added to the rendered phase after a process restart.
+export const RENDERED_REFERENCE_VERIFIER_REVISION = 'render-layout-surfaces-v5'
+
+export function referenceTextLayoutRequiresUpgrade(profile: RenderedReferenceStyleProfile | undefined): boolean {
+  return Boolean(profile && [
+    ...Object.values(profile.phases),
+    ...(profile.interiorVariants ?? []).map((variant) => variant.profile),
+  ].some((phase) => phase.textLayout?.version !== 2))
 }
 
 export interface ReferenceStyleVerification {
+  verifier_revision: string
   fidelity: 'pass' | 'mismatch'
   score: number
   matched: {
@@ -222,11 +291,54 @@ export interface ReferenceStyleVerification {
     avoid: string[]
     source: string[]
   }
+  /**
+   * Structured, set-level diagnostics for inline values copied from the
+   * reference. A reference may intentionally use more than one value for the
+   * same class/property (for example two visible `.mono` opacity variants).
+   * Those values are simultaneous requirements, not repair alternatives.
+   */
+  inlineVariantGaps: ReferenceStyleInlineVariantGap[]
+  /** Source colors used exclusively by unselected, Browser-attested layouts. */
+  omittedAlternativeLayoutColors?: string[]
   thresholds: {
     colors: number
     fonts: number
     markers: number
   }
+}
+
+export interface ReferenceStyleInlineVariantGap {
+  className: string
+  property: string
+  required: string[]
+  current: string[]
+  missing: string[]
+}
+
+export interface ReferenceStyleVerificationOptions {
+  /**
+   * A compact model-authored palette is positive fidelity evidence, not an
+   * exhaustive source-color allowlist. Once immutable browser evidence is
+   * bound, additional colors are judged by the rendered comparison instead
+   * of making a source with more than the bounded palette impossible to copy.
+   */
+  authoritativeRenderedReference?: boolean
+  /**
+   * Browser-captured interior roots form an alternative layout library. A
+   * shorter adapted deck must choose one real variant per interior slide, but
+   * it must not stack or instantiate every reference variant simultaneously.
+   */
+  alternativeLayoutSelectors?: readonly string[]
+  /** Private raw source, recovered and hash-bound to the durable contract by the caller. */
+  boundTemplateSource?: ReferenceStyleEvidence
+  /**
+   * Immutable Browser-observed presentation roots whose base CSS may be
+   * adapted from an external deck controller to a self-contained runtime.
+   * Static verification still checks their visual declarations; only
+   * interaction-state mechanics are deferred to Browser geometry/state
+   * attestation.
+   */
+  runtimeManagedSlideSelectors?: readonly string[]
 }
 
 /**
@@ -249,6 +361,14 @@ export interface ReferenceStyleEvidenceNormalization {
 
 const STYLE_PROPERTY_PATTERN = /(?:font-family|background(?:-color)?|border-radius|box-shadow|grid-template|clip-path|letter-spacing|line-height|--[a-z][\w-]*\s*:|\b(?:colors?|typography|components?|palette|layout|radii)\s*:)/giu
 const STYLE_COLOR_PATTERN = /#[0-9a-f]{3,8}\b|(?:rgba?|hsla?)\([^)]{3,80}\)/giu
+// Evidence parsing is independent of the compact profile's property/size
+// budget. Only paint values can prove a color: a string in content, a URL,
+// an unknown property or an unused custom property cannot paint that token.
+const CSS_PAINT_PROPERTY = /^(?:color|background(?:-color|-image)?|(?:border|border-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)(?:-color)?|border-image(?:-source)?|outline(?:-color)?|(?:box|text)-shadow|text-decoration(?:-color)?|text-emphasis(?:-color)?|column-rule(?:-color)?|caret(?:-color)?|accent-color|fill|stroke|(?:stop|flood|lighting)-color|filter|backdrop-filter|-webkit-text-(?:fill|stroke)-color)$/u
+
+function paintValue(value: string): string {
+  return value.replace(/url\((?:[^()"']|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')*\)|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/giu, '')
+}
 const STYLE_FONT_PATTERN = /(?:font-family\s*:|fontFamily\s*:|typeface|fonts?\s*:|Space Grotesk|Inter|Noto Sans|Noto Serif|Helvetica|Arial|Georgia|Roboto|Montserrat|Poppins)/giu
 
 const SOURCE_PROFILE_MAX_RULES = 64
@@ -265,6 +385,7 @@ const RENDER_PROFILE_MAX_BYTES = 160 * 1_024
 const RENDER_PROFILE_MAX_ANCHORS_PER_PHASE = 48
 const RENDER_PROFILE_MAX_LAYOUT_VARIANTS = 16
 const RENDER_PROFILE_MAX_ANCHORS_PER_VARIANT = 20
+const RENDER_PROFILE_MAX_SHARED_ANCHOR_SELECTORS = 8
 const RENDER_PROFILE_MAX_INSTANCES_PER_ANCHOR = 12
 const RENDER_PROFILE_MAX_STYLE_PROPERTIES = 24
 const RENDER_PROFILE_MAX_OVERLAY_PROBES = 12
@@ -276,7 +397,9 @@ const RENDER_PROFILE_STYLE_PROPERTIES = new Set([
   'font-weight', 'gap', 'grid-template-columns', 'grid-template-rows', 'height',
   'inset', 'justify-content', 'left', 'letter-spacing', 'line-height', 'margin',
   'max-height', 'max-width', 'min-height', 'min-width', 'opacity', 'overflow',
-  'padding', 'pointer-events', 'position', 'right', 'row-gap', 'text-align',
+  'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+  'pointer-events', 'position', 'right', 'row-gap', 'text-align',
   'text-transform', 'top', 'transform', 'visibility', 'width', 'flex-direction',
   'flex-wrap', 'background-image',
 ])
@@ -286,14 +409,17 @@ const SOURCE_PROFILE_PROPERTIES = new Set([
   'top', 'right', 'bottom', 'left', 'inset', 'display', 'visibility', 'position', 'opacity', 'gap',
   'row-gap', 'column-gap', 'grid-template-columns', 'grid-template-rows',
   'border', 'border-width', 'border-color', 'border-style', 'border-radius',
-  'clip-path', 'box-shadow', 'padding', 'margin', 'transform', 'overflow',
+  'clip-path', 'box-shadow', 'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'transform', 'overflow',
   'align-items', 'justify-content', 'text-align', 'text-transform', 'letter-spacing',
 ])
 const SOURCE_PROFILE_PROPERTY_PRIORITY = [
   'background', 'background-color', 'color', 'font-family', 'width', 'height',
   'top', 'right', 'bottom', 'left', 'inset', 'position', 'display', 'visibility', 'opacity', 'gap',
   'grid-template-columns', 'border', 'border-radius', 'clip-path', 'box-shadow',
-  'padding', 'margin', 'transform', 'font-size', 'font-weight', 'letter-spacing',
+  'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+  'transform', 'font-size', 'font-weight', 'letter-spacing',
   'min-width', 'max-width', 'min-height', 'max-height', 'row-gap', 'column-gap',
   'grid-template-rows', 'border-width', 'border-color', 'border-style', 'overflow',
   'align-items', 'justify-content', 'text-align', 'text-transform',
@@ -311,7 +437,10 @@ const STRUCTURAL_LAYOUT_PROPERTIES = new Set([
 const STRUCTURAL_REFERENCE_MARKERS = new Set([
   'clip-path', 'grid-template', 'grid-template-columns', 'grid-template-rows',
 ])
-const RENDER_PHASE_STRUCTURAL_ROOT_SELECTOR_PATTERN = /^(?:\.slide-header|\.(?!(?:(?:slide|active|prev|current|visible|hidden|entering|leaving)|(?:nav|progress|counter|keyboard|hint|chrome|runner|footer)(?:[-_][\w-]*)?|cover-dots?|closing-decoration|accent-(?:line|dot))$)[a-z_][\w-]*)$/iu
+const RUNTIME_MANAGED_SLIDE_SOURCE_PROPERTIES = new Set([
+  'display', 'opacity', 'position', 'visibility',
+])
+const RENDER_PHASE_STRUCTURAL_ROOT_SELECTOR_PATTERN = /^(?:\.slide-header|\.(?!(?:(?:slide|active|prev|current|visible|hidden|entering|leaving)|(?:nav|progress|counter|keyboard|hint|chrome|runner|footer|topbar|top-bar|slide-meta)(?:[-_][\w-]*)?|cover-dots?|closing-decoration|accent-(?:line|dot))$)[a-z_][\w-]*)$/iu
 const STANDARD_HTML_SELECTOR_TAGS = new Set([
   'a', 'abbr', 'address', 'article', 'aside', 'audio', 'b', 'blockquote', 'body', 'button',
   'canvas', 'caption', 'cite', 'code', 'col', 'colgroup', 'data', 'dd', 'del', 'details',
@@ -703,9 +832,34 @@ export function normalizeRenderedReferenceStyleProfile(
       `render_profile.phases.${phase}`,
       RENDER_PROFILE_MAX_ANCHORS_PER_PHASE,
       RENDER_PHASE_STRUCTURAL_ROOT_SELECTOR_PATTERN,
-      true,
     )]
   })) as unknown as Record<ReferenceRenderPhase, RenderedReferencePhaseProfile>
+  let sharedAnchorSelectors: string[] | undefined
+  if (input.sharedAnchorSelectors !== undefined) {
+    if (!Array.isArray(input.sharedAnchorSelectors)
+      || input.sharedAnchorSelectors.length < 1
+      || input.sharedAnchorSelectors.length > RENDER_PROFILE_MAX_SHARED_ANCHOR_SELECTORS) {
+      throw new Error('render_profile.sharedAnchorSelectors is out of bounds')
+    }
+    const selectors = new Set<string>()
+    sharedAnchorSelectors = input.sharedAnchorSelectors.map((rawSelector, index) => {
+      const selector = normalizeCssSelector(requiredBoundedString(
+        rawSelector,
+        `render_profile.sharedAnchorSelectors[${index}]`,
+        240,
+      ))
+      if (!selector || selectors.has(selector)) {
+        throw new Error(`render_profile.sharedAnchorSelectors[${index}] is invalid or duplicated`)
+      }
+      selectors.add(selector)
+      for (const phase of ['cover', 'content', 'closing'] as const) {
+        if (!phases[phase].anchors.some((anchor) => anchor.selector === selector)) {
+          throw new Error(`render_profile.phases.${phase} lacks shared anchor ${selector}`)
+        }
+      }
+      return selector
+    })
+  }
   let interiorVariants: RenderedReferenceLayoutVariantProfile[] | undefined
   if (input.interiorVariants !== undefined) {
     if (!Array.isArray(input.interiorVariants)
@@ -731,18 +885,53 @@ export function normalizeRenderedReferenceStyleProfile(
           `${path}.profile`,
           RENDER_PROFILE_MAX_ANCHORS_PER_VARIANT,
           new RegExp(`^${escapedSelector}(?:$|[ .:#>+~])`, 'iu'),
-          true,
         ),
       }
     })
+    if (sharedAnchorSelectors) {
+      for (const [index, variant] of interiorVariants.entries()) {
+        for (const selector of sharedAnchorSelectors) {
+          if (!variant.profile.anchors.some((anchor) => anchor.selector === selector)) {
+            throw new Error(`render_profile.interiorVariants[${index}].profile lacks shared anchor ${selector}`)
+          }
+        }
+      }
+    }
   }
   return {
     version: 1,
     evidenceSha256,
     viewport: { width, height },
     phases,
+    ...(sharedAnchorSelectors ? { sharedAnchorSelectors } : {}),
     ...(interiorVariants ? { interiorVariants } : {}),
   }
+}
+
+/**
+ * Return Browser-grounded selectors that identify the presentation page
+ * roots. These roots may use different CSS mechanics when an external deck
+ * controller is replaced by an equivalent self-contained runtime; their
+ * rendered geometry and single-active-page behavior remain authoritative.
+ */
+export function renderedReferenceRuntimeManagedSlideSelectors(
+  profile: RenderedReferenceStyleProfile | undefined,
+): string[] {
+  if (!profile) return []
+  const shared = profile.sharedAnchorSelectors ?? profile.phases.cover.anchors
+    .map((anchor) => anchor.selector)
+    .filter((selector) => (
+      profile.phases.content.anchors.some((anchor) => anchor.selector === selector)
+      && profile.phases.closing.anchors.some((anchor) => anchor.selector === selector)
+    ))
+  return [...new Set(shared.map(normalizeCssSelector).filter(referenceSelectorTargetsPresentationRoot))]
+}
+
+function referenceSelectorTargetsPresentationRoot(selector: string): boolean {
+  const surface = selectorRelationshipSurface(selector)
+  if (!surface) return false
+  return /(?:^|[>+~\s])(?:section|article)?\.slide(?:$|[.#\[])/iu.test(surface)
+    || /^[a-z][\w]*-[\w-]+>(?:section|article)(?:$|[.#\[])/iu.test(surface)
 }
 
 function normalizeRenderedReferencePhaseProfile(
@@ -750,7 +939,6 @@ function normalizeRenderedReferencePhaseProfile(
   path: string,
   maxAnchors: number,
   structuralPattern: RegExp,
-  requirePersistentChrome: boolean,
 ): RenderedReferencePhaseProfile {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path} must be an object`)
   const rawPhase = value as Record<string, unknown>
@@ -769,7 +957,7 @@ function normalizeRenderedReferencePhaseProfile(
     const count = Number(anchor.count)
     if (!Number.isInteger(count) || count < 1 || count > 10_000) throw new Error(`${anchorPath}.count is out of bounds`)
     if (![
-      'strict', 'size', 'intrinsic-block', 'intrinsic-block-center', 'intrinsic-inline', 'intrinsic-size',
+      'strict', 'size', 'flow-size', 'intrinsic-block', 'intrinsic-block-center', 'intrinsic-inline', 'intrinsic-size',
     ].includes(String(anchor.geometry))) {
       throw new Error(`${anchorPath}.geometry is invalid`)
     }
@@ -782,6 +970,30 @@ function normalizeRenderedReferencePhaseProfile(
       throw new Error(`${anchorPath} sample counts do not match`)
     }
     const rects = anchor.rects.map((rawRect, rectIndex) => normalizeRenderedRect(rawRect, `${anchorPath}.rects[${rectIndex}]`))
+    if (anchor.authoredBox !== undefined && anchor.authoredBox !== true) throw new Error(`${anchorPath}.authoredBox must be true when present`)
+    let containingBlockOffsets: Array<RenderedReferenceContainingBlockOffsetProfile | null> | undefined
+    if (anchor.containingBlockOffsets !== undefined) {
+      if (!Array.isArray(anchor.containingBlockOffsets) || anchor.containingBlockOffsets.length !== sampleCount) {
+        throw new Error(`${anchorPath}.containingBlockOffsets sample count does not match`)
+      }
+      containingBlockOffsets = anchor.containingBlockOffsets.map((rawOffset, offsetIndex) => {
+        if (rawOffset === null) return null
+        const offsetPath = `${anchorPath}.containingBlockOffsets[${offsetIndex}]`
+        if (!rawOffset || typeof rawOffset !== 'object' || Array.isArray(rawOffset)) {
+          throw new Error(`${offsetPath} must be an object or null`)
+        }
+        const values = rawOffset as Record<string, unknown>
+        const normalized = {} as RenderedReferenceContainingBlockOffsetProfile
+        for (const edge of ['left', 'top', 'right', 'bottom'] as const) {
+          const coordinate = Number(values[edge])
+          if (!Number.isFinite(coordinate) || coordinate < -4 || coordinate > 4) {
+            throw new Error(`${offsetPath}.${edge} is out of bounds`)
+          }
+          normalized[edge] = Math.round(coordinate * 10_000) / 10_000
+        }
+        return normalized
+      })
+    }
     const styles = anchor.styles.map((rawStyles, styleIndex) => {
       const stylePath = `${anchorPath}.styles[${styleIndex}]`
       if (!rawStyles || typeof rawStyles !== 'object' || Array.isArray(rawStyles)) throw new Error(`${stylePath} must be an object`)
@@ -800,16 +1012,21 @@ function normalizeRenderedReferencePhaseProfile(
       if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) throw new Error(`${anchorPath}.occlusion[${ratioIndex}] is out of bounds`)
       return Math.round(ratio * 100) / 100
     })
-    return { selector, count, geometry, rects, styles, occlusion } satisfies RenderedReferenceAnchorProfile
+    return {
+      selector,
+      count,
+      geometry,
+      ...(anchor.authoredBox === true ? { authoredBox: true as const } : {}),
+      rects,
+      ...(containingBlockOffsets ? { containingBlockOffsets } : {}),
+      styles,
+      occlusion,
+    } satisfies RenderedReferenceAnchorProfile
   })
   const structuralAnchors = anchors.filter((anchor) => structuralPattern.test(anchor.selector))
   if (structuralAnchors.length === 0) throw new Error(`${path} lacks a phase structural anchor`)
   if (!structuralAnchors.some((anchor) => anchor.geometry === 'strict')) {
     throw new Error(`${path} must retain at least one strict geometry structural anchor`)
-  }
-  if (requirePersistentChrome
-    && !anchors.some((anchor) => /(?:^|[-_.#])(?:nav|progress|counter|keyboard|hint|chrome|runner|footer)(?:$|[-_.:# ])/iu.test(anchor.selector))) {
-    throw new Error(`${path} lacks persistent chrome`)
   }
   const rawOverlayProbes = rawPhase.overlayProbes
   if (!Array.isArray(rawOverlayProbes) || rawOverlayProbes.length > RENDER_PROFILE_MAX_OVERLAY_PROBES) {
@@ -866,6 +1083,7 @@ function normalizeRenderedReferencePhaseProfile(
     anchors,
     overlayProbes,
     ...(typographyProbes ? { typographyProbes } : {}),
+    ...(rawPhase.textLayout !== undefined ? { textLayout: normalizeRenderedTextLayout(rawPhase.textLayout) } : {}),
   }
 }
 
@@ -931,6 +1149,8 @@ export function projectReferenceStyleToolResultForProvider(content: string): str
     )) return content
     const sourceProfileJson = sourceProfile ? JSON.stringify(sourceProfile) : undefined
     const renderProfileJson = renderProfile ? JSON.stringify(renderProfile) : undefined
+    const languageVariant = payload.language_variant === undefined ? undefined : normalizeReferenceLanguageVariant(payload.language_variant)
+    if (languageVariant && languageVariant.sourceSha256 !== evidenceSha256) return content
     return JSON.stringify({
       status: 'success',
       contract: {
@@ -946,6 +1166,11 @@ export function projectReferenceStyleToolResultForProvider(content: string): str
         viewport: contract.viewport,
       },
       provenance: { resolvedUrl, evidenceSha256, evidenceBytes },
+      ...(languageVariant ? { language_variant_attestation: {
+        language: languageVariant.language, adapter: languageVariant.adapter,
+        manifest_sha256: languageVariant.manifestSha256, design_url: languageVariant.designUrl,
+        design_sha256: languageVariant.designSha256,
+      } } : {}),
       ...(sourceProfile && sourceProfileJson ? {
         source_profile_attestation: {
           version: sourceProfile.version,
@@ -966,6 +1191,7 @@ export function projectReferenceStyleToolResultForProvider(content: string): str
             anchors: renderProfile.phases[phase].anchors.length,
             overlay_probes: renderProfile.phases[phase].overlayProbes.length,
           }])),
+          shared_anchor_selectors: renderProfile.sharedAnchorSelectors ?? [],
           ...(renderProfile.interiorVariants ? {
             interior_variants: {
               count: renderProfile.interiorVariants.length,
@@ -1057,6 +1283,29 @@ export function findReferenceStyleEvidence(
     best = candidate
   }
   return best
+}
+
+/**
+ * Resolve the complete fetch occurrence containing one terminal call without
+ * applying the style-score threshold. The source-resolution ledger uses this
+ * to distinguish a complete but non-style-bearing response from an incomplete
+ * pagination chain; callers must still apply `referenceStyleEvidenceScore`.
+ */
+export function completedReferenceStyleFetchForCall(
+  messages: readonly ModelMessage[],
+  referenceUrls: readonly string[],
+  callId: string,
+  beforeMessageIndex = Number.POSITIVE_INFINITY,
+): ReferenceStyleEvidence | undefined {
+  const occurrences = successfulReferenceFetchOccurrences(messages, referenceUrls, beforeMessageIndex)
+  const candidates: ReferenceStyleEvidence[] = occurrences.webFetches.map(evidenceFromWebFetch)
+  for (const chain of fetchPageChains(occurrences.fetchPageChunks)) {
+    const evidence = evidenceFromCompleteFetchPageChain(chain)
+    if (evidence) candidates.push(evidence)
+  }
+  return candidates
+    .filter((candidate) => candidate.callIds.includes(callId))
+    .sort((left, right) => right.resultMessageIndex - left.resultMessageIndex)[0]
 }
 
 /**
@@ -1196,8 +1445,19 @@ function fetchPageChains(chunks: readonly SuccessfulReferenceFetchPageChunk[]): 
     for (const chunk of group) {
       latestResultMessageIndex = Math.max(latestResultMessageIndex, chunk.resultMessageIndex)
       requestedUrls.add(chunk.canonicalRequestedUrl)
-      if (!chunk.metadataValid || byIndex.has(chunk.chunkIndex)) invalid = true
-      else byIndex.set(chunk.chunkIndex, chunk)
+      const duplicate = byIndex.get(chunk.chunkIndex)
+      if (!chunk.metadataValid) {
+        invalid = true
+      } else if (!duplicate) {
+        byIndex.set(chunk.chunkIndex, chunk)
+      } else if (referenceFetchPageChunksAreIdentical(duplicate, chunk)) {
+        // A provider replay or process restart may publish the same immutable
+        // page twice. Retain the newest occurrence so its call id can anchor
+        // continuation/evidence while treating the bytes as one logical page.
+        byIndex.set(chunk.chunkIndex, chunk)
+      } else {
+        invalid = true
+      }
       if (chunk.totalChunks !== undefined) declaredTotals.add(chunk.totalChunks)
     }
     if (requestedUrls.size !== 1 || declaredTotals.size > 1) invalid = true
@@ -1223,6 +1483,20 @@ function fetchPageChains(chunks: readonly SuccessfulReferenceFetchPageChunk[]): 
       ...(totalChunks === undefined ? {} : { totalChunks }),
     }
   })
+}
+
+function referenceFetchPageChunksAreIdentical(
+  left: SuccessfulReferenceFetchPageChunk,
+  right: SuccessfulReferenceFetchPageChunk,
+): boolean {
+  return left.canonicalRequestedUrl === right.canonicalRequestedUrl
+    && left.canonicalResolvedUrl === right.canonicalResolvedUrl
+    && left.format === right.format
+    && left.chunkIndex === right.chunkIndex
+    && left.hasMore === right.hasMore
+    && left.totalChunks === right.totalChunks
+    && left.metadataValid === right.metadataValid
+    && left.content === right.content
 }
 
 function evidenceFromCompleteFetchPageChain(chain: ReferenceFetchPageChain): ReferenceStyleEvidence | undefined {
@@ -1264,6 +1538,9 @@ function continuationFromFetchPageChain(chain: ReferenceFetchPageChain): Referen
     format: chain.format,
     nextChunkIndex,
     ...(chain.totalChunks === undefined ? {} : { totalChunks: chain.totalChunks }),
+    callIds: [...chain.chunks.values()]
+      .sort((left, right) => left.chunkIndex - right.chunkIndex)
+      .map((chunk) => chunk.call.id),
   }
 }
 
@@ -1301,21 +1578,25 @@ function eligibleReferenceStyleFetch(
   resolvedUrl: string,
   referenceUrls: readonly string[],
 ): boolean {
+  // Both ends of the fetch provenance must remain inside one explicitly
+  // authorized identity. Trusting only the requested URL would let an
+  // arbitrary cross-origin redirect inject style evidence.
   if (!referenceUrls.some((referenceUrl) => (
-    referenceUrlsAreRelated(referenceUrl, requestedUrl) || referenceUrlsAreRelated(referenceUrl, resolvedUrl)
+    referenceUrlsAreRelated(referenceUrl, requestedUrl)
+    && referenceUrlsAreRelated(referenceUrl, resolvedUrl)
   ))) return false
-  // GitHub directory HTML describes GitHub's own chrome, not the referenced
-  // design. Even if that shell happens to contain many CSS/color tokens, it
-  // remains discovery evidence and the workflow must follow a concrete raw
-  // design.md/template.json/template.html child.
+  // GitHub repository/directory HTML describes GitHub's own chrome, not the
+  // referenced design. Even if that shell happens to contain many CSS/color
+  // tokens, it remains discovery evidence and the workflow must follow a
+  // concrete raw or GitHub file such as design.md/template.json/template.html.
   try {
     const requested = new URL(requestedUrl)
     const resolved = new URL(resolvedUrl)
     const requestedCoordinates = githubReferenceCoordinates(requested)
     const resolvedCoordinates = githubReferenceCoordinates(resolved)
     return !(
-      (requested.hostname.toLowerCase() === 'github.com' && requestedCoordinates?.kind === 'directory')
-      || (resolved.hostname.toLowerCase() === 'github.com' && resolvedCoordinates?.kind === 'directory')
+      (requested.hostname.toLowerCase() === 'github.com' && requestedCoordinates?.kind !== 'file')
+      || (resolved.hostname.toLowerCase() === 'github.com' && resolvedCoordinates?.kind !== 'file')
     )
   } catch {
     return false
@@ -1327,7 +1608,7 @@ export function contractIsGroundedInEvidence(
   evidence: ReferenceStyleEvidence,
 ): boolean {
   if (!referenceUrlsAreRelated(contract.sourceUrl, evidence.requestedUrl)
-    && !referenceUrlsAreRelated(contract.sourceUrl, evidence.resolvedUrl)) return false
+    || !referenceUrlsAreRelated(contract.sourceUrl, evidence.resolvedUrl)) return false
   if (contract.strictness === 'exact') {
     const gaps = referenceStyleGroundingGaps(contract, evidence)
     return Boolean(gaps
@@ -1347,15 +1628,15 @@ export function contractIsGroundedInEvidence(
 /**
  * Return actionable exact-grounding failures without weakening provenance.
  * `undefined` means the request is not eligible for detailed diagnostics: the
- * mode is not exact, or neither fetched URL is related to `sourceUrl`.
+ * mode is not exact, or either fetched URL is unrelated to `sourceUrl`.
  */
 export function referenceStyleGroundingGaps(
   contract: ReferenceStyleContract,
   evidence: ReferenceStyleEvidence,
 ): ReferenceStyleGroundingGaps | undefined {
   if (contract.strictness !== 'exact'
-    || (!referenceUrlsAreRelated(contract.sourceUrl, evidence.requestedUrl)
-      && !referenceUrlsAreRelated(contract.sourceUrl, evidence.resolvedUrl))) return undefined
+    || !referenceUrlsAreRelated(contract.sourceUrl, evidence.requestedUrl)
+    || !referenceUrlsAreRelated(contract.sourceUrl, evidence.resolvedUrl)) return undefined
   const grounded = domConnectedVisualTokens(evidence.content, contract.viewport)
   return {
     colors: contract.colors.filter((value) => !grounded.colors.has(normalizeCssColorToken(value))),
@@ -1380,16 +1661,17 @@ export function normalizeReferenceStyleContractAgainstEvidence(
   evidence: ReferenceStyleEvidence,
 ): ReferenceStyleEvidenceNormalization {
   if (contract.strictness !== 'exact'
-    || (!referenceUrlsAreRelated(contract.sourceUrl, evidence.requestedUrl)
-      && !referenceUrlsAreRelated(contract.sourceUrl, evidence.resolvedUrl))) {
+    || !referenceUrlsAreRelated(contract.sourceUrl, evidence.requestedUrl)
+    || !referenceUrlsAreRelated(contract.sourceUrl, evidence.resolvedUrl)) {
     return { contract, omittedVisuallyInertColors: [] }
   }
 
   const connectedColors = domConnectedVisualTokens(evidence.content, contract.viewport).colors
   const declaredColors = new Set<string>()
   for (const rule of extractCssRules(evidence.content, contract.viewport)) {
-    for (const value of rule.declarations.values()) {
-      for (const color of value.match(STYLE_COLOR_PATTERN) ?? []) {
+    for (const [property, value] of rule.declarations) {
+      if (!CSS_PAINT_PROPERTY.test(property) && !property.startsWith('--')) continue
+      for (const color of paintValue(value).match(STYLE_COLOR_PATTERN) ?? []) {
         declaredColors.add(normalizeCssColorToken(color))
       }
     }
@@ -1474,6 +1756,22 @@ export function latestSuccessfulReferenceStyleContract(
         || visualEvidence.viewport.width !== contract.viewport.width
         || visualEvidence.viewport.height !== contract.viewport.height
       )) continue
+      const rawTemplateCatalog = payload.composition_template ?? payload.templateCatalog
+      const rawRuntimeEvidence = payload.runtime_evidence ?? payload.runtimeEvidence
+      const runtimeEvidence = rawRuntimeEvidence === undefined ? undefined : normalizeReferenceTemplateRuntimeEvidence(rawRuntimeEvidence)
+      if (runtimeEvidence && runtimeEvidence.sourceEvidenceSha256 !== provenance.evidenceSha256) continue
+      let templateCatalog: DurableReferenceStyleContract['templateCatalog']
+      if (rawTemplateCatalog !== undefined) {
+        try {
+          templateCatalog = normalizeReferenceTemplateCatalog(rawTemplateCatalog, provenance.evidenceSha256, provenance.resolvedUrl)
+        } catch {
+          // Unsupported/corrupt optional composition metadata must not erase
+          // otherwise valid source/render evidence. Use the ordinary path.
+        }
+      }
+      const languageVariant = payload.language_variant === undefined ? undefined
+        : normalizeReferenceLanguageVariant(payload.language_variant, templateCatalog)
+      if (languageVariant && (languageVariant.sourceSha256 !== provenance.evidenceSha256 || !templateCatalog)) continue
       return {
         contract,
         provenance: {
@@ -1485,6 +1783,9 @@ export function latestSuccessfulReferenceStyleContract(
         ...(renderProfile ? { renderProfile } : {}),
         ...(fontEvidence ? { fontEvidence } : {}),
         ...(visualEvidence ? { visualEvidence } : {}),
+        ...(templateCatalog ? { templateCatalog } : {}),
+        ...(runtimeEvidence ? { runtimeEvidence } : {}),
+        ...(languageVariant ? { languageVariant } : {}),
       }
     } catch {
       // A malformed historical record cannot satisfy the durable gate.
@@ -1497,46 +1798,103 @@ export function verifyHtmlAgainstReferenceStyle(
   html: string,
   contract: ReferenceStyleContract,
   sourceProfile?: ReferenceStyleSourceProfile,
+  options: ReferenceStyleVerificationOptions = {},
 ): ReferenceStyleVerification {
   // Ignore comments and script bodies so a candidate cannot satisfy the
   // deterministic gate by stuffing unused reference tokens into metadata or
   // JavaScript strings. The rendered DOM and CSS remain eligible evidence.
   const haystack = normalizeStyleText(staticVisualSurface(html))
+  const runtimeManagedSlideSelectors = new Set(
+    (options.runtimeManagedSlideSelectors ?? []).map(normalizeCssSelector).filter(Boolean),
+  )
   const connected = contract.strictness === 'exact'
-    ? domConnectedVisualTokens(html, contract.viewport)
+    ? domConnectedVisualTokens(html, contract.viewport, runtimeManagedSlideSelectors)
     : undefined
-  const matchedColors = contract.colors.filter((value) => connected
+  const alternativeLayoutClasses = new Set(
+    (options.alternativeLayoutSelectors ?? []).flatMap((selector) => {
+      const identifiers = selectorIdentifiers(normalizeCssSelector(selector))
+      return identifiers.length === 1 && identifiers[0].startsWith('.')
+        ? [identifiers[0].slice(1)]
+        : []
+    }),
+  )
+  const candidateDomClasses = connected?.domClasses ?? extractDomSnapshot(html).classes
+  let requiredColors = contract.colors
+  if (contract.strictness === 'exact' && sourceProfile && options.authoritativeRenderedReference
+    && alternativeLayoutClasses.size > 0 && options.boundTemplateSource) {
+    const source = options.boundTemplateSource
+    if (createHash('sha256').update(source.content).digest('hex') !== source.sha256
+      || !referenceUrlsAreRelated(contract.sourceUrl, source.resolvedUrl)
+      || !referenceUrlsAreRelated(contract.sourceUrl, source.requestedUrl)) {
+      throw new Error('Selected-layout palette requires the exact source-bound template bytes')
+    }
+    const projected = projectReferenceTemplateLayouts(source.content, source.resolvedUrl,
+      alternativeLayoutClasses, new Set(candidateDomClasses.keys()))
+    const fullPalette = domConnectedVisualTokens(source.content, contract.viewport).colors
+    const selectedPalette = domConnectedVisualTokens(projected, contract.viewport).colors
+    // Omit only colors positively proven to belong exclusively to omitted
+    // source layouts. Never derive requirements from candidate CSS, and never
+    // exempt a fabricated contract color or a global/selected-layout color.
+    requiredColors = contract.colors.filter((color) => {
+      const token = normalizeCssColorToken(color)
+      return !fullPalette.has(token) || selectedPalette.has(token)
+    })
+  }
+  const requiredMarkers = contract.requiredMarkers.filter((value) => (
+    // Browser-captured interior roots are a library of alternatives. A
+    // compound marker such as `.s-chart .plotwrap` belongs only to the chart
+    // variant and must not become a global checklist item when a shorter deck
+    // legitimately selects `.s-process` instead. If the root is selected,
+    // retain the whole marker so its private structure is still exact.
+    !selectorIdentifiers(value).some((identifier) => (
+      identifier.startsWith('.')
+      && alternativeLayoutClasses.has(identifier.slice(1))
+      && !candidateDomClasses.has(identifier.slice(1))
+    ))
+  ))
+  const matchedColors = requiredColors.filter((value) => connected
     ? connected.colors.has(normalizeCssColorToken(value))
     : haystack.includes(normalizeStyleText(value)))
   const matchedFonts = contract.fonts.filter((value) => connected
     ? connected.fonts.has(normalizeFontFamilyToken(value))
     : haystack.includes(normalizeStyleText(value)))
-  const matchedMarkers = contract.requiredMarkers.filter((value) => connected
+  const matchedMarkers = requiredMarkers.filter((value) => connected
     ? domConnectedMarkerIsGrounded(value, connected)
     : haystack.includes(normalizeStyleText(value)))
-  const colorViolations = unexpectedChromaticColors(staticVisualSurface(html), contract.colors)
+  const renderedReferenceOwnsExhaustivePalette = contract.strictness === 'exact'
+    && Boolean(sourceProfile)
+    && options.authoritativeRenderedReference === true
+  const colorViolations = renderedReferenceOwnsExhaustivePalette
+    ? []
+    : unexpectedChromaticColors(staticVisualSurface(html), contract.colors)
   const fontViolations = unexpectedPrimaryFontFamilies(staticVisualSurface(html), contract.fonts)
   const avoidViolations: string[] = []
   const sourceVerification = contract.strictness === 'exact' && sourceProfile
-    ? verifySourceProfile(html, sourceProfile, contract.viewport)
-    : { violations: [], checked: 0, matched: 0 }
+      ? verifySourceProfile(
+        html,
+        sourceProfile,
+        contract.viewport,
+        alternativeLayoutClasses,
+        runtimeManagedSlideSelectors,
+      )
+    : { violations: [], checked: 0, matched: 0, inlineVariantGaps: [] }
   const avoidText = contract.avoid.join('\n')
   if (
     /(?:no\s+)?(?:drop\s+)?shadows?.{0,30}(?:cards?|content)|(?:cards?|content).{0,30}(?:drop\s+)?shadows?|卡片.{0,20}阴影/iu.test(avoidText)
     && /(?:\.[a-z][\w-]*card[\w-]*|\bcard[\w-]*)[^{}]*\{[^{}]*box-shadow\s*:\s*(?!none\b)[^;}]+/iu.test(staticVisualSurface(html))
   ) avoidViolations.push('card/content box-shadow contradicts the StyleContract')
   const colorThreshold = contract.strictness === 'exact'
-    ? contract.colors.length
+    ? requiredColors.length
     : Math.max(2, Math.ceil(contract.colors.length * 0.4))
   const fontThreshold = contract.strictness === 'exact'
     ? contract.fonts.length
     : Math.max(1, Math.ceil(contract.fonts.length * 0.34))
   const markerThreshold = contract.strictness === 'exact'
-    ? contract.requiredMarkers.length
-    : Math.max(1, Math.ceil(contract.requiredMarkers.length * 0.34))
-  const colorRatio = matchedColors.length / contract.colors.length
+    ? requiredMarkers.length
+    : Math.max(1, Math.ceil(requiredMarkers.length * 0.34))
+  const colorRatio = requiredColors.length > 0 ? matchedColors.length / requiredColors.length : 1
   const fontRatio = matchedFonts.length / contract.fonts.length
-  const markerRatio = matchedMarkers.length / contract.requiredMarkers.length
+  const markerRatio = requiredMarkers.length > 0 ? matchedMarkers.length / requiredMarkers.length : 1
   const tokenScore = colorRatio * 45 + fontRatio * 25 + markerRatio * 30
   const sourceRatio = sourceVerification.checked > 0
     ? sourceVerification.matched / sourceVerification.checked
@@ -1548,6 +1906,7 @@ export function verifyHtmlAgainstReferenceStyle(
     colorViolations.length * 10 + fontViolations.length * 12 + avoidViolations.length * 12
   ))) * 10) / 10)
   return {
+    verifier_revision: REFERENCE_STYLE_VERIFIER_REVISION,
     fidelity: matchedColors.length >= colorThreshold
       && matchedFonts.length >= fontThreshold
       && matchedMarkers.length >= markerThreshold
@@ -1560,9 +1919,9 @@ export function verifyHtmlAgainstReferenceStyle(
     score,
     matched: { colors: matchedColors, fonts: matchedFonts, markers: matchedMarkers },
     missing: {
-      colors: contract.colors.filter((value) => !matchedColors.includes(value)),
+      colors: requiredColors.filter((value) => !matchedColors.includes(value)),
       fonts: contract.fonts.filter((value) => !matchedFonts.includes(value)),
-      markers: contract.requiredMarkers.filter((value) => !matchedMarkers.includes(value)),
+      markers: requiredMarkers.filter((value) => !matchedMarkers.includes(value)),
     },
     violations: {
       colors: colorViolations,
@@ -1570,6 +1929,10 @@ export function verifyHtmlAgainstReferenceStyle(
       avoid: avoidViolations,
       source: sourceVerification.violations,
     },
+    inlineVariantGaps: sourceVerification.inlineVariantGaps,
+    ...(requiredColors.length < contract.colors.length ? {
+      omittedAlternativeLayoutColors: contract.colors.filter((color) => !requiredColors.includes(color)),
+    } : {}),
     thresholds: { colors: colorThreshold, fonts: fontThreshold, markers: markerThreshold },
   }
 }
@@ -1578,14 +1941,28 @@ export function referenceUrlsAreRelated(left: string, right: string): boolean {
   try {
     const a = new URL(left)
     const b = new URL(right)
-    a.hash = ''
-    b.hash = ''
-    if (a.toString() === b.toString()) return true
+    if (!['http:', 'https:'].includes(a.protocol) || !['http:', 'https:'].includes(b.protocol)) return false
+    if (a.username || a.password || b.username || b.password) return false
     const githubA = githubReferenceCoordinates(a)
     const githubB = githubReferenceCoordinates(b)
-    if (githubA && githubB) {
+    const githubHostA = isGitHubReferenceHost(a.hostname)
+    const githubHostB = isGitHubReferenceHost(b.hostname)
+    if (githubHostA || githubHostB) {
+      if (!githubA || !githubB) return false
+      if (referenceIdentitySearch(a) !== referenceIdentitySearch(b)) return false
       if (githubA.repository !== githubB.repository) return false
-      if (githubA.revision && githubB.revision && githubA.revision !== githubB.revision) return false
+      // An unrecognized README anchor is a section identity, not permission
+      // to consume an arbitrary file from the same repository. Repository
+      // roots without an anchor remain related so a model that drops a known
+      // catalog slug can still be repaired back to its tentative source.
+      if (githubA.anchor && githubB.anchor && githubA.anchor !== githubB.anchor) return false
+      if (githubA.anchor && !githubA.resourcePath && githubB.resourcePath) return false
+      if (githubB.anchor && !githubB.resourcePath && githubA.resourcePath) return false
+      if (
+        githubA.revision
+        && githubB.revision
+        && !githubRevisionsAreRelated(githubA.revision, githubB.revision)
+      ) return false
       if (!githubA.resourcePath || !githubB.resourcePath) return true
       if (githubA.kind === 'file' && githubB.kind === 'file') {
         return githubA.resourcePath === githubB.resourcePath
@@ -1600,7 +1977,13 @@ export function referenceUrlsAreRelated(left: string, right: string): boolean {
       }
       return false
     }
-    if (a.hostname !== b.hostname) return false
+    a.hash = ''
+    b.hash = ''
+    if (a.toString() === b.toString()) return true
+    // Generic references never cross an origin boundary. Query parameters
+    // remain part of the resource identity because no application-specific
+    // policy proves that they are non-semantic.
+    if (a.origin !== b.origin || a.search !== b.search) return false
     const aPath = a.pathname.replace(/\/+$/, '')
     const bPath = b.pathname.replace(/\/+$/, '')
     return aPath === bPath || aPath.startsWith(`${bPath}/`) || bPath.startsWith(`${aPath}/`)
@@ -1609,43 +1992,148 @@ export function referenceUrlsAreRelated(left: string, right: string): boolean {
   }
 }
 
+function githubRevisionsAreRelated(left: string, right: string): boolean {
+  if (left === right) return true
+  // HEAD is a default-branch alias, not a wildcard for arbitrary branches.
+  // GitHub's overwhelmingly common concrete defaults are main/master; other
+  // default names remain usable through HEAD itself without broadening
+  // provenance to experimental or attacker-selected revisions.
+  const concrete = left === 'HEAD' ? right : right === 'HEAD' ? left : undefined
+  return concrete === 'main' || concrete === 'master'
+}
+
+function isGitHubReferenceHost(hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  return host === 'github.com' || host === 'raw.githubusercontent.com'
+}
+
+function referenceIdentitySearch(url: URL): string {
+  if (githubRepositoryQueryIsNonSemantic(url)) return ''
+  return url.search
+}
+
+function githubRepositoryQueryIsNonSemantic(url: URL): boolean {
+  if (url.hostname.toLowerCase() !== 'github.com' || !url.search) return false
+  const segments = url.pathname.split('/').filter(Boolean)
+  if (segments.length !== 2) return false
+  const entries = [...url.searchParams.entries()]
+  return entries.length > 0 && entries.every(([name, value]) => (
+    (name === 'tab' && value === 'readme-ov-file')
+    || (name === 'utm_source' && value === 'copied-link')
+  ))
+}
+
 interface GitHubReferenceCoordinates {
   repository: string
   revision?: string
   resourcePath: string
   kind: 'repository' | 'directory' | 'file'
+  /** Valid repository-root README anchor, retained as resource identity. */
+  anchor?: string
+}
+
+/**
+ * Template catalogs commonly expose a concrete template as a README anchor on
+ * the repository URL (for example `repo#paper-deck`) while storing its source
+ * at `templates/paper-deck/template.html`. Preserve that anchor as resource
+ * identity and produce a default-branch raw URL without trusting slashes,
+ * traversal, query text, or arbitrary nested paths from the fragment.
+ */
+export function githubAnchoredTemplateSourceUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value)
+    if (url.search && !githubRepositoryQueryIsNonSemantic(url)) return undefined
+    const resourcePath = githubAnchoredTemplateResourcePath(url)
+    if (!resourcePath) return undefined
+    const segments = url.pathname.split('/').filter(Boolean)
+    return new URL(
+      `https://raw.githubusercontent.com/${segments[0]}/${segments[1].replace(/\.git$/iu, '')}/HEAD/${resourcePath}/template.html`,
+    ).toString()
+  } catch {
+    return undefined
+  }
+}
+
+function githubAnchoredTemplateResourcePath(url: URL): string | undefined {
+  const slug = githubRepositoryAnchor(url)
+  if (!slug) return undefined
+  const segments = url.pathname.split('/').filter(Boolean)
+  // README anchors are ambiguous. Apply the templates/<slug>/template.html
+  // convention only when the repository advertises itself as a template
+  // catalog; every other valid anchor stays a section-scoped identity and
+  // cannot silently authorize sibling repository files.
+  const repositoryName = segments[1].replace(/\.git$/iu, '')
+  if (!repositoryName.split(/[-_.]+/u).some((token) => /^templates?$/iu.test(token))) return undefined
+  return `templates/${slug}`
+}
+
+function githubRepositoryAnchor(url: URL): string | undefined {
+  if (
+    url.protocol !== 'https:'
+    || url.hostname.toLowerCase() !== 'github.com'
+    || url.username
+    || url.password
+    || url.port
+  ) return undefined
+  const segments = url.pathname.split('/').filter(Boolean)
+  if (segments.length !== 2 || !url.hash) return undefined
+  let slug = ''
+  try {
+    slug = decodeURIComponent(url.hash.slice(1)).trim()
+  } catch {
+    return undefined
+  }
+  if (
+    !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/u.test(slug)
+    || slug === '.'
+    || slug === '..'
+  ) return undefined
+  return slug
 }
 
 function githubReferenceCoordinates(url: URL): GitHubReferenceCoordinates | undefined {
   const host = url.hostname.toLowerCase()
+  if (
+    url.protocol !== 'https:'
+    || url.username
+    || url.password
+    || url.port
+    || !isGitHubReferenceHost(host)
+  ) return undefined
   const segments = url.pathname.split('/').filter(Boolean)
   if (segments.length < 2) return undefined
   const repository = `${segments[0].toLowerCase()}/${segments[1].replace(/\.git$/iu, '').toLowerCase()}`
   if (host === 'raw.githubusercontent.com') {
     return {
       repository,
-      revision: segments[2]?.toLowerCase(),
-      resourcePath: segments.slice(3).join('/').toLowerCase(),
+      revision: segments[2],
+      resourcePath: segments.slice(3).join('/'),
       kind: segments.length > 3 ? 'file' : 'repository',
     }
   }
   if (host !== 'github.com') return undefined
-  if (segments.length === 2) return { repository, resourcePath: '', kind: 'repository' }
-  const route = segments[2].toLowerCase()
+  if (segments.length === 2) {
+    const anchor = githubRepositoryAnchor(url)
+    const anchoredTemplatePath = githubAnchoredTemplateResourcePath(url)
+    return anchoredTemplatePath
+      ? { repository, resourcePath: anchoredTemplatePath, kind: 'directory', anchor }
+      : { repository, resourcePath: '', kind: 'repository', ...(anchor ? { anchor } : {}) }
+  }
+  const route = segments[2]
   if (route === 'tree' && segments.length >= 4) {
     return {
       repository,
-      revision: segments[3]?.toLowerCase(),
-      resourcePath: segments.slice(4).join('/').toLowerCase(),
+      revision: segments[3],
+      resourcePath: segments.slice(4).join('/'),
       kind: segments.length > 4 ? 'directory' : 'repository',
     }
   }
   if (['blob', 'raw'].includes(route) && segments.length >= 5) {
-    const resourcePath = segments.slice(4).join('/').toLowerCase()
+    const resourcePath = segments.slice(4).join('/')
     const finalSegment = segments.at(-1) ?? ''
     return {
       repository,
-      revision: segments[3]?.toLowerCase(),
+      revision: segments[3],
       resourcePath,
       // Some GitHub links in persisted Sessions use /blob/ for a directory.
       // Treat only extensionless blob targets as directories so their raw
@@ -1746,7 +2234,7 @@ function boundedColorStringArray(
     const tokens = raw.match(STYLE_COLOR_PATTERN) ?? []
     if (tokens.length === 0) throw new Error(`${name} entries must contain one concrete CSS color token, not a generic label`)
     for (const token of tokens) {
-      const canonical = token.toLowerCase().replace(/\s+/gu, '')
+      const canonical = normalizeCssColorToken(token)
       if (seen.has(canonical)) continue
       seen.add(canonical)
       normalized.push(canonical)
@@ -1781,19 +2269,86 @@ interface DomConnectedVisualTokens {
 }
 
 function normalizeCssColorToken(value: string): string {
+  // Parsed declarations already normalize leading decimals. Match the same
+  // authored number in contract tokens without rounding or changing alpha.
   return value.trim().toLowerCase().replace(/\s+/gu, '')
+    .replace(/(^|[(:,/])([+-]?)\.(\d)/gu, '$1$20.$3')
 }
 
 function normalizeFontFamilyToken(value: string): string {
   return value.trim().toLowerCase().replace(/^['"]|['"]$/gu, '').replace(/\s+/gu, ' ')
 }
 
-function cssRuleIsVisiblyConnected(rule: ParsedCssRule, dom: DomSnapshot): boolean {
-  if (rule.declarations.get('display') === 'none'
-    || ['hidden', 'collapse'].includes(rule.declarations.get('visibility') ?? '')) return false
+function cssRuleIsVisiblyConnected(
+  rule: ParsedCssRule,
+  dom: DomSnapshot,
+  rules: readonly ParsedCssRule[],
+  runtimeManagedSlideSelectors: ReadonlySet<string>,
+): boolean {
+  const displayHidden = rule.declarations.get('display') === 'none'
+  const visibilityHidden = ['hidden', 'collapse'].includes(rule.declarations.get('visibility') ?? '')
+  if (displayHidden || visibilityHidden) {
+    // A self-contained slide runtime commonly hides the base root and exposes
+    // one `.active` refinement. The base rule still paints that real visible
+    // instance, so its palette and selector are connected evidence. Keep this
+    // exception bound to Browser-attested slide roots and require one concrete
+    // DOM-matching state rule that explicitly reverses every hidden property;
+    // an arbitrary hidden token-stuffing selector remains inert.
+    const activated = runtimeManagedSlideSelectors.has(rule.selector)
+      && runtimeSlideHasVisibleInstance(rule, dom, rules)
+    if (!activated) return false
+  }
   const base = rule.selector.replace(/::(?:before|after)$/iu, '')
   if (base === ':root') return dom.tags.has('html')
   return selectorIdentifiersShareRelationship(rule.selector, dom)
+}
+
+function runtimeSlideHasVisibleInstance(
+  base: ParsedCssRule,
+  dom: DomSnapshot,
+  rules: readonly ParsedCssRule[],
+): boolean {
+  // `.slide.active` can override `deck-stage > section.slide` without sharing
+  // its textual prefix. Prove that both selectors target the SAME element,
+  // then resolve the actual visibility cascade. An unrelated active element,
+  // a weaker rule, or a later hide must not turn inert CSS into evidence.
+  // Dynamic/functional selectors need Browser evidence; do not approximate
+  // :hover, :not(...), attribute state or pseudo-elements as currently active.
+  const simple = (selector: string) => /^[\w.#*>\s-]+$/u.test(selector)
+  if (!simple(base.selector)) return false
+  const properties = ['display', 'visibility', 'opacity'] as const
+  const candidates = rules.filter((rule) => simple(rule.selector)).map((rule, order) => ({
+    rule,
+    order,
+    specificity: [
+      (rule.selector.match(/#/gu) ?? []).length,
+      (rule.selector.match(/\./gu) ?? []).length,
+      selectorCompoundFragments(rule.selector).filter((part) => /^[a-z]/iu.test(part)).length,
+    ],
+  }))
+  return dom.identifierPaths.some((path) => {
+    if (!selectorMatchesIdentifierPath(base.selector, path, true)) return false
+    const winners = new Map<string, { value: string; rank: number[] }>()
+    for (const { rule, order, specificity } of candidates) {
+      if (!selectorMatchesIdentifierPath(rule.selector, path, true)) continue
+      for (const property of properties) {
+        const value = rule.declarations.get(property)
+        if (value === undefined) continue
+        const rank = [rule.importantProperties?.has(property) ? 1 : 0, ...specificity, order]
+        const previous = winners.get(property)
+        const difference = previous ? rank.findIndex((value, index) => value !== previous.rank[index]) : -1
+        if (!previous || (difference >= 0 && rank[difference] > previous.rank[difference])) {
+          winners.set(property, { value, rank })
+        }
+      }
+    }
+    const display = winners.get('display')?.value
+    const visibility = winners.get('visibility')?.value
+    const opacity = winners.get('opacity')?.value
+    return (display === undefined || /^(?:block|inline|inline-block|flex|inline-flex|grid|inline-grid|table|contents|flow-root)$/u.test(display))
+      && (visibility === undefined || visibility === 'visible')
+      && (opacity === undefined || (Number.isFinite(Number(opacity)) && Number(opacity) > 0))
+  })
 }
 
 /**
@@ -1804,9 +2359,17 @@ function cssRuleIsVisiblyConnected(rule: ParsedCssRule, dom: DomSnapshot): boole
 function domConnectedVisualTokens(
   html: string,
   viewport: { width: number; height: number },
+  runtimeManagedSlideSelectors: ReadonlySet<string> = new Set(),
 ): DomConnectedVisualTokens {
   const dom = extractDomSnapshot(html)
-  const rules = mergeCssRules(extractCssRules(html, viewport)).filter((rule) => cssRuleIsVisiblyConnected(rule, dom))
+  const cascadeRules = extractCssRules(html, viewport)
+  const parsedRules = mergeCssRules(cascadeRules)
+  const rules = parsedRules.filter((rule) => cssRuleIsVisiblyConnected(
+    rule,
+    dom,
+    cascadeRules,
+    runtimeManagedSlideSelectors,
+  ))
   const colors = new Set<string>()
   const fonts = new Set<string>()
   const selectors = new Set<string>()
@@ -1815,6 +2378,7 @@ function domConnectedVisualTokens(
   const variableValues = new Map<string, string>()
   const referencedVariables = new Set<string>()
   const fontVariables = new Set<string>()
+  const paintVariables = new Set<string>()
 
   for (const rule of rules) {
     selectors.add(rule.selector)
@@ -1823,13 +2387,14 @@ function domConnectedVisualTokens(
     for (const [property, value] of rule.declarations) {
       properties.add(property)
       if (property.startsWith('--')) variableValues.set(property, value)
-      else {
-        for (const color of value.match(STYLE_COLOR_PATTERN) ?? []) colors.add(normalizeCssColorToken(color))
+      else if (CSS_PAINT_PROPERTY.test(property)) {
+        for (const color of paintValue(value).match(STYLE_COLOR_PATTERN) ?? []) colors.add(normalizeCssColorToken(color))
       }
       for (const reference of value.matchAll(/var\(\s*(--[a-z][\w-]*)/giu)) {
         const variable = reference[1].toLowerCase()
         referencedVariables.add(variable)
         if (property === 'font-family') fontVariables.add(variable)
+        if (CSS_PAINT_PROPERTY.test(property)) paintVariables.add(variable)
       }
       if (property === 'font-family') {
         for (const family of value.split(',')) {
@@ -1857,6 +2422,10 @@ function domConnectedVisualTokens(
           fontVariables.add(nested)
           changed = true
         }
+        if (paintVariables.has(variable) && !paintVariables.has(nested)) {
+          paintVariables.add(nested)
+          changed = true
+        }
       }
     }
     if (!changed) break
@@ -1865,7 +2434,9 @@ function domConnectedVisualTokens(
     const value = variableValues.get(variable)
     if (!value) continue
     variables.add(variable)
-    for (const color of value.match(STYLE_COLOR_PATTERN) ?? []) colors.add(normalizeCssColorToken(color))
+    if (paintVariables.has(variable)) {
+      for (const color of paintValue(value).match(STYLE_COLOR_PATTERN) ?? []) colors.add(normalizeCssColorToken(color))
+    }
     if (fontVariables.has(variable)) {
       for (const family of value.split(',')) {
         const normalized = normalizeFontFamilyToken(family)
@@ -2001,6 +2572,7 @@ function concreteCustomElementName(value: string): string | undefined {
 interface ParsedCssRule {
   selector: string
   declarations: Map<string, string>
+  importantProperties?: Set<string>
 }
 
 interface DomClassUsage {
@@ -2014,7 +2586,11 @@ interface DomSnapshot {
   tags: Set<string>
   hiddenClasses: Map<string, Set<string>>
   hiddenIds: Map<string, Set<string>>
+  semanticallyHiddenClasses: Map<string, Set<string>>
+  semanticallyHiddenIds: Map<string, Set<string>>
   identifierPaths: Array<Array<Set<string>>>
+  /** Visible elements in source order, represented by their tag/class/id identifiers. */
+  elements: Array<Set<string>>
 }
 
 function boundGeneratedSourceProfile(
@@ -2162,11 +2738,12 @@ function parseCssRuleList(
     } else if (/^@(supports|layer|container|scope|document)\b/iu.test(header)) {
       parseCssRuleList(body, output, viewport)
     } else if (header && !header.startsWith('@')) {
-      const declarations = parseCssDeclarations(body)
+      const importantProperties = new Set<string>()
+      const declarations = parseCssDeclarations(body, importantProperties)
       if (declarations.size > 0) {
         for (const selector of splitCssSelectors(header)) {
           const normalized = normalizeCssSelector(selector)
-          if (normalized) output.push({ selector: normalized, declarations: new Map(declarations) })
+          if (normalized) output.push({ selector: normalized, declarations: new Map(declarations), importantProperties })
           if (output.length >= 2_048) break
         }
       }
@@ -2268,7 +2845,7 @@ function rangeComparisonMatches(left: number, operator: string, right: number): 
   return left >= right
 }
 
-function parseCssDeclarations(value: string): Map<string, string> {
+function parseCssDeclarations(value: string, importantProperties = new Set<string>()): Map<string, string> {
   const declarations = new Map<string, string>()
   const chunks: string[] = []
   let start = 0
@@ -2298,9 +2875,15 @@ function parseCssDeclarations(value: string): Map<string, string> {
     const separator = declarationColonIndex(chunk)
     if (separator < 1) continue
     const property = chunk.slice(0, separator).trim().toLowerCase()
-    if (!SOURCE_PROFILE_PROPERTIES.has(property) && !/^--[a-z][\w-]*$/u.test(property)) continue
+    // Parse bounded source declarations before applying any summary policy.
+    // The profile projector still selects SOURCE_PROFILE_PROPERTIES below;
+    // evidence consumers must not mistake omitted summary fields for absence.
+    if (!/^(?:--[a-z][\w-]*|-?[a-z][\w-]*)$/u.test(property)) continue
     const rawValue = chunk.slice(separator + 1).trim()
     if (!rawValue || rawValue.length > 2_000) continue
+    const important = /!important\s*$/iu.test(rawValue)
+    if (!important && importantProperties.has(property)) continue
+    if (important) importantProperties.add(property)
     declarations.set(property, normalizeCssDeclarationValue(property, rawValue))
   }
   return declarations
@@ -2354,10 +2937,14 @@ function mergeCssRules(rules: readonly ParsedCssRule[]): ParsedCssRule[] {
   for (const rule of rules) {
     const prior = merged.get(rule.selector)
     if (!prior) {
-      merged.set(rule.selector, { selector: rule.selector, declarations: new Map(rule.declarations) })
+      merged.set(rule.selector, { selector: rule.selector, declarations: new Map(rule.declarations), importantProperties: new Set(rule.importantProperties) })
       continue
     }
-    for (const [property, value] of rule.declarations) prior.declarations.set(property, value)
+    for (const [property, value] of rule.declarations) {
+      if (prior.importantProperties?.has(property) && !rule.importantProperties?.has(property)) continue
+      prior.declarations.set(property, value)
+      if (rule.importantProperties?.has(property)) prior.importantProperties?.add(property)
+    }
   }
   return [...merged.values()]
 }
@@ -2458,6 +3045,14 @@ function selectorIdentifiersExist(identifiers: readonly string[], dom: DomSnapsh
 }
 
 function selectorIdentifiersShareRelationship(selector: string, dom: DomSnapshot): boolean {
+  return dom.identifierPaths.some((path) => selectorMatchesIdentifierPath(selector, path))
+}
+
+function selectorMatchesIdentifierPath(
+  selector: string,
+  path: Array<Set<string>>,
+  terminalOnly = false,
+): boolean {
   const relationshipSurface = selectorRelationshipSurface(selector)
   if (!relationshipSurface) return false
   const surface = relationshipSurface
@@ -2478,22 +3073,21 @@ function selectorIdentifiersShareRelationship(selector: string, dom: DomSnapshot
       ...(tagName ? [`@${tagName}`] : []),
       ...identifiers,
     ]
-    if (relationshipIdentifiers.length === 0) return selectorIdentifiersExist(selectorIdentifiers(selector), dom)
+    if (relationshipIdentifiers.length === 0 && token !== '*') return false
     if (compounds.length > 0) combinators.push(pending ?? ' ')
     compounds.push(relationshipIdentifiers)
     pending = undefined
   }
   if (compounds.length === 0) return false
   if (compounds.length === 1) {
-    return dom.identifierPaths.some((path) => path.some((nodeIdentifiers) => (
+    return (terminalOnly ? path.slice(-1) : path).some((nodeIdentifiers) => (
       compounds[0].every((identifier) => nodeIdentifiers.has(identifier))
-    )))
+    ))
   }
   if (combinators.some((entry) => entry === '+' || entry === '~')) return false
-  return dom.identifierPaths.some((path) => {
     const visit = (compoundIndex: number, pathIndex: number): boolean => {
       if (!compounds[compoundIndex].every((identifier) => path[pathIndex]?.has(identifier))) return false
-      if (compoundIndex === compounds.length - 1) return true
+      if (compoundIndex === compounds.length - 1) return !terminalOnly || pathIndex === path.length - 1
       if (combinators[compoundIndex] === '>') return pathIndex + 1 < path.length && visit(compoundIndex + 1, pathIndex + 1)
       for (let next = pathIndex + 1; next < path.length; next += 1) {
         if (visit(compoundIndex + 1, next)) return true
@@ -2501,7 +3095,6 @@ function selectorIdentifiersShareRelationship(selector: string, dom: DomSnapshot
       return false
     }
     return path.some((_, index) => visit(0, index))
-  })
 }
 
 function selectorTargetsHeading(selector: string): boolean {
@@ -2523,8 +3116,16 @@ function extractDomSnapshot(content: string): DomSnapshot {
   const tags = new Set<string>()
   const hiddenClasses = new Map<string, Set<string>>()
   const hiddenIds = new Map<string, Set<string>>()
+  const semanticallyHiddenClasses = new Map<string, Set<string>>()
+  const semanticallyHiddenIds = new Map<string, Set<string>>()
   const identifierPaths: Array<Array<Set<string>>> = []
-  const stack: Array<{ tagName: string; hiddenReason?: string; identifierPath: Array<Set<string>> }> = []
+  const elements: Array<Set<string>> = []
+  const stack: Array<{
+    tagName: string
+    hiddenReason?: string
+    semanticHiddenReasons?: string[]
+    identifierPath: Array<Set<string>>
+  }> = []
   const voidTags = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'])
   for (const tag of content.matchAll(/<!--[\s\S]*?-->|<\/?([a-z][\w:-]*)\b((?:[^>"']|"[^"]*"|'[^']*')*)>/giu)) {
     if (tag[0].startsWith('<!--')) continue
@@ -2549,16 +3150,22 @@ function extractDomSnapshot(content: string): DomSnapshot {
         : /^0(?:\.0+)?$/u.test(inline.get('opacity') ?? '')
           ? 'inline opacity:0'
           : undefined
+    // `aria-hidden` and `inert` remove accessibility/interaction semantics,
+    // not paint. Decorative reference artwork commonly uses aria-hidden and
+    // must remain eligible for a visual StyleContract.
     const ownHiddenReason = ['template', 'noscript', 'script', 'style'].includes(tagName)
       ? `<${tagName}> subtree`
       : htmlHasAttribute(attributes, 'hidden')
         ? 'hidden attribute'
-        : htmlHasAttribute(attributes, 'inert')
-          ? 'inert attribute'
-          : htmlAttributeValue(attributes, 'aria-hidden')?.trim().toLowerCase() === 'true'
-            ? 'aria-hidden=true'
-            : inlineHidden
+        : inlineHidden
     const hiddenReason = stack.at(-1)?.hiddenReason ?? ownHiddenReason
+    const semanticHiddenReasons = [...new Set([
+      ...(stack.at(-1)?.semanticHiddenReasons ?? []),
+      ...(htmlHasAttribute(attributes, 'inert') ? ['inert attribute'] : []),
+      ...(htmlAttributeValue(attributes, 'aria-hidden')?.trim().toLowerCase() === 'true'
+        ? ['aria-hidden=true']
+        : []),
+    ])]
     if (!hiddenReason) tags.add(tagName)
     const identifiers = new Set<string>()
     identifiers.add(`@${tagName}`)
@@ -2571,6 +3178,11 @@ function extractDomSnapshot(content: string): DomSnapshot {
         reasons.add(hiddenReason)
         hiddenClasses.set(className, reasons)
         continue
+      }
+      if (semanticHiddenReasons.length > 0) {
+        const reasons = semanticallyHiddenClasses.get(className) ?? new Set<string>()
+        for (const reason of semanticHiddenReasons) reasons.add(reason)
+        semanticallyHiddenClasses.set(className, reasons)
       }
       const usage = classes.get(className) ?? { count: 0, inline: new Map<string, Set<string>>() }
       usage.count += 1
@@ -2588,17 +3200,47 @@ function extractDomSnapshot(content: string): DomSnapshot {
         const reasons = hiddenIds.get(id) ?? new Set<string>()
         reasons.add(hiddenReason)
         hiddenIds.set(id, reasons)
-      } else ids.add(id)
+      } else {
+        ids.add(id)
+        if (semanticHiddenReasons.length > 0) {
+          const reasons = semanticallyHiddenIds.get(id) ?? new Set<string>()
+          for (const reason of semanticHiddenReasons) reasons.add(reason)
+          semanticallyHiddenIds.set(id, reasons)
+        }
+      }
     }
     const identifierPath = hiddenReason
       ? stack.at(-1)?.identifierPath ?? []
       : [...(stack.at(-1)?.identifierPath ?? []), identifiers]
-    if (!hiddenReason && identifiers.size > 0) identifierPaths.push(identifierPath)
+    if (!hiddenReason && identifiers.size > 0) {
+      identifierPaths.push(identifierPath)
+      elements.push(identifiers)
+    }
     if (!voidTags.has(tagName) && !/\/\s*>$/u.test(tag[0])) {
-      stack.push({ tagName, identifierPath, ...(hiddenReason ? { hiddenReason } : {}) })
+      stack.push({
+        tagName,
+        identifierPath,
+        ...(hiddenReason ? { hiddenReason } : {}),
+        ...(semanticHiddenReasons.length > 0 ? { semanticHiddenReasons } : {}),
+      })
     }
   }
-  return { classes, ids, tags, hiddenClasses, hiddenIds, identifierPaths }
+  return {
+    classes,
+    ids,
+    tags,
+    hiddenClasses,
+    hiddenIds,
+    semanticallyHiddenClasses,
+    semanticallyHiddenIds,
+    identifierPaths,
+    elements,
+  }
+}
+
+function referenceSelectorRequiresInteractiveSemantics(selector: string): boolean {
+  return /(?:^|[-_.#])(?:button|controls?|keyboard|link|menu|nav(?:igation)?|next|pager|prev(?:ious)?|tab)(?:$|[-_.:# ])/iu.test(selector)
+    || /(?:^|[\s>+~])(?:a|button|input|nav|select|textarea)(?:$|[.#:[\s>+~])/iu.test(selector)
 }
 
 function htmlAttributeValue(attributes: string, name: string): string | undefined {
@@ -2616,19 +3258,66 @@ function verifySourceProfile(
   html: string,
   profile: ReferenceStyleSourceProfile,
   viewport: { width: number; height: number },
-): { violations: string[]; checked: number; matched: number } {
+  alternativeLayoutClasses: ReadonlySet<string> = new Set(),
+  runtimeManagedSlideSelectors: ReadonlySet<string> = new Set(),
+): {
+  violations: string[]
+  checked: number
+  matched: number
+  inlineVariantGaps: ReferenceStyleInlineVariantGap[]
+} {
   const candidateRules = mergeCssRules(extractCssRules(html, viewport))
   const candidateBySelector = new Map(candidateRules.map((rule) => [rule.selector, rule]))
   const candidateDom = extractDomSnapshot(html)
   const candidateBodyFont = globalFontFamily(candidateRules, ['body']) ?? globalFontFamily(candidateRules, ['html'])
   const candidateHeadingFont = globalFontFamily(candidateRules, ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
   const violations: string[] = []
+  const inlineVariantGaps: ReferenceStyleInlineVariantGap[] = []
+  const alternativeScopesByClass = new Map<string, Set<string>>()
+  const globallyRequiredClasses = new Set<string>()
+  for (const rule of profile.rules) {
+    if (!rule.requiredInDom) continue
+    const classNames = selectorIdentifiers(rule.selector)
+      .filter((identifier) => identifier.startsWith('.'))
+      .map((identifier) => identifier.slice(1))
+    const layoutRoots = classNames.filter((className) => alternativeLayoutClasses.has(className))
+    if (layoutRoots.length === 0) {
+      for (const className of classNames) globallyRequiredClasses.add(className)
+      continue
+    }
+    for (const className of classNames) {
+      const scopes = alternativeScopesByClass.get(className) ?? new Set<string>()
+      for (const root of layoutRoots) scopes.add(root)
+      alternativeScopesByClass.set(className, scopes)
+    }
+  }
   let checked = 0
   let matched = 0
   const check = (passes: boolean, violation: string) => {
     checked += 1
     if (passes) matched += 1
     else violations.push(violation)
+  }
+
+  // Render-profile layout roots are alternatives, not a checklist of classes
+  // to pile onto every adapted page. Enforce this in the source gate as well
+  // as the Browser gate so a model cannot hide a stacked pair behind compound
+  // CSS overrides that happen to reproduce one variant's pixels.
+  if (alternativeLayoutClasses.size > 0) {
+    const slides = candidateDom.elements.filter((identifiers) => identifiers.has('.slide'))
+    if (slides.length >= 3) {
+      slides.slice(1, -1).forEach((identifiers, interiorIndex) => {
+        const selected = [...alternativeLayoutClasses]
+          .filter((className) => identifiers.has(`.${className}`))
+          .sort()
+        check(
+          selected.length === 1,
+          selected.length === 0
+            ? `source interior slide ${interiorIndex + 2} must use exactly one alternative layout root; found none of ${JSON.stringify([...alternativeLayoutClasses].map((className) => `.${className}`))}`
+            : `source interior slide ${interiorIndex + 2} stacks alternative layout roots ${JSON.stringify(selected.map((className) => `.${className}`))}; remove every surplus root class from the slide class attribute instead of neutralizing it with compound CSS overrides`,
+        )
+      })
+    }
   }
 
   if (profile.bodyFontFamily) {
@@ -2646,6 +3335,16 @@ function verifySourceProfile(
 
   for (const expectedRule of profile.rules) {
     const identifiers = selectorIdentifiers(expectedRule.selector)
+    // Interior slide-root selectors are alternatives. When one is not used
+    // by this shorter adapted deck, its private subtree is outside the active
+    // source-verification surface; Browser attestation separately requires
+    // every actual interior slide to choose one real reference variant.
+    if (identifiers.some((identifier) => (
+      identifier.startsWith('.')
+      && alternativeLayoutClasses.has(identifier.slice(1))
+      && !candidateDom.classes.has(identifier.slice(1))
+    ))) continue
+    const requiresInteractiveSemantics = referenceSelectorRequiresInteractiveSemantics(expectedRule.selector)
     const candidateUsesAllIdentifiers = selectorIdentifiersShareRelationship(expectedRule.selector, candidateDom)
     const aliasRule = expectedRule.requiredInDom
       ? undefined
@@ -2676,10 +3375,17 @@ function verifySourceProfile(
       const hiddenReasons = identifier.startsWith('.')
         ? candidateDom.hiddenClasses.get(identifier.slice(1))
         : candidateDom.hiddenIds.get(identifier.slice(1))
+      const semanticHiddenReasons = requiresInteractiveSemantics
+        ? identifier.startsWith('.')
+          ? candidateDom.semanticallyHiddenClasses.get(identifier.slice(1))
+          : candidateDom.semanticallyHiddenIds.get(identifier.slice(1))
+        : undefined
       check(
-        exists,
+        exists && !semanticHiddenReasons?.size,
         hiddenReasons?.size
           ? `source selector ${expectedRule.selector} is hidden from candidate DOM (${identifier}: ${[...hiddenReasons].join(', ')})`
+          : semanticHiddenReasons?.size
+            ? `source selector ${expectedRule.selector} is semantically unavailable in candidate DOM (${identifier}: ${[...semanticHiddenReasons].join(', ')})`
           : `source selector ${expectedRule.selector} is not used by candidate DOM (missing ${identifier})`,
       )
     }
@@ -2695,7 +3401,15 @@ function verifySourceProfile(
       checked += expectedRule.declarations.length + (expectedRule.effectiveFontFamily ? 1 : 0)
       continue
     }
+    const runtimeManagedSlideRoot = runtimeManagedSlideSelectors.has(expectedRule.selector)
     for (const expected of expectedRule.declarations) {
+      // External custom-element controllers often own page stacking while a
+      // standalone deliverable implements the same single-stage behavior in
+      // its own CSS. Browser verification checks the active computed display,
+      // opacity, visibility, geometry, and occlusion; comparing the inactive
+      // base mechanism here would reject a visually equivalent runtime before
+      // that authoritative check can run.
+      if (runtimeManagedSlideRoot && RUNTIME_MANAGED_SLIDE_SOURCE_PROPERTIES.has(expected.property)) continue
       const actual = candidateRule.declarations.get(expected.property)
       check(
         actual === expected.value,
@@ -2723,24 +3437,63 @@ function verifySourceProfile(
 
   for (const expectedDom of profile.dom) {
     const candidateUsage = candidateDom.classes.get(expectedDom.className)
+    const alternativeScopes = alternativeScopesByClass.get(expectedDom.className)
+    if (
+      !globallyRequiredClasses.has(expectedDom.className)
+      && alternativeScopes
+      && ![...alternativeScopes].some((root) => candidateDom.classes.has(root))
+    ) continue
+    if (alternativeLayoutClasses.has(expectedDom.className) && !candidateUsage) continue
     if (!expectedDom.required && !candidateUsage) continue
     check(Boolean(candidateUsage), `source DOM is missing required .${expectedDom.className}`)
     if (!candidateUsage) {
-      checked += expectedDom.inlineStyleVariants?.reduce((total, variant) => total + variant.values.length, 0) ?? 0
+      for (const variant of expectedDom.inlineStyleVariants ?? []) {
+        checked += variant.values.length
+        inlineVariantGaps.push({
+          className: expectedDom.className,
+          property: variant.property,
+          required: [...variant.values],
+          current: [],
+          missing: [...variant.values],
+        })
+      }
       continue
     }
     for (const variant of expectedDom.inlineStyleVariants ?? []) {
       const actualValues = candidateUsage.inline.get(variant.property)
-      for (const expectedValue of variant.values) {
-        check(
-          Boolean(actualValues?.has(expectedValue)),
-          `source .${expectedDom.className} inline ${variant.property} is missing variant "${expectedValue}"`,
-        )
+      const missing = variant.values.filter((expectedValue) => !actualValues?.has(expectedValue))
+      checked += variant.values.length
+      matched += variant.values.length - missing.length
+      if (missing.length === 0) continue
+      // Always surface already-satisfied required values before unrelated
+      // candidate values. This keeps the complete invariant visible within a
+      // bounded diagnostic even for adversarially variant-heavy HTML.
+      const currentRequired = variant.values.filter((expectedValue) => actualValues?.has(expectedValue))
+      const currentExtras = [...(actualValues ?? [])]
+        .filter((value) => !variant.values.includes(value))
+        .slice(0, SOURCE_PROFILE_MAX_INLINE_VALUES)
+      const gap: ReferenceStyleInlineVariantGap = {
+        className: expectedDom.className,
+        property: variant.property,
+        required: [...variant.values],
+        current: [...currentRequired, ...currentExtras],
+        missing,
       }
+      inlineVariantGaps.push(gap)
+      violations.push(
+        `source .${gap.className} inline ${gap.property} variants required ${JSON.stringify(gap.required)}, `
+        + `current ${JSON.stringify(gap.current)}, missing ${JSON.stringify(gap.missing)}; `
+        + 'preserve every current required variant and add each missing value on another existing visible instance instead of replacing one required variant with another',
+      )
     }
   }
 
-  return { violations: [...new Set(violations)].slice(0, 128), checked, matched }
+  return {
+    violations: [...new Set(violations)].slice(0, 128),
+    checked,
+    matched,
+    inlineVariantGaps: inlineVariantGaps.slice(0, SOURCE_PROFILE_MAX_DOM_CLASSES),
+  }
 }
 
 function staticVisualSurface(value: string): string {
@@ -2792,7 +3545,22 @@ function cssColorRgb(value: string): [number, number, number] | undefined {
 function unexpectedPrimaryFontFamilies(surface: string, allowedFonts: readonly string[]): string[] {
   const allowed = new Set(allowedFonts.map((font) => normalizeStyleText(font)))
   const violations = new Set<string>()
-  for (const match of surface.matchAll(/font-family\s*:\s*([^;}]+)/giu)) {
+  // Attribute values are HTML-decoded by the parser; style bodies are raw
+  // CSS. A literal font-family example in visible text is neither of these.
+  const css: string[] = []
+  const pending: DefaultTreeAdapterMap['node'][] = [parse(surface)]
+  while (pending.length) {
+    const node = pending.pop()!
+    if ('tagName' in node) {
+      const inline = node.attrs.find((attribute) => attribute.name === 'style')?.value
+      if (inline) css.push(inline)
+      if (node.tagName === 'style') css.push(node.childNodes
+        .filter((child): child is DefaultTreeAdapterMap['textNode'] => child.nodeName === '#text')
+        .map((child) => child.value).join(''))
+    }
+    if ('childNodes' in node) pending.push(...node.childNodes)
+  }
+  for (const match of css.join('\n').matchAll(/font-family\s*:\s*([^;}]+)/giu)) {
     const primary = match[1]
       .split(',')[0]
       ?.trim()

@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { createHash } from 'node:crypto'
 import { execFile as execFileCallback } from 'node:child_process'
 import { createServer } from 'node:http'

@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { createServer } from 'node:http'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'

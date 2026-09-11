@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { SessionEvent } from '../shared/types.js'
 import { createApp } from './app.js'
+import { createReferenceSourceResolution } from './reference-source-resolution.js'
 import { SessionStore } from './session-store.js'
 
 const roots: string[] = []
@@ -87,6 +88,13 @@ async function seedCompletedTurn(
       { role: 'assistant', content: 'Answer to undo' },
     ]
     state.turnMessageStarts = { [priorTurnId]: 0, [targetTurnId]: 2 }
+    state.activeReferenceSourceResolution = createReferenceSourceResolution(
+      'https://github.com/example/beautiful-templates#paper',
+      [{
+        url: 'https://raw.githubusercontent.com/example/beautiful-templates/HEAD/templates/paper/template.html',
+        origin: 'tentative_convention',
+      }],
+    )
   })
   return { sessionId, priorTurnId, targetTurnId, final }
 }
@@ -127,6 +135,7 @@ describe('Arena undo-last-turn action', () => {
       ])
       expect(state.turnMessageStarts).toEqual({ [seeded.priorTurnId]: 0 })
       expect(state.pendingTurnUndo).toBeUndefined()
+      expect(state.activeReferenceSourceResolution).toBeUndefined()
       const events = await created.store.events(seeded.sessionId)
       const undoEvents = events.filter((event) => event.type === 'turn.undone')
       expect(undoEvents).toHaveLength(1)

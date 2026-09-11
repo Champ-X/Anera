@@ -12,6 +12,7 @@ import { BrowserManager } from './browser-manager.js'
 import { BLUE_PROFESSIONAL_TEMPLATE_HTML } from './fixtures/blue-professional-template.fixture.js'
 import {
   extractReferenceStyleSourceProfile,
+  renderedReferenceRuntimeManagedSlideSelectors,
   type ReferenceStyleContract,
 } from './reference-style.js'
 
@@ -65,6 +66,24 @@ function referenceDeckHtml(headline: string, totalSlides = 3, keyboardHint = 'Us
   </script></body></html>`
 }
 
+function positionedAccentDeckHtml(headline: string, accentLeft = -80): string {
+  return referenceDeckHtml(headline)
+    .replace(
+      '.layout-cover{justify-content:center;padding-left:115px}',
+      '.layout-cover{justify-content:center;align-items:center;padding-left:115px}',
+    )
+    .replace('</style>', `
+      .title-label{position:relative;align-self:center;display:inline-block}
+      .title-label h1{margin:0}
+      .title-label::before{content:"";position:absolute;left:50%;top:-12px;width:8px;height:8px;border-radius:50%;background:#1e2bfa}
+      .title-accent-3{position:absolute;left:${accentLeft}px;top:20px;width:40px;height:40px;background:#1e2bfa}
+    </style>`)
+    .replace(
+      `<section class="slide active layout-cover"><h1>${headline}</h1>`,
+      `<section class="slide active layout-cover"><div class="title-label"><h1>${headline}</h1><span class="title-accent-3"></span></div>`,
+    )
+}
+
 function statefulCounterDeckHtml(headline: string, totalSlides = 4): string {
   return referenceDeckHtml(headline, totalSlides)
     .replace(
@@ -105,6 +124,35 @@ function externalControllerDeckHtml(): string {
     <section class="slide s-toc"><div class="runner">Index</div><div class="body"><h2>Index</h2></div><footer class="footer">02</footer></section>
     <section class="slide s-stats"><div class="runner">Stats</div><div class="body"><h2>Stats</h2></div><footer class="footer">03</footer></section>
     <section class="slide s-cta"><div class="runner">Encore</div><h1>Encore</h1><footer class="footer">04</footer></section>
+  </deck-stage></body></html>`
+}
+
+function classlessCustomElementDeckHtml(): string {
+  return externalControllerDeckHtml()
+    .replace('deck-stage>section.slide', 'deck-stage>section')
+    .replaceAll('class="slide ', 'class="')
+    .replaceAll('.runner', '.topbar')
+    .replaceAll('class="runner"', 'class="topbar"')
+    .replaceAll('.footer', '.slide-meta')
+    .replaceAll('class="footer"', 'class="slide-meta"')
+}
+
+function editorialTriToneDeckHtml(): string {
+  return `<!doctype html><html><head><script src="deck-stage.js"></script><style>
+    *{box-sizing:border-box;margin:0}html,body{width:100%;height:100%;overflow:hidden;background:#7a1f35;color:#7a1f35;font-family:Arial,sans-serif}
+    deck-stage section{position:relative;width:100vw;height:100vh;overflow:hidden}
+    .pill{display:inline-flex;padding:12px 28px;border-radius:999px;white-space:nowrap}.footer{position:absolute;inset:auto 64px 36px}
+    .s-cover{background:#f2b6c6}.s-cover .meta{position:absolute;inset:48px 64px auto;display:flex;justify-content:space-between}
+    .s-cover .pill-cluster{position:absolute;inset:120px 64px auto;display:flex;flex-wrap:wrap;gap:22px}
+    .s-cover .wordmark{position:absolute;inset:auto 64px 80px;display:flex;font-size:160px;font-weight:800}
+    .s-manifesto{background:#f2d86a;display:grid;grid-template-columns:1fr 1fr}.s-manifesto .left{padding:80px 64px;display:flex;flex-direction:column;justify-content:space-between}.s-manifesto .right{padding:80px 64px;background:#7a1f35;color:#f2d86a;display:flex;flex-direction:column;justify-content:space-between}
+    .s-grid{padding:72px 64px;background:#f2b6c6}.s-grid .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:24px}.s-grid .card{height:260px;padding:28px;border-radius:28px;background:#7a1f35;color:#f2d86a}
+    .s-closer{padding:80px 64px;background:#7a1f35;color:#f2d86a}.s-closer .top{display:flex;justify-content:space-between}.s-closer .big{font-size:240px;color:#f2b6c6}.s-closer .corner-pills{position:absolute;right:64px;top:200px;display:flex;flex-direction:column;gap:12px}.s-closer .grid{position:absolute;inset:auto 64px 100px;display:grid;grid-template-columns:repeat(4,1fr);gap:24px}
+  </style></head><body><deck-stage>
+    <section class="s-cover" data-screen-label="01 Cover"><div class="meta"><span>Vol. 04</span><span>Editorial Brief</span></div><div class="pill-cluster"><span class="pill">focus</span><span class="pill">culture</span></div><div class="wordmark">Studio &amp; Salon</div></section>
+    <section class="s-manifesto" data-screen-label="02 Manifesto"><div class="left"><h2>Manifesto</h2><p>Editorial premise.</p></div><div class="right"><h3>Chapter one</h3><p>Measured contrast.</p></div></section>
+    <section class="s-grid" data-screen-label="03 Values"><h2>Values</h2><div class="grid"><article class="card">One</article><article class="card">Two</article><article class="card">Three</article><article class="card">Four</article></div></section>
+    <section class="s-closer" data-screen-label="04 Colophon"><div class="top"><span>Colophon</span><span>No. 04</span></div><div class="big">Fin.</div><div class="corner-pills"><span class="pill">issue 04</span><span class="pill">colophon</span></div><div class="grid"><span>Editorial</span><span>Type</span><span>Printed by</span><span>Correspondence</span></div></section>
   </deck-stage></body></html>`
 }
 
@@ -229,7 +277,10 @@ describe('browser manager', () => {
   it('atomically captures viewport-sized screenshots for the cover, content, and closing phases', async () => {
     const manager = new BrowserManager()
     managers.push(manager)
-    const source = phaseColorDeckHtml()
+    const source = phaseColorDeckHtml().replace(
+      '<div class="cover-decoration"></div>',
+      '<div class="cover-decoration" aria-hidden="true"></div>',
+    )
     const sourceProfile = extractReferenceStyleSourceProfile(source, RENDER_CONTRACT)!
     const viewport = { width: 800, height: 600 }
     const bundle = await manager.captureReferenceRenderBundle(
@@ -237,10 +288,19 @@ describe('browser manager', () => {
       sourceProfile,
       '7'.repeat(64),
       viewport,
+      { textParents: [
+        { variant: 'v1', slot: 't1', path: [0] },
+        { variant: 'v2', slot: 't1', path: [0, 0] },
+        { variant: 'v2', slot: 't2', path: [1] },
+      ] },
     )
 
+    expect(bundle.textFontFamilies).toEqual(['"Space Grotesk", sans-serif', '"Space Grotesk", sans-serif', 'Inter, sans-serif'])
     expect(bundle.profile.phases).toMatchObject({
-      cover: { anchors: expect.arrayContaining([expect.objectContaining({ selector: '.layout-cover' })]) },
+      cover: { anchors: expect.arrayContaining([
+        expect.objectContaining({ selector: '.layout-cover' }),
+        expect.objectContaining({ selector: '.layout-cover .cover-decoration' }),
+      ]) },
       content: { anchors: expect.arrayContaining([expect.objectContaining({ selector: '.slide-header' })]) },
       closing: { anchors: expect.arrayContaining([expect.objectContaining({ selector: '.layout-closing' })]) },
     })
@@ -259,6 +319,49 @@ describe('browser manager', () => {
       [30, 70, 240, 255],
     ])
   }, 20_000)
+
+  it('uses authored auto sizing for positioned text containers omitted from the bounded source rules', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const longCopy = 'A deliberately long reference paragraph that wraps across several source lines'
+    const source = referenceDeckHtml('Composite typography')
+      .replace('</style>', `.lower{position:absolute;left:60px;right:60px;bottom:100px;display:flex;gap:32px}.lower p{max-width:280px;font-size:32px;margin:0}
+        .right{position:absolute;right:100px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:18px;max-width:380px}
+        .right h2{font-size:72px;margin:0}.right p{font-size:24px;margin:0}</style>`)
+      .replace('<div class="cover-decoration"></div>', `<div class="cover-decoration"></div><div class="lower"><p>${longCopy}</p></div>`)
+      .replace('<section class="slide">', '<section class="slide layout-content">')
+      .replace('<div>Replaceable content 1</div>', `<div class="right"><h2>Reference display</h2><p>${longCopy}</p></div>`)
+    const sourceProfile = extractReferenceStyleSourceProfile(source, RENDER_CONTRACT)!
+    // Real large templates can omit these less salient rules from their
+    // bounded profile. The Browser must derive auto sizing from the actual
+    // author CSS, not from selector names or the candidate's geometry.
+    sourceProfile.rules = sourceProfile.rules.filter((rule) => !/\.(?:lower|right)\b/u.test(rule.selector))
+    const profile = await manager.captureReferenceRenderProfile(source, sourceProfile, '2'.repeat(64), RENDER_CONTRACT.viewport)
+    const completeProfile = await manager.captureReferenceRenderProfile(source,
+      extractReferenceStyleSourceProfile(source, RENDER_CONTRACT)!, '3'.repeat(64), RENDER_CONTRACT.viewport)
+    expect(completeProfile.interiorVariants?.find((variant) => variant.layoutSelector === '.layout-content')?.profile.anchors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ selector: '.layout-content .right', geometry: 'intrinsic-size', authoredBox: true })]))
+    const candidate = source.replaceAll(longCopy, 'Short copy').replace('Reference display', 'Title')
+    const check = async (html: string, phase: 'cover' | 'content') => {
+      await manager.open('authored-auto-container', `data:text/html,${encodeURIComponent(html)}`)
+      await manager.setViewport('authored-auto-container', RENDER_CONTRACT.viewport.width, RENDER_CONTRACT.viewport.height)
+      if (phase === 'content') await manager.press('authored-auto-container', 'ArrowRight')
+      return manager.verifyRenderedReferenceStyle('authored-auto-container', profile, phase)
+    }
+    for (const phase of ['cover', 'content'] as const) {
+      const result = await check(candidate, phase)
+      expect(result, result.violations.join('\n')).toMatchObject({ fidelity: 'pass' })
+    }
+    for (const [from, to, phase] of [
+      ['bottom:100px', 'bottom:160px', 'cover'],
+      ['right:100px', 'right:180px', 'content'],
+      ['max-width:380px', 'max-width:220px', 'content'],
+      ['gap:18px', 'gap:40px', 'content'],
+    ] as const) {
+      const result = await check(candidate.replace(from, to), phase)
+      expect(result.fidelity, `${from}: ${result.violations.join('\n')}`).toBe('mismatch')
+    }
+  }, 30_000)
 
   it('captures script-controlled custom-element decks without executing their external controller', async () => {
     const manager = new BrowserManager()
@@ -285,6 +388,7 @@ describe('browser manager', () => {
     expect(bundle.profile.interiorVariants?.map((variant) => variant.layoutSelector)).toEqual([
       '.s-toc', '.s-stats',
     ])
+    expect(bundle.profile.sharedAnchorSelectors).toEqual(expect.arrayContaining(['.runner', '.footer']))
     for (const phase of ['cover', 'content', 'closing'] as const) {
       expect(bundle.profile.phases[phase].anchors).toEqual(expect.arrayContaining([
         expect.objectContaining({ selector: '.runner' }),
@@ -292,6 +396,310 @@ describe('browser manager', () => {
       ]))
     }
   }, 20_000)
+
+  it('accepts equivalent self-contained slide stacking while retaining strict rendered geometry', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = externalControllerDeckHtml()
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      colors: ['#9f1239', '#166534', '#1d4ed8', '#6b21a8'],
+      fonts: ['Inter'],
+      requiredMarkers: [
+        'deck-stage>section.slide', '.runner', '.footer', '.s-cover', '.s-toc', '.s-stats', '.s-cta',
+      ],
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const renderProfile = await manager.captureReferenceRenderProfile(
+      source,
+      sourceProfile,
+      '4'.repeat(64),
+      contract.viewport,
+    )
+    expect(renderedReferenceRuntimeManagedSlideSelectors(renderProfile)).toContain('deck-stage>section.slide')
+
+    const candidate = source
+      .replace('<script src="deck-stage.js"></script>', '')
+      .replace(
+        'deck-stage>section.slide{position:relative;width:100vw;',
+        'deck-stage>section.slide{position:absolute;inset:0;opacity:0;visibility:hidden;width:100vw;',
+      )
+      .replace('</style>', 'deck-stage>section.slide.active{opacity:1;visibility:visible}</style>')
+      .replace('<section class="slide s-cover">', '<section class="slide s-cover active">')
+      .replace('</body>', `<script>
+        const slides=[...document.querySelectorAll('deck-stage>section.slide')];let current=0;
+        const show=(next)=>{current=Math.max(0,Math.min(slides.length-1,next));slides.forEach((slide,index)=>slide.classList.toggle('active',index===current))};
+        addEventListener('keydown',(event)=>{if(event.key==='ArrowRight')show(current+1);if(event.key==='End')show(slides.length-1)});
+        show(0);
+      </script></body>`)
+
+    await manager.open('self-contained-controller', `data:text/html,${encodeURIComponent(candidate)}`)
+    const cover = await manager.verifyRenderedReferenceStyle('self-contained-controller', renderProfile, 'cover')
+    expect(cover, cover.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+    await manager.press('self-contained-controller', 'ArrowRight')
+    const content = await manager.verifyRenderedReferenceStyle('self-contained-controller', renderProfile, 'content')
+    expect(content, content.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const centered = candidate.replace('inset:0;opacity:0', 'inset:0;left:50%;transform:translateX(-50%);opacity:0')
+    await manager.open('self-contained-centered', `data:text/html,${encodeURIComponent(centered)}`)
+    const equivalent = await manager.verifyRenderedReferenceStyle('self-contained-centered', renderProfile, 'cover')
+    expect(equivalent, equivalent.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+    const translated = centered.replace('translateX(-50%)', 'translateX(-40%)')
+    await manager.open('self-contained-shifted', `data:text/html,${encodeURIComponent(translated)}`)
+    const shifted = await manager.verifyRenderedReferenceStyle('self-contained-shifted', renderProfile, 'cover')
+    expect(shifted.fidelity).toBe('mismatch')
+
+    const drifted = candidate.replace('width:100vw;height:100vh', 'width:calc(100vw - 80px);height:100vh')
+    await manager.open('self-contained-controller-drift', `data:text/html,${encodeURIComponent(drifted)}`)
+    const drift = await manager.verifyRenderedReferenceStyle('self-contained-controller-drift', renderProfile, 'cover')
+    expect(drift.fidelity).toBe('mismatch')
+    expect(drift.violations.join('\n')).toMatch(/deck-stage>section\.slide.*size expected/iu)
+  }, 30_000)
+
+  it('treats localized nested display-title glyph width as content while preserving directional spacing', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = externalControllerDeckHtml()
+      .replace('</style>', `
+        .s-cover{display:flex;align-items:center;justify-content:center}
+        .s-cover .title{font:180px/1 Arial,sans-serif;text-align:center}
+        .s-cover .title .l2{display:block;padding-left:180px;color:white}
+      </style>`)
+      .replace('<h1>After Hours</h1>', '<div class="title">After<span class="l2">Hours.</span></div>')
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      colors: ['#9f1239', '#166534', '#1d4ed8', '#6b21a8'],
+      fonts: ['Arial', 'Inter'],
+      requiredMarkers: [
+        'deck-stage>section.slide', '.s-cover .title .l2', '.runner', '.footer', '.s-toc', '.s-stats', '.s-cta',
+      ],
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    expect(sourceProfile.rules.find((rule) => rule.selector === '.s-cover .title .l2')?.declarations)
+      .toContainEqual({ property: 'padding-left', value: '180px' })
+    const renderProfile = await manager.captureReferenceRenderProfile(
+      source,
+      sourceProfile,
+      '5'.repeat(64),
+      contract.viewport,
+    )
+    const titleLine = renderProfile.phases.cover.anchors.find((anchor) => (
+      anchor.selector === '.s-cover .title .l2'
+    ))
+    expect(titleLine).toMatchObject({ geometry: 'intrinsic-size' })
+    expect(titleLine?.styles[0]).toMatchObject({ 'padding-left': '180px' })
+
+    const localized = source
+      .replace('<script src="deck-stage.js"></script>', '')
+      .replace('<section class="slide s-cover">', '<section class="slide s-cover active">')
+      .replace('</style>', 'deck-stage>section.slide:not(.active){display:none}</style>')
+      .replace('After<span class="l2">Hours.</span>', 'Hot<span class="l2">Week.</span>')
+    await manager.open('localized-display-title', `data:text/html,${encodeURIComponent(localized)}`)
+    const current = await manager.verifyRenderedReferenceStyle('localized-display-title', renderProfile, 'cover')
+    expect(current, current.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const legacyProfile = structuredClone(renderProfile)
+    const legacyTitleLine = legacyProfile.phases.cover.anchors.find((anchor) => (
+      anchor.selector === '.s-cover .title .l2'
+    ))!
+    legacyTitleLine.geometry = 'intrinsic-block'
+    for (const style of legacyTitleLine.styles) delete style['padding-left']
+    const legacy = await manager.verifyRenderedReferenceStyle('localized-display-title', legacyProfile, 'cover')
+    expect(legacy, legacy.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const spacingDrift = localized.replace('padding-left:180px', 'padding-left:260px')
+    await manager.open('localized-display-title-drift', `data:text/html,${encodeURIComponent(spacingDrift)}`)
+    const drift = await manager.verifyRenderedReferenceStyle('localized-display-title-drift', renderProfile, 'cover')
+    expect(drift.fidelity).toBe('mismatch')
+    expect(drift.violations.join('\n')).toMatch(/\.s-cover \.title \.l2.*padding-left expected "180px" but found "260px"/iu)
+  }, 30_000)
+
+  it('captures classless custom-element slide sections with template-specific persistent chrome', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = classlessCustomElementDeckHtml()
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      colors: ['#9f1239', '#166534', '#1d4ed8', '#6b21a8'],
+      fonts: ['Inter'],
+      requiredMarkers: [
+        'deck-stage>section', '.topbar', '.slide-meta', '.s-cover', '.s-toc', '.s-stats', '.s-cta',
+      ],
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const bundle = await manager.captureReferenceRenderBundle(
+      source,
+      sourceProfile,
+      'a'.repeat(64),
+      contract.viewport,
+    )
+
+    expect(bundle.profile.interiorVariants?.map((variant) => variant.layoutSelector)).toEqual([
+      '.s-toc', '.s-stats',
+    ])
+    expect(bundle.profile.sharedAnchorSelectors).toEqual(expect.arrayContaining(['.topbar', '.slide-meta']))
+    for (const phase of ['cover', 'content', 'closing'] as const) {
+      expect(bundle.profile.phases[phase].anchors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ selector: '.topbar' }),
+        expect.objectContaining({ selector: '.slide-meta' }),
+      ]))
+    }
+    expect(new Set(Object.values(bundle.screenshots).map((png) => (
+      createHash('sha256').update(png).digest('hex')
+    ))).size).toBe(3)
+  }, 20_000)
+
+  it('captures editorial tri-tone decks that intentionally have no shared chrome', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = editorialTriToneDeckHtml()
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      sourceUrl: 'https://github.com/zarazhangrui/beautiful-html-templates/blob/main/templates/editorial-tri-tone',
+      colors: ['#f2b6c6', '#f2d86a', '#7a1f35'],
+      fonts: ['Arial'],
+      layout: ['1920x1080 editorial slides with phase-local compositions'],
+      components: ['pill cluster', 'split manifesto', 'value grid', 'colophon'],
+      requiredMarkers: ['deck-stage', '.s-cover', '.s-manifesto', '.s-grid', '.s-closer', '.pill'],
+      signature: 'Tri-tone editorial deck with unique layouts and no global navigation DOM.',
+      viewport: { width: 1920, height: 1080 },
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const bundle = await manager.captureReferenceRenderBundle(
+      source,
+      sourceProfile,
+      '7'.repeat(64),
+      contract.viewport,
+    )
+
+    expect(bundle.profile).not.toHaveProperty('sharedAnchorSelectors')
+    expect(bundle.profile.phases.cover.anchors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ selector: '.s-cover', geometry: 'strict' }),
+      expect.objectContaining({ selector: '.s-cover .pill-cluster' }),
+    ]))
+    expect(bundle.profile.phases.content.anchors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ selector: '.s-manifesto', geometry: 'strict' }),
+    ]))
+    expect(bundle.profile.phases.closing.anchors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ selector: '.s-closer', geometry: 'strict' }),
+      expect.objectContaining({ selector: '.s-closer .corner-pills' }),
+    ]))
+    expect(bundle.profile.interiorVariants?.map((variant) => variant.layoutSelector)).toEqual([
+      '.s-manifesto', '.s-grid',
+    ])
+    expect(new Set(Object.values(bundle.screenshots).map((png) => (
+      createHash('sha256').update(png).digest('hex')
+    ))).size).toBe(3)
+  }, 20_000)
+
+  it('allows copy-driven pill wrapping while retaining the cluster anchor', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const pills = (labels: readonly string[]) => labels
+      .map((label) => `<span class="pill">${label}</span>`)
+      .join('')
+    const referenceLabels = [
+      'editorial', 'cinema', 'television', 'performance', 'celebrity', 'streaming',
+      'festival', 'awards', 'criticism', 'culture', 'production', 'audience',
+    ]
+    const candidateLabels = [
+      '影', '剧', '乐', '演', '星', '流', '节', '奖', '评', '文', '制', '观',
+    ]
+    const source = editorialTriToneDeckHtml()
+      .replace('white-space:nowrap}', 'white-space:nowrap;font-size:44px}')
+      .replace(
+        '<span class="pill">focus</span><span class="pill">culture</span>',
+        pills(referenceLabels),
+      )
+    const candidate = source.replace(pills(referenceLabels), pills(candidateLabels))
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      colors: ['#f2b6c6', '#f2d86a', '#7a1f35'],
+      fonts: ['Arial'],
+      requiredMarkers: ['deck-stage', '.s-cover', '.s-manifesto', '.s-grid', '.s-closer', '.pill'],
+      viewport: { width: 1920, height: 1080 },
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const renderProfile = await manager.captureReferenceRenderProfile(
+      source,
+      sourceProfile,
+      '6'.repeat(64),
+      contract.viewport,
+    )
+    expect(renderProfile.phases.cover.anchors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ selector: '.s-cover .pill', geometry: 'intrinsic-size', count: 12 }),
+    ]))
+
+    await manager.open('wrapped-pill-copy', `data:text/html,${encodeURIComponent(candidate)}`)
+    await manager.setViewport('wrapped-pill-copy', contract.viewport.width, contract.viewport.height)
+    const localized = await manager.verifyRenderedReferenceStyle('wrapped-pill-copy', renderProfile, 'cover')
+    expect(localized, localized.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+    const legacyProfile = structuredClone(renderProfile)
+    for (const anchor of legacyProfile.phases.cover.anchors) {
+      if (anchor.selector === '.s-cover .pill') anchor.geometry = 'intrinsic-block'
+      if (anchor.selector === '.pill') anchor.geometry = 'size'
+    }
+    const legacyLocalized = await manager.verifyRenderedReferenceStyle('wrapped-pill-copy', legacyProfile, 'cover')
+    expect(legacyLocalized, legacyLocalized.violations.join('\n'))
+      .toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const shiftedCluster = candidate.replace('inset:120px 64px auto', 'inset:180px 64px auto')
+    await manager.open('wrapped-pill-drift', `data:text/html,${encodeURIComponent(shiftedCluster)}`)
+    await manager.setViewport('wrapped-pill-drift', contract.viewport.width, contract.viewport.height)
+    const drift = await manager.verifyRenderedReferenceStyle('wrapped-pill-drift', renderProfile, 'cover')
+    expect(drift.fidelity).toBe('mismatch')
+    expect(drift.violations.join('\n')).toMatch(/pill-cluster.*position/iu)
+  }, 25_000)
+
+  it('allows copy-driven width in legacy positioned pill stacks while retaining their anchored edge', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = editorialTriToneDeckHtml()
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      colors: ['#f2b6c6', '#f2d86a', '#7a1f35'],
+      fonts: ['Arial'],
+      requiredMarkers: ['deck-stage', '.s-cover', '.s-manifesto', '.s-grid', '.s-closer', '.pill'],
+      viewport: { width: 1920, height: 1080 },
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const renderProfile = await manager.captureReferenceRenderProfile(
+      source,
+      sourceProfile,
+      '8'.repeat(64),
+      contract.viewport,
+    )
+    const legacyProfile = structuredClone(renderProfile)
+    const cornerPills = legacyProfile.phases.closing.anchors.find((anchor) => (
+      anchor.selector === '.s-closer .corner-pills'
+    ))
+    expect(cornerPills).toMatchObject({ geometry: 'intrinsic-size' })
+    cornerPills!.geometry = 'strict'
+
+    const activeClosing = source
+      .replace('<script src="deck-stage.js"></script>', '<style>deck-stage section:not(.active){display:none!important}deck-stage section.active{display:block!important;position:relative!important;top:0!important;left:0!important}</style>')
+      .replace('<section class="s-closer"', '<section class="s-closer active"')
+      .replace('<span class="pill">issue 04</span><span class="pill">colophon</span>', '<span class="pill">i</span><span class="pill">weekly brief</span>')
+    await manager.open('legacy-closing-pill-copy', `data:text/html,${encodeURIComponent(activeClosing)}`)
+    await manager.setViewport('legacy-closing-pill-copy', contract.viewport.width, contract.viewport.height)
+    const localized = await manager.verifyRenderedReferenceStyle(
+      'legacy-closing-pill-copy',
+      legacyProfile,
+      'closing',
+    )
+    expect(localized, localized.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const shifted = activeClosing.replace('top:200px', 'top:260px')
+    await manager.open('legacy-closing-pill-drift', `data:text/html,${encodeURIComponent(shifted)}`)
+    await manager.setViewport('legacy-closing-pill-drift', contract.viewport.width, contract.viewport.height)
+    const drift = await manager.verifyRenderedReferenceStyle(
+      'legacy-closing-pill-drift',
+      legacyProfile,
+      'closing',
+    )
+    expect(drift.fidelity).toBe('mismatch')
+    expect(drift.violations.join('\n')).toMatch(/corner-pills.*position/iu)
+  }, 25_000)
 
   it('treats localized intrinsic text sizing as content while retaining fixed template geometry', async () => {
     const manager = new BrowserManager()
@@ -316,27 +724,41 @@ describe('browser manager', () => {
     ]))
     expect(renderProfile.interiorVariants?.find((variant) => variant.layoutSelector === '.s-section')?.profile.anchors)
       .toEqual(expect.arrayContaining([
-        expect.objectContaining({ selector: '.s-section .right', geometry: 'intrinsic-block-center' }),
+        expect.objectContaining({
+          selector: '.s-section .right', geometry: 'intrinsic-size', authoredBox: true,
+          styles: [expect.objectContaining({ width: 'auto', height: 'auto', top: '50%', right: '100px', 'max-width': '380px' })],
+        }),
       ]))
+
+    const legacyRenderProfile = structuredClone(renderProfile)
+    const legacyCenteredAnchor = legacyRenderProfile.interiorVariants
+      ?.find((variant) => variant.layoutSelector === '.s-section')
+      ?.profile.anchors.find((anchor) => anchor.selector === '.s-section .right')
+    if (!legacyCenteredAnchor) throw new Error('fixture lacks the centered section anchor')
+    // A real legacy profile stored used pixel values and had no Typed OM
+    // authority. Changing only geometry on a new authoredBox profile would
+    // accidentally test the new evidence path twice instead of migration.
+    await manager.open('localized-intrinsic-source', `data:text/html,${encodeURIComponent(source)}`)
+    await manager.press('localized-intrinsic-source', 'ArrowRight')
+    await manager.press('localized-intrinsic-source', 'ArrowRight')
+    const sourcePage = manager['sessions'].get('localized-intrinsic-source')!.page
+    legacyCenteredAnchor.styles = [await sourcePage.evaluate((properties) => {
+      const style = getComputedStyle(document.querySelector('.s-section .right')!)
+      return Object.fromEntries(properties.map((property) => [property, style.getPropertyValue(property)]))
+    }, Object.keys(legacyCenteredAnchor.styles[0]!))]
+    legacyCenteredAnchor.geometry = 'strict'
+    delete legacyCenteredAnchor.authoredBox
+    expect(legacyCenteredAnchor.styles[0]).toMatchObject({ top: '450px', 'max-width': '380px' })
 
     await manager.open('localized-intrinsic-copy', `data:text/html,${encodeURIComponent(localizedIntrinsicDeckHtml(true))}`)
     const localized = await manager.verifyRenderedReferenceStyle('localized-intrinsic-copy', renderProfile, 'cover')
     expect(localized, localized.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
     await manager.press('localized-intrinsic-copy', 'ArrowRight')
     await manager.press('localized-intrinsic-copy', 'ArrowRight')
-    const legacyRenderProfile = structuredClone(renderProfile)
-    const legacyCenteredAnchor = legacyRenderProfile.interiorVariants
-      ?.find((variant) => variant.layoutSelector === '.s-section')
-      ?.profile.anchors.find((anchor) => anchor.selector === '.s-section .right')
-    if (!legacyCenteredAnchor) throw new Error('fixture lacks the centered section anchor')
-    legacyCenteredAnchor.geometry = 'strict'
-    const legacyLocalizedContent = await manager.verifyRenderedReferenceStyle(
-      'localized-intrinsic-copy',
-      legacyRenderProfile,
-      'content',
-    )
-    expect(legacyLocalizedContent, legacyLocalizedContent.violations.join('\n'))
-      .toMatchObject({ fidelity: 'pass', score: 100 })
+    for (const profile of [renderProfile, legacyRenderProfile]) {
+      const content = await manager.verifyRenderedReferenceStyle('localized-intrinsic-copy', profile, 'content')
+      expect(content, content.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+    }
 
     const geometryDrift = localizedIntrinsicDeckHtml(true).replace(
       'right:100px;top:50%;',
@@ -345,10 +767,160 @@ describe('browser manager', () => {
     await manager.open('localized-intrinsic-drift', `data:text/html,${encodeURIComponent(geometryDrift)}`)
     await manager.press('localized-intrinsic-drift', 'ArrowRight')
     await manager.press('localized-intrinsic-drift', 'ArrowRight')
-    const drift = await manager.verifyRenderedReferenceStyle('localized-intrinsic-drift', legacyRenderProfile, 'content')
-    expect(drift.fidelity).toBe('mismatch')
-    expect(drift.violations.join('\n')).toMatch(/\.s-section \.right.*(?:position|top|right)/iu)
+    for (const profile of [renderProfile, legacyRenderProfile]) {
+      const drift = await manager.verifyRenderedReferenceStyle('localized-intrinsic-drift', profile, 'content')
+      expect(drift.fidelity).toBe('mismatch')
+      expect(drift.violations.join('\n')).toMatch(/\.s-section \.right.*(?:position|top|right)/iu)
+    }
   }, 35_000)
+
+  it('compares positioned decoration inside a moving intrinsic parent by containing-block offsets', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = positionedAccentDeckHtml('REFERENCE')
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      requiredMarkers: [
+        ...RENDER_CONTRACT.requiredMarkers,
+        '.title-label', '.title-label::before', '.title-accent-3',
+      ],
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const renderProfile = await manager.captureReferenceRenderProfile(
+      source,
+      sourceProfile,
+      '6'.repeat(64),
+      contract.viewport,
+    )
+    const accent = renderProfile.phases.cover.anchors.find((anchor) => anchor.selector === '.title-accent-3')
+    expect(accent).toMatchObject({
+      geometry: 'strict',
+      containingBlockOffsets: [expect.objectContaining({ left: expect.any(Number), top: expect.any(Number) })],
+    })
+
+    const localized = positionedAccentDeckHtml('本周娱乐行业重要趋势与市场动态')
+    await manager.open('moving-accent-parent', `data:text/html,${encodeURIComponent(localized)}`)
+    const matching = await manager.verifyRenderedReferenceStyle('moving-accent-parent', renderProfile, 'cover')
+    expect(matching, matching.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+    expect(matching.violations.join('\n')).not.toMatch(/title-label::before/iu)
+
+    const legacyProfile = structuredClone(renderProfile)
+    for (const anchor of legacyProfile.phases.cover.anchors) delete anchor.containingBlockOffsets
+    const legacyMatching = await manager.verifyRenderedReferenceStyle('moving-accent-parent', legacyProfile, 'cover')
+    expect(legacyMatching, legacyMatching.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+
+    await manager.open(
+      'moving-accent-drift',
+      `data:text/html,${encodeURIComponent(positionedAccentDeckHtml('本周娱乐行业重要趋势与市场动态', -100))}`,
+    )
+    const drift = await manager.verifyRenderedReferenceStyle('moving-accent-drift', renderProfile, 'cover')
+    expect(drift.fidelity).toBe('mismatch')
+    expect(drift.violations.join('\n')).toMatch(/title-accent-3.*(?:position|left)/iu)
+    const legacyDrift = await manager.verifyRenderedReferenceStyle('moving-accent-drift', legacyProfile, 'cover')
+    expect(legacyDrift.fidelity).toBe('mismatch')
+    expect(legacyDrift.violations.join('\n')).toMatch(/title-accent-3.*(?:position|left)/iu)
+  }, 30_000)
+
+  it('treats positioned replacement copy as intrinsic but reports semantic-tag margin drift with directional guidance', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = externalControllerDeckHtml()
+      .replace('*{box-sizing:border-box;margin:0}', '*{box-sizing:border-box}')
+      .replace('</style>', `
+        .s-cover .tagline{position:absolute;left:40px;top:90px;font:20px monospace;letter-spacing:.16em;text-transform:uppercase}
+        .s-cover .footnote{position:absolute;left:40px;bottom:80px;max-width:360px;font:20px/1.4 Arial,sans-serif}
+        .s-cover .runner{right:40px;display:flex;justify-content:space-between}
+        .runner .pill{padding:6px 14px;border:2px solid currentColor;border-radius:999px;font:18px monospace}
+        .s-cover .kicker{position:absolute;left:40px;top:140px;padding:8px 16px;background:#166534;border:2px solid white;font:20px monospace}
+        .s-cover .badge{position:absolute;right:40px;top:140px;padding:10px 18px;background:#1d4ed8;border:2px solid white;font:20px monospace}
+        .s-cover .fixed-label{position:absolute;left:400px;top:220px;width:180px;height:60px;background:#6b21a8;font:20px monospace}
+      </style>`)
+      .replace(
+        '<section class="slide s-cover">',
+        '<section class="slide s-cover"><div class="tagline">REFERENCE EDITION</div><div class="footnote">Short reference copy.</div><div class="kicker">REFERENCE KICKER</div><div class="badge">REFERENCE BADGE</div><div class="fixed-label">FIXED LABEL</div>',
+      )
+      .replace('<div class="runner">Cover</div>', '<div class="runner"><span>Cover</span><span class="pill">REFERENCE TOPIC</span></div>')
+    const contract: ReferenceStyleContract = {
+      ...RENDER_CONTRACT,
+      colors: ['#9f1239', '#166534', '#1d4ed8', '#6b21a8'],
+      fonts: ['Arial', 'monospace'],
+      requiredMarkers: [
+        '.s-cover', '.s-toc', '.s-stats', '.s-cta', '.runner', '.footer', '.tagline', '.footnote',
+        '.pill', '.kicker', '.badge', '.fixed-label',
+      ],
+    }
+    const sourceProfile = extractReferenceStyleSourceProfile(source, contract)!
+    const renderProfile = await manager.captureReferenceRenderProfile(
+      source,
+      sourceProfile,
+      '9'.repeat(64),
+      contract.viewport,
+    )
+    expect(renderProfile.phases.cover.anchors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ selector: '.s-cover .tagline', geometry: 'intrinsic-size' }),
+      expect.objectContaining({ selector: '.s-cover .footnote', geometry: 'intrinsic-size' }),
+      expect.objectContaining({ selector: '.runner .pill', geometry: 'intrinsic-size' }),
+      expect.objectContaining({ selector: '.s-cover .kicker', geometry: 'intrinsic-size' }),
+      expect.objectContaining({ selector: '.s-cover .badge', geometry: 'intrinsic-size' }),
+      expect.objectContaining({ selector: '.s-cover .fixed-label', geometry: 'strict' }),
+    ]))
+
+    const localized = source
+      .replace('REFERENCE EDITION', '本周人工智能热点新闻')
+      .replace('Short reference copy.', '更长的本地化说明文字会自然换行，但不应被误判为模板几何漂移。')
+      .replace('REFERENCE TOPIC', '本周主题')
+      .replace('REFERENCE KICKER', '监管与安全')
+      .replace('REFERENCE BADGE', '重点关注')
+    await manager.open('positioned-intrinsic-copy', `data:text/html,${encodeURIComponent(localized)}`)
+    const localizedVerification = await manager.verifyRenderedReferenceStyle(
+      'positioned-intrinsic-copy',
+      renderProfile,
+      'cover',
+    )
+    expect(localizedVerification, localizedVerification.violations.join('\n'))
+      .toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const legacyStrictProfile = structuredClone(renderProfile)
+    for (const anchor of legacyStrictProfile.phases.cover.anchors) {
+      if (['.s-cover .tagline', '.s-cover .footnote', '.s-cover .kicker', '.s-cover .badge'].includes(anchor.selector)) {
+        anchor.geometry = 'strict'
+      }
+      if (anchor.selector === '.runner .pill') anchor.geometry = 'intrinsic-block'
+    }
+    const legacyLocalized = await manager.verifyRenderedReferenceStyle(
+      'positioned-intrinsic-copy',
+      legacyStrictProfile,
+      'cover',
+    )
+    expect(legacyLocalized, legacyLocalized.violations.join('\n'))
+      .toMatchObject({ fidelity: 'pass', score: 100 })
+
+    const fixedGeometryDrift = localized.replace('width:180px;height:60px', 'width:240px;height:60px')
+    await manager.open('positioned-fixed-label-drift', `data:text/html,${encodeURIComponent(fixedGeometryDrift)}`)
+    const fixedDrift = await manager.verifyRenderedReferenceStyle(
+      'positioned-fixed-label-drift',
+      renderProfile,
+      'cover',
+    )
+    expect(fixedDrift.fidelity).toBe('mismatch')
+    expect(fixedDrift.violations.join('\n')).toMatch(/\.s-cover \.fixed-label.*size/iu)
+
+    const marginDrift = localized.replace(
+      '<div class="footnote">更长的本地化说明文字会自然换行，但不应被误判为模板几何漂移。</div>',
+      '<p class="footnote">更长的本地化说明文字会自然换行，但不应被误判为模板几何漂移。</p>',
+    )
+    await manager.open('positioned-intrinsic-margin', `data:text/html,${encodeURIComponent(marginDrift)}`)
+    const drift = await manager.verifyRenderedReferenceStyle(
+      'positioned-intrinsic-margin',
+      renderProfile,
+      'cover',
+    )
+    expect(drift.fidelity).toBe('mismatch')
+    expect(drift.violations.join('\n')).toMatch(/bottom edge is .* too high/iu)
+    expect(drift.violations.join('\n')).toContain('Computed bottom already matches "80px"')
+    expect(drift.violations.join('\n')).toMatch(/computed margin expected "0px" but found "(?:20px 0px|20px 0px 20px)"/iu)
+    expect(drift.violations.join('\n')).toContain('preserve that anchor')
+  }, 30_000)
 
   it('rejects opacity-only vertical-flow slides and accepts a single in-stage active slide', async () => {
     const manager = new BrowserManager()
@@ -384,6 +956,65 @@ describe('browser manager', () => {
     await manager.press('single-stage-deck', 'ArrowRight')
     const content = await manager.verifyRenderedReferenceStyle('single-stage-deck', renderProfile, 'content')
     expect(content, content.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+
+    // A missing native controller need not leave any .active class behind.
+    // Reject its overlapping visible roots before isolated variant sampling
+    // can manufacture reassuring layout scores.
+    const controllerMissing = source
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/giu, '')
+      .replace(/class="([^"\n]*\bslide\b[^"\n]*)"/gu, (_match, classes: string) => `class="${classes.split(/\s+/u).filter((name) => name !== 'active').join(' ')}"`)
+      .replace('.slide{display:none;position:relative;', '.slide{display:block;position:absolute;inset:0;')
+    await manager.open('missing-native-stage', `data:text/html,${encodeURIComponent(controllerMissing)}`)
+    const missing = await manager.verifyRenderedReferenceStyle('missing-native-stage', renderProfile, 'content')
+    expect(missing.fidelity).toBe('mismatch')
+    expect(missing.violations[0]).toMatch(/active presentation roots.*exactly one active slide/iu)
+    expect(missing.interiorAttestation).toBeUndefined()
+  }, 30_000)
+
+  it('profiles hash-authorized native runtime inheritance and restores data-attribute slide state', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    const source = externalControllerDeckHtml()
+    const runtime = `customElements.define('deck-stage',class extends HTMLElement{connectedCallback(){const root=this.attachShadow({mode:'open'});const style=document.createElement('style');style.textContent=':host{display:block;width:100vw;height:100vh;font-family:monospace}::slotted(*){position:absolute!important;inset:0;visibility:hidden}::slotted([data-deck-active]){visibility:visible}';root.append(style,document.createElement('slot'));const slides=[...this.children];let index=0;const show=()=>slides.forEach((slide,i)=>slide.toggleAttribute('data-deck-active',i===index));show();window.addEventListener('keydown',e=>{if(e.key==='ArrowRight')index=Math.min(index+1,slides.length-1);if(e.key==='Home')index=0;if(e.key==='End')index=slides.length-1;show()})}});`
+    const dependency = { url: 'https://example.com/deck-stage.js', content: runtime, bytes: Buffer.byteLength(runtime), sha256: createHash('sha256').update(runtime).digest('hex') }
+    const contract: ReferenceStyleContract = { ...RENDER_CONTRACT, fonts: ['Inter'],
+      colors: ['#9f1239', '#166534', '#1d4ed8', '#6b21a8'], requiredMarkers: ['.runner', '.footer', '.s-cover', '.s-toc', '.s-stats', '.s-cta'] }
+    const profile = extractReferenceStyleSourceProfile(source, contract)!
+    const poisonedMarkup = source.replace('</body>', '<script>document.querySelector(".s-cover").style.padding="0"</script></body>')
+    const bundle = await manager.captureReferenceRenderBundle(poisonedMarkup, profile, 'a'.repeat(64), contract.viewport, { runtimeScripts: [dependency] })
+    const inherited = bundle.profile.phases.cover.anchors.find((anchor) => anchor.selector === 'deck-stage>section.slide')
+    expect(inherited?.styles[0]['font-family']).toContain('monospace')
+    // A harmless stale class must neither choose cover typography/layout after
+    // navigation nor require the native controller to mutate that class.
+    const candidate = source.replace('<script src="deck-stage.js"></script>', '')
+      .replace('class="slide s-cover"', 'class="slide s-cover active"')
+      .replace('</body>', `<script>${runtime}</script></body>`)
+    await manager.open('native-runtime-state', `data:text/html,${encodeURIComponent(candidate)}`)
+    const cover = await manager.verifyRenderedReferenceStyle('native-runtime-state', bundle.profile, 'cover')
+    expect(cover, cover.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100 })
+    const content = await manager.press('native-runtime-state', 'ArrowRight')
+    const verified = await manager.verifyRenderedReferenceStyle('native-runtime-state', bundle.profile, 'content')
+    expect(verified, verified.violations.join('\n')).toMatchObject({ fidelity: 'pass', score: 100,
+      interiorAttestation: { candidateSlides: 2, matchedSlides: 2 } })
+    expect((await manager.snapshot('native-runtime-state')).text).toBe(content.text)
+    expect((await manager.press('native-runtime-state', 'ArrowRight')).text).toContain('Stats')
+    expect((await manager.press('native-runtime-state', 'Home')).text).toContain('After Hours')
+    // The same stale class becomes a real defect when light-DOM visibility
+    // rules still depend on it. Reject both a stuck cover and a blank stage
+    // before forced all-interior activation can hide the broken navigation.
+    for (const inactive of ['.active', '[data-deck-active]']) {
+      const broken = candidate.replace('</style>', `deck-stage>section.slide{opacity:0;visibility:hidden}.slide.active{opacity:1;visibility:visible}deck-stage>section.slide:not(${inactive}){display:none}</style>`)
+      await manager.open('native-runtime-conflict', `data:text/html,${encodeURIComponent(broken)}`)
+      await manager.press('native-runtime-conflict', 'ArrowRight')
+      const conflict = await manager.verifyRenderedReferenceStyle('native-runtime-conflict', bundle.profile, 'content')
+      expect(conflict.fidelity).toBe('mismatch')
+      expect(conflict.violations[0]).toContain('active slide 2 does not visibly intersect')
+      expect(conflict.violations[0]).toContain('Native [data-deck-active] selects slide(s) 2; .active selects slide(s) 1')
+      expect(conflict.interiorAttestation).toBeUndefined()
+    }
+    await expect(manager.captureReferenceRenderBundle(source, profile, 'a'.repeat(64), contract.viewport, {
+      runtimeScripts: [{ ...dependency, content: 'tampered' }],
+    })).rejects.toThrow(/corrupted/)
   }, 30_000)
 
   it('waits for trusted embedded font faces and fails closed when capture or candidate faces are missing', async () => {
@@ -640,6 +1271,10 @@ describe('browser manager', () => {
       .toEqual(expect.arrayContaining([expect.objectContaining({ selector: '.layout-dashboard .stats-grid' })]))
     expect(renderProfile.interiorVariants?.find((variant) => variant.layoutSelector === '.layout-bars')?.profile.anchors)
       .toEqual(expect.arrayContaining([expect.objectContaining({ selector: '.layout-bars .bars-container' })]))
+    expect(renderProfile.interiorVariants?.find((variant) => variant.layoutSelector === '.layout-timeline')?.profile.anchors)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ selector: '.layout-timeline .step-circle', geometry: 'flow-size' }),
+      ]))
 
     // Keep the same four real layout variants used by the AI-weekly-news
     // regression. Copy is deliberately collapsed to tiny localized strings so
@@ -672,6 +1307,32 @@ describe('browser manager', () => {
       },
     })
     expect(valid.violations).toEqual([])
+
+    const stackedVariant = validSix.replace(
+      'slide layout-agenda',
+      'slide layout-agenda layout-metrics',
+    )
+    await manager.open('blue-stacked-variant', `data:text/html,${encodeURIComponent(stackedVariant)}`)
+    await manager.press('blue-stacked-variant', 'ArrowRight')
+    const stackedVerification = await manager.verifyRenderedReferenceStyle(
+      'blue-stacked-variant', renderProfile, 'content',
+    )
+    expect(stackedVerification.fidelity).toBe('mismatch')
+    expect(stackedVerification.violations.join('\n')).toMatch(
+      /content slide 2 stacks alternative reference layout variants \.layout-agenda, \.layout-metrics/iu,
+    )
+
+    const shiftedFlowDecoration = validSix.replace(
+      '</head>',
+      '<style>html body .layout-timeline .step-circle{position:relative!important;top:90px!important}</style></head>',
+    )
+    await manager.open('blue-real-flow-shift', `data:text/html,${encodeURIComponent(shiftedFlowDecoration)}`)
+    await manager.press('blue-real-flow-shift', 'ArrowRight')
+    const shiftedFlowVerification = await manager.verifyRenderedReferenceStyle(
+      'blue-real-flow-shift', renderProfile, 'content',
+    )
+    expect(shiftedFlowVerification.fidelity).toBe('mismatch')
+    expect(shiftedFlowVerification.violations.join('\n')).toMatch(/layout-timeline \.step-circle.*top/iu)
 
     const driftedThirdPage = validSix.replace(
       '</head>',
@@ -796,7 +1457,7 @@ describe('browser manager', () => {
       sourceProfile,
       'f'.repeat(64),
       RENDER_CONTRACT.viewport,
-    )).rejects.toThrow(/at least three \.slide/iu)
+    )).rejects.toThrow(/at least three identifiable slide roots/iu)
   }, 15_000)
 
   it('opens, snapshots stable refs, operates form controls, scrolls, resizes, and reads console output', async () => {
@@ -860,9 +1521,11 @@ describe('browser manager', () => {
       </style>
       <button onclick="document.querySelector('#card').classList.add('hidden'); document.querySelector('#status').classList.add('ack')">Apply</button>
       <article id="card">Web Degraded</article>
+      <span aria-hidden="true">Painted decoration</span>
       <span id="status"></span>`
     const opened = await manager.open('visual-text', `data:text/html,${encodeURIComponent(html)}`)
     expect(opened.text).toContain('Web Degraded')
+    expect(opened.text).toContain('Painted decoration')
     expect(opened.text).toContain('Unacknowledged')
     const button = (opened.interactive as Array<{ ref: string; text?: string }>).find((item) => item.text === 'Apply')
     const clicked = await manager.click('visual-text', { ref: button?.ref })
@@ -1016,6 +1679,44 @@ describe('browser manager', () => {
     await sharedBrowser?.close()
     await waitFor(() => manager.diagnostics().browserInstances === 0 && manager.diagnostics().sessionContexts === 0)
     expect((await manager.snapshot('two')).title).toBe('Session Two')
+    expect(manager.diagnostics()).toEqual({ browserInstances: 1, sessionContexts: 1, pendingSessionContexts: 0 })
+  })
+
+  it('closes the Browser transport before Context drain during a reusable reset', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    await manager.open('before-reset', 'data:text/html,<title>Before reset</title>')
+    const internal = manager as unknown as {
+      sessions: Map<string, { context: { close(): Promise<void> } }>
+      browser: { close(): Promise<void> }
+    }
+    const context = internal.sessions.get('before-reset')!.context
+    const browser = internal.browser
+    const originalContextClose = context.close.bind(context)
+    const originalBrowserClose = browser.close.bind(browser)
+    const order: string[] = []
+    let releaseContext = () => {}
+    const contextGate = new Promise<void>((resolveGate) => { releaseContext = resolveGate })
+    vi.spyOn(context, 'close').mockImplementationOnce(async () => {
+      order.push('context')
+      await contextGate
+      await originalContextClose()
+    })
+    vi.spyOn(browser, 'close').mockImplementationOnce(async () => {
+      order.push('browser')
+      await originalBrowserClose()
+    })
+    const reset = manager.closeEverything()
+    try {
+      await waitFor(() => order.length > 0)
+      expect(order[0]).toBe('browser')
+    } finally {
+      releaseContext()
+      await reset
+    }
+    expect(order).toEqual(['browser', 'context'])
+    expect(manager.diagnostics()).toEqual({ browserInstances: 0, sessionContexts: 0, pendingSessionContexts: 0 })
+    expect((await manager.open('after-reset', 'data:text/html,<title>After reset</title>')).title).toBe('After reset')
     expect(manager.diagnostics()).toEqual({ browserInstances: 1, sessionContexts: 1, pendingSessionContexts: 0 })
   })
 

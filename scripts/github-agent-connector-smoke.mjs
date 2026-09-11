@@ -1,3 +1,4 @@
+import './legacy-live-test-disabled.mjs'
 import { createServer } from 'node:http'
 import { createVerify, generateKeyPairSync } from 'node:crypto'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'

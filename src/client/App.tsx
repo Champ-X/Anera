@@ -1,3 +1,4 @@
+import { ModelSelector } from './ModelSelector'
 import {
   Archive,
   ArrowDown,
@@ -26,6 +27,7 @@ import {
   Image as ImageIcon,
   LoaderCircle,
   ListChecks,
+  Maximize2,
   Menu,
   MousePointer2,
   Paperclip,
@@ -75,6 +77,7 @@ import type {
 } from '../shared/types'
 import { AGENT_LEADERBOARD_PATH, AgentLeaderboard, isAgentLeaderboardPath } from './AgentLeaderboard'
 import { api } from './api'
+import { canOpenWebsitePreview, shouldCloseWebsitePreview } from './preview-lifecycle'
 import {
   SHOWCASE_NAVIGATION_EVENT,
   SHOWCASE_REPLAY_EVENT,
@@ -384,6 +387,7 @@ export type TimelineItem =
   | { kind: 'user'; key: string; content: string; attachments: string[]; customFeedbackTurn?: boolean; reviewedNodeId?: string }
   | { kind: 'activity'; key: string; label: string }
   | { kind: 'thought'; key: string; label: string; content: string; running: boolean; duration?: string }
+  | { kind: 'progress'; key: string; content: string; streaming: boolean }
   | { kind: 'plan'; key: string; plan: PlanState }
   | ToolGroupTimelineItem
   | ToolTimelineItem
@@ -849,11 +853,7 @@ export function App() {
   }, [thankYouPhase])
 
   useEffect(() => {
-    if (
-      previewTarget
-      && snapshot?.website.status !== 'running'
-      && previewTarget.url === snapshot?.website.previewUrl
-    ) {
+    if (shouldCloseWebsitePreview(previewTarget?.url, snapshot?.website)) {
       closePreview()
     }
   }, [closePreview, previewTarget, snapshot?.website.previewUrl, snapshot?.website.status])
@@ -1313,6 +1313,18 @@ export function App() {
     clearWorkspacePersistenceTimer()
     let source: EventSource | undefined
     let disposed = false
+    let eventFrame: number | undefined
+    let pendingEvents: SessionEvent[] = []
+    const flushEvents = () => {
+      if (eventFrame !== undefined) window.cancelAnimationFrame(eventFrame)
+      eventFrame = undefined
+      const batch = pendingEvents
+      pendingEvents = []
+      if (disposed || batch.length === 0) return
+      setSnapshot((current) => current && current.session.id === activeId
+        ? applyEventsToSnapshot(current, batch)
+        : current)
+    }
     void (async () => {
       let afterSeq = 0
       try {
@@ -1329,9 +1341,13 @@ export function App() {
       source = new EventSource(`/api/sessions/${activeId}/events?after=${afterSeq}`)
       source.addEventListener('session-event', (message) => {
         const event = JSON.parse((message as MessageEvent).data) as SessionEvent
-        setSnapshot((current) => current && current.session.id === activeId
-          ? applyEventToSnapshot(current, event)
-          : current)
+        pendingEvents.push(event)
+        if (event.type.endsWith('.delta')) {
+          // Preserve every durable delta, but render a burst once per frame.
+          // Terminal/tool boundaries flush synchronously so none can overtake
+          // their preceding text when the browser throttles animation frames.
+          eventFrame ??= window.requestAnimationFrame(flushEvents)
+        } else flushEvents()
         const persistence = workspacePersistenceFromEvent(event)
         if (persistence) {
           clearWorkspacePersistenceTimer()
@@ -1375,6 +1391,8 @@ export function App() {
     return () => {
       disposed = true
       source?.close()
+      if (eventFrame !== undefined) window.cancelAnimationFrame(eventFrame)
+      pendingEvents = []
       window.clearTimeout(refreshTimer.current)
       clearWorkspacePersistenceTimer()
     }
@@ -1928,6 +1946,7 @@ export function App() {
             models={agentModels}
             modelListUnavailable={modelListUnavailable}
             modelSelection={snapshot?.session.modelSelection ?? null}
+            currentModel={snapshot?.session.model}
             codingMode={Boolean(snapshot?.repository || repositoryPanelOpen)}
             connectionsOpen={connectionsOpen}
             connectionsEnabled={githubConnection.status === 'connected' && repositoryPanelOpen}
@@ -2092,12 +2111,14 @@ export function App() {
               try { await api.stop(activeId) }
               catch (reason) { void refreshCredits().catch(() => undefined); setError(messageOf(reason)) }
             }}
-            onResume={async () => {
-              if (!activeId) return
+            onResume={async (model) => {
+              if (!activeId || activeComposerOperation) return
+              setActiveComposerOperation('submit')
               setUndoOffer(undefined)
               setThankYouPhase(null)
-              try { await api.resume(activeId) }
+              try { await api.resume(activeId, model) }
               catch (reason) { void refreshCredits().catch(() => undefined); setError(messageOf(reason)) }
+              finally { setActiveComposerOperation(null) }
             }}
             onNewChat={async () => {
               navigateToDraft(false, true, true)
@@ -2676,6 +2697,7 @@ export function Composer(props: {
   models: AgentModelOption[]
   modelListUnavailable: boolean
   modelSelection: string | null
+  currentModel?: string
   codingMode: boolean
   connectionsOpen: boolean
   connectionsEnabled: boolean
@@ -2684,7 +2706,7 @@ export function Composer(props: {
   onConnections: (anchor: PopoverAnchor) => void
   onSend: (content: string, attachments: ComposerAttachment[], model: string | null, reviewedNodeId?: string) => Promise<void>
   onStop: () => Promise<void>
-  onResume: () => Promise<void>
+  onResume: (model?: string) => Promise<void>
   onNewChat: () => Promise<void>
 }) {
   const [value, setValue] = useState('')
@@ -2692,7 +2714,9 @@ export function Composer(props: {
   const [uploading, setUploading] = useState(false)
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [creditOpen, setCreditOpen] = useState(false)
-  const [modelSelection, setModelSelection] = useState(props.modelSelection ?? 'auto')
+  const [modelOverride, setModelSelection] = useState<string>()
+  const modelSelection = modelOverride ?? props.modelSelection ?? props.currentModel ?? props.models[0]?.id ?? ''
+  const modelPending = !modelSelection
   const fileInput = useRef<HTMLInputElement>(null)
   const editor = useRef<HTMLDivElement>(null)
   const composing = useRef(false)
@@ -2714,8 +2738,8 @@ export function Composer(props: {
     if (props.codingMode) setAttachments([])
   }, [props.codingMode])
   useEffect(() => {
-    setModelSelection(props.modelSelection ?? 'auto')
-  }, [props.modelSelection])
+    setModelSelection(undefined)
+  }, [props.modelSelection, props.currentModel])
   useEffect(() => {
     const command = props.draftCommand
     if (!command || command.sessionId !== props.sessionId) return
@@ -2781,14 +2805,14 @@ export function Composer(props: {
     }
   }
   const submit = async () => {
-    if (props.readOnly || props.submitDisabled || (!value.trim() && (!attachments.length || props.codingMode)) || props.running || blockedBySessionLimit || uploading) return
+    if (props.readOnly || props.submitDisabled || modelPending || (!value.trim() && (!attachments.length || props.codingMode)) || props.running || blockedBySessionLimit || uploading) return
     const content = value
     setValue('')
     try {
       await props.onSend(
         content,
         attachments.map((attachment) => ({ ...attachment })),
-        modelSelection === 'auto' ? null : modelSelection,
+        modelSelection,
         props.reviewedNodeId,
       )
       setAttachments([])
@@ -2942,17 +2966,19 @@ export function Composer(props: {
             }}
           >{props.connectionsEnabled ? <Github size={14} /> : <Plug size={14} />}<ChevronDown className={props.connectionsOpen ? 'open' : ''} size={11} /></button>
           <span className="composer-spacer" />
-          {props.resumable && !props.running && <button className="resume-button" onClick={() => void props.onResume()}><RotateCcw size={13} /> Continue</button>}
+          {props.resumable && !props.running && <button className="resume-button" disabled={props.readOnly || props.submitDisabled || modelPending} onClick={() => void props.onResume(modelSelection)}><RotateCcw size={13} /> Continue</button>}
           <CreditGaugeControl balance={props.creditBalance} isFreeSession={props.isFreeSession} open={creditOpen} onOpenChange={setCreditOpen} />
           {props.running
             ? <button className="send-button stop" onClick={() => void props.onStop()} aria-label="Stop agent"><CircleStop size={17} /></button>
             : <button
               className="send-button"
-                disabled={Boolean(props.readOnly || props.submitDisabled || blockedBySessionLimit || ((!value.trim() && (attachments.length === 0 || props.codingMode)) || uploading))}
+                disabled={Boolean(props.readOnly || props.submitDisabled || modelPending || blockedBySessionLimit || ((!value.trim() && (attachments.length === 0 || props.codingMode)) || uploading))}
                 onClick={() => void submit()}
                 aria-label="Send message"
               ><ArrowUp size={17} /></button>}
         </div>
+        <ModelSelector models={props.models} value={modelSelection} unavailable={props.modelListUnavailable}
+          disabled={Boolean(editorLocked || props.submitDisabled)} onChange={setModelSelection} />
       </div>
       {props.repositoryControl}
     </div>
@@ -3149,6 +3175,9 @@ function Timeline({ item, sessionId, onPreview, onApproval, onHitl, onGiveFeedba
   )
   if (item.kind === 'activity') return <AssistantActivityRow item={item} />
   if (item.kind === 'thought') return <ThoughtRow item={item} />
+  if (item.kind === 'progress') return <div className="assistant-progress markdown" aria-busy={item.streaming}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
+  </div>
   if (item.kind === 'plan') return <PlanCard item={item} />
   if (item.kind === 'exploration') return <ExplorationGroup item={item} />
   if (item.kind === 'tool-group') return <ArenaToolGroup item={item} />
@@ -3885,19 +3914,46 @@ function ResolvedHitl({ item }: { item: HitlTimelineItem }) {
   return <section className={`hitl-card resolved ${item.decision}`}><Check size={15} /><strong>{label}</strong></section>
 }
 
-function ThoughtRow({ item }: { item: Extract<TimelineItem, { kind: 'thought' }> }) {
-  const [open, setOpen] = useState(item.running || Boolean(item.content))
-  useEffect(() => {
-    if (item.running && item.content) setOpen(true)
-  }, [item.content, item.running])
+export function ThoughtRow({ item }: { item: Extract<TimelineItem, { kind: 'thought' }> }) {
+  // Automatic disclosure follows the current thought; a user's explicit
+  // choice persists across deltas and completion. Historical thoughts start
+  // collapsed, keeping the execution narrative readable after reconnect.
+  const [disclosure, setDisclosure] = useState<boolean | null>(null)
+  const open = disclosure ?? item.running
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const followingTail = useRef(true)
+  const readingPosition = useRef(0)
+  const mountedBody = useRef<HTMLDivElement | null>(null)
+  useLayoutEffect(() => {
+    const body = bodyRef.current
+    if (body && item.running) {
+      if (followingTail.current) body.scrollTop = body.scrollHeight
+      else if (body !== mountedBody.current) body.scrollTop = readingPosition.current
+    }
+    mountedBody.current = body
+  }, [item.content, item.running, open])
   return (
     <div className={`thought-row ${item.running ? 'running' : ''}`}>
-      <button aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-        {item.running ? <LoaderCircle className="spin" size={14} /> : <BrainCircuit size={14} />}
+      <button aria-expanded={open} onClick={() => {
+        // Collapsing unmounts the scroll container. Preserve reading intent
+        // separately from DOM lifetime, including deltas received while shut.
+        const body = bodyRef.current
+        if (open && body && item.running) {
+          readingPosition.current = body.scrollTop
+          followingTail.current = body.scrollHeight - body.scrollTop - body.clientHeight < 28
+        }
+        setDisclosure(!open)
+      }}>
+        <BrainCircuit size={14} />
         <span>{item.running ? 'Thinking...' : item.label}</span>
         <span className="thought-disclosure" aria-hidden="true">{open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
       </button>
-      {open && item.content && <div className="thought-body">{item.content}</div>}
+      {open && item.content && <div className="thought-body" ref={bodyRef} tabIndex={0} aria-label="Thinking details" onScroll={(event) => {
+        const body = event.currentTarget
+        readingPosition.current = body.scrollTop
+        followingTail.current = body.scrollHeight - body.scrollTop - body.clientHeight < 28
+      }}>{item.content}</div>}
+      {item.running && <span className="thinking-activity-dot" role="status" aria-label="Thinking in progress" />}
     </div>
   )
 }
@@ -3934,8 +3990,8 @@ export function AssistantActivityRow({ item }: { item: Extract<TimelineItem, { k
 export function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
   const [open, setOpen] = useState(Boolean(item.autoExpanded))
   useEffect(() => setOpen(Boolean(item.autoExpanded)), [item.autoExpanded])
-  const icon = item.name.includes('web') ? <Globe2 size={14} /> : item.name.includes('file') ? <FileCode2 size={14} /> : <TerminalSquare size={14} />
   const mutation = toolMutationSummary(item)
+  const icon = item.name.includes('web') ? <Globe2 size={14} /> : mutation || item.name.includes('file') ? <FileCode2 size={14} /> : <TerminalSquare size={14} />
   const status = toolStatusSummary(item)
   return (
     <div className={`tool-row ${item.status}`} data-tool-name={item.name}>
@@ -3989,10 +4045,11 @@ function CommandToolSection(props: { label: 'COMMAND' | 'STDOUT' | 'STDERR'; cop
 }
 
 function toolMutationSummary(item: ToolTimelineItem): { action: string; path: string; lines?: number } | undefined {
-  if (!['create_file', 'write_file', 'edit_file'].includes(item.name)) return undefined
+  if (!['create_file', 'write_file', 'edit_file', 'compose_reference_html'].includes(item.name)) return undefined
   const path = String(item.args.path || 'file').replace(/^\/home\/user\//, '')
-  const action = item.name === 'edit_file' ? 'Edit' : 'Write'
-  const content = item.name === 'edit_file' ? undefined : item.args.content
+  const action = item.name === 'edit_file' ? 'Edit' : item.name === 'compose_reference_html' ? 'Compose' : 'Write'
+  // Composition arguments are content bindings, not the generated HTML bytes.
+  const content = ['create_file', 'write_file'].includes(item.name) ? item.args.content : undefined
   const lines = typeof content === 'string'
     ? content.length === 0 ? 0 : content.split('\n').length - (content.endsWith('\n') ? 1 : 0)
     : undefined
@@ -4099,7 +4156,7 @@ export function ArenaToolGroup({ item }: { item: Extract<TimelineItem, { kind: '
   )
 }
 
-function ArtifactCard({ artifact, onPreview }: { artifact: ArtifactRecord; onPreview: () => void }) {
+export function ArtifactCard({ artifact, onPreview }: { artifact: ArtifactRecord; onPreview: () => void }) {
   const canPreviewWebsite = artifact.kind === 'website'
   const format = artifact.name.includes('.') ? artifact.name.split('.').at(-1)!.toUpperCase() : artifact.kind.toUpperCase()
   const icon = artifact.kind === 'image'
@@ -4119,10 +4176,14 @@ function ArtifactCard({ artifact, onPreview }: { artifact: ArtifactRecord; onPre
     {artifact.previewUrl && <div className="website-artifact-preview">
       <iframe
         title={`Inline preview of ${artifact.name}`}
+        tabIndex={-1}
         src={artifact.previewUrl}
         sandbox="allow-scripts allow-modals allow-downloads"
         referrerPolicy="no-referrer"
       />
+      <button type="button" className="website-artifact-open" onClick={onPreview} aria-label={`Open ${artifact.name} in viewer`}>
+        <Maximize2 size={14} aria-hidden="true" /> Open
+      </button>
     </div>}
   </section>
   return (
@@ -4226,7 +4287,7 @@ export function WorkspacePanel(props: {
         {showWebsite && <div className={`workspace-resource-row website-panel ${website?.status || 'stopped'}`}>
           <button
             className="workspace-resource-main"
-            disabled={website?.status !== 'running' || !website.previewUrl}
+            disabled={!canOpenWebsitePreview(website)}
             onClick={props.onPreview}
           >
             <Globe2 size={14} />
@@ -4515,6 +4576,7 @@ export function projectTimeline(
     .filter((event) => event.type === 'tool.started' && event.stepId)
     .map((event) => event.stepId as string))
   const thoughts = new Map<string, Extract<TimelineItem, { kind: 'thought' }>>()
+  const progressItems = new Map<string, Extract<TimelineItem, { kind: 'progress' }>>()
   const tools = new Map<string, Extract<TimelineItem, { kind: 'tool' }>>()
   const toolStartedAt = new Map<string, string>()
   const artifacts = new Map<string, Extract<TimelineItem, { kind: 'artifact' }>>()
@@ -4548,6 +4610,15 @@ export function projectTimeline(
     clearAssistantActivity()
     clearAutoExpandedTool()
   }
+  const progressForStep = (key: string) => {
+    let progress = progressItems.get(key)
+    if (!progress) {
+      progress = { kind: 'progress', key: `progress-${key}`, content: '', streaming: true }
+      progressItems.set(key, progress)
+      items.push(progress)
+    }
+    return progress
+  }
   for (const event of visibleEvents) {
     const data = event.data as Record<string, any>
     if (event.type === 'turn.started') {
@@ -4578,6 +4649,15 @@ export function projectTimeline(
       })
     } else if (event.type === 'assistant.thought.started' || event.type === 'assistant.thought.delta' || event.type === 'assistant.thought.completed') {
       beginVisibleActivity()
+      if (data.visibleProgress) {
+        const progress = progressForStep(event.stepId || event.id)
+        if (event.type === 'assistant.thought.delta') progress.content += String(data.delta || '')
+        if (event.type === 'assistant.thought.completed') {
+          progress.content = String(data.text || progress.content)
+          progress.streaming = false
+        }
+        continue
+      }
       const key = `${event.stepId || event.id}${data.visibleProgress ? '-progress' : ''}`
       let thought = thoughts.get(key)
       if (!thought) {
@@ -4590,6 +4670,14 @@ export function projectTimeline(
         thought.content = String(data.text || thought.content)
         thought.running = false
         thought.label = data.compacted ? 'Context checkpoint' : `Thought${thought.content ? ` for ${formatDuration(Date.parse(event.at) - Date.parse(visibleEvents.find((item) => item.stepId === event.stepId && item.type === 'assistant.started')?.at || event.at))}` : ''}`
+      }
+    } else if (event.type === 'assistant.progress.delta' || event.type === 'assistant.progress') {
+      beginVisibleActivity()
+      const progress = progressForStep(event.stepId || event.id)
+      if (event.type === 'assistant.progress.delta') progress.content += String(data.delta || '')
+      else {
+        progress.content = String(data.content || progress.content)
+        progress.streaming = false
       }
     } else if (event.type === 'assistant.tool_call.delta') {
       const streamIndex = Number.isInteger(data.index) && data.index >= 0 ? Number(data.index) : 0
@@ -4770,14 +4858,9 @@ export function projectTimeline(
       beginVisibleActivity()
       const key = event.stepId || event.turnId || event.id
       if (event.stepId && stepsWithToolCalls.has(event.stepId)) {
-        const progressKey = `${event.stepId}-progress`
-        let thought = thoughts.get(progressKey)
-        if (!thought) {
-          thought = { kind: 'thought', key: `thought-${progressKey}`, label: 'Thought', content: '', running: true }
-          thoughts.set(progressKey, thought)
-          items.push(thought)
-        }
-        thought.content += String(data.delta || '')
+        const progress = progressForStep(event.stepId)
+        progress.content += String(data.delta || '')
+        progress.streaming = false
         continue
       }
       let final = finals.get(key)
@@ -4795,12 +4878,11 @@ export function projectTimeline(
       // authoritative: keep the complete Final and discard the provisional
       // duplicate instead of leaving a terminal Session "Thinking...".
       if (event.stepId) {
-        const progressKey = `${event.stepId}-progress`
-        const progress = thoughts.get(progressKey)
+        const progress = progressItems.get(event.stepId)
         if (progress) {
           const progressIndex = items.indexOf(progress)
           if (progressIndex >= 0) items.splice(progressIndex, 1)
-          thoughts.delete(progressKey)
+          progressItems.delete(event.stepId)
         }
       }
       let final = finals.get(key)
@@ -4828,6 +4910,7 @@ export function projectTimeline(
     clearAssistantActivity()
     clearAutoExpandedTool()
     for (const thought of thoughts.values()) thought.running = false
+    for (const progress of progressItems.values()) progress.streaming = false
   }
   if (['cancelled', 'failed', 'timed_out', 'interrupted'].includes(snapshot.session.status)) {
     for (const final of finals.values()) final.streaming = false
@@ -4840,7 +4923,7 @@ export function projectTimeline(
 const EXPLORATION_TOOLS = new Set(['list_files', 'read_file', 'grep_files', 'glob_files'])
 const COMMAND_TOOLS = new Set(['bash', 'shell_command'])
 const COMMAND_DETAIL_TOOLS = new Set([...COMMAND_TOOLS, 'start_process'])
-const FILE_EDIT_TOOLS = new Set(['write_file', 'edit_file'])
+const FILE_EDIT_TOOLS = new Set(['write_file', 'edit_file', 'compose_reference_html'])
 
 export function groupArenaToolItems(items: TimelineItem[]): TimelineItem[] {
   const grouped: TimelineItem[] = []
@@ -4911,6 +4994,13 @@ export function toolLabel(
   if (name === 'create_file') return `Created ${String(args.path || 'file')}`
   if (name === 'write_file') return `Wrote ${String(args.path || 'file')}`
   if (name === 'edit_file') return `Edited ${String(args.path || 'file')}`
+  if (name === 'compose_reference_html') {
+    const path = String(args.path || 'file')
+    if (status === 'running') return `Composing ${path}`
+    if (status === 'failed') return `Composition failed: ${path}`
+    if (status === 'timed_out') return `Composition stopped: ${path}`
+    return `Composed ${path}`
+  }
   if (name === 'delete_file') return `Deleted ${String(args.path || 'file')}`
   if (name === 'apply_patch') return 'Applied patch'
   if (name === 'install_npm_packages') {
@@ -4983,6 +5073,23 @@ export function applyEventToSnapshot(snapshot: SessionSnapshot, event: SessionEv
   return applySnapshotProjection(withEvent, event)
 }
 
+export function applyEventsToSnapshot(snapshot: SessionSnapshot, batch: readonly SessionEvent[]): SessionSnapshot {
+  const seen = new Set(snapshot.events.map((event) => event.id))
+  const incoming = batch.filter((event) => {
+    if (event.sessionId !== snapshot.session.id || seen.has(event.id)) return false
+    seen.add(event.id)
+    return true
+  }).sort((left, right) => left.seq - right.seq)
+  if (incoming.length === 0) return snapshot
+  const latestSeq = snapshot.events.reduce((maximum, event) => Math.max(maximum, event.seq), 0)
+  const events = [...snapshot.events, ...incoming].sort((left, right) => left.seq - right.seq)
+  let next = { ...snapshot, events }
+  for (const event of incoming) {
+    if (event.seq > latestSeq) next = applySnapshotProjection(next, event)
+  }
+  return next
+}
+
 export function reconcileSnapshot(current: SessionSnapshot | undefined, incoming: SessionSnapshot): SessionSnapshot {
   const hydrated = incoming.events.reduce(applySnapshotProjection, { ...incoming })
   if (!current || current.session.id !== hydrated.session.id) return hydrated
@@ -5026,7 +5133,7 @@ function applySnapshotProjection(snapshot: SessionSnapshot, event: SessionEvent)
 
 function applyEventToSummary(summary: SessionSummary, event: SessionEvent): SessionSummary {
   const data = event.data as Record<string, any>
-  if (event.type === 'turn.started' && typeof data.model === 'string') return {
+  if ((event.type === 'turn.started' || event.type === 'run.resumed') && typeof data.model === 'string') return {
     ...summary,
     model: data.model,
     ...('modelSelection' in data ? { modelSelection: data.modelSelection } : {}),

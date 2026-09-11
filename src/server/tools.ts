@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { readContextRecord } from './context-records.js'
+import { dispatchWebProviderRequest } from './tool-transport.js'
+import { ToolCapabilityUnavailableError } from './tool-recovery.js'
+import { mkdir, open, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, resolve } from 'node:path'
 import type { ArtifactRecord, CodingRepositoryState, CodingSessionStatus, DeploymentState, ModelMessage, ModelToolImageDataPart, PlanItem, PlanItemStatus, ProcessPortRecord, ProcessRecord, SessionEvent, SpeechProviderMetering, ToolCallRecord, WebProviderMetering, WebProviderName, WebProviderRequestMetering } from '../shared/types.js'
 import {
@@ -12,8 +15,22 @@ export {
 } from '../shared/workspace-snapshot-policy.js'
 import { arenaTextContentType, artifactMime, createWorkspaceArtifact } from './artifact.js'
 import { extractAttachmentPage } from './attachment-extractor.js'
+import { ATTACHMENT_VERIFIER, attachmentEvidenceFreshnessGap, attachmentExtractionCoverage, withFileEvidenceSnapshot, type FileEvidenceReceipt } from './file-evidence.js'
 import type { BrowserManager } from './browser-manager.js'
 import { config } from './config.js'
+import { researchPageReadFromResult, researchPageReadProgress, type ResearchPageRead } from './research-evidence.js'
+import { createResearchBrief, missingResearchBriefLinks, researchBriefMatchesReads, researchBriefMembershipIssue, researchBriefMembershipMessage, researchSnapshotsFromEvents } from './research-brief.js'
+import { researchHtmlClaimGap } from './research-claim-integrity.js'
+import { composeReferenceTemplate, materializeReferenceTemplateDependencies, referenceTemplateBindingReview, referenceTemplateCatalog, referenceTemplateCatalogRequiresUpgrade, referenceTemplateTextParents, REFERENCE_TEMPLATE_CATALOG_VERSION, REFERENCE_TEMPLATE_MAX_OUTPUT_BYTES, type ReferenceTemplateSlide } from './reference-template.js'
+import { buildReferenceResourceSet, readReferenceResource, resolveReferenceResourceReplacement,
+  validateReferenceResourceReadRequest, REFERENCE_RESOURCE_MAX_PAGE_BYTES, REFERENCE_RESOURCE_MIN_PAGE_BYTES,
+  type ReferenceResourceBinding, type ReferenceResourceReadRequest } from './reference-resources.js'
+import { resolveReferenceRuntimeEvidence } from './reference-runtime-evidence.js'
+import { inspectStoredReferenceRuntime } from './reference-runtime-diagnostics.js'
+import { assertReferenceSourcePreserved, verifyDurableReferenceSource } from './reference-preserving-edit.js'
+import { applyReferenceTextEdit, readReferenceText, REFERENCE_TEXT_VIEW_MAX_BYTES, type ReferenceTextEditTarget, type ReferenceTextEditBatch } from './reference-text-edit.js'
+import { assertReferenceLanguageDelivery, assertReferenceLanguageFontCoverage, createReferenceLanguageVariant, fetchReferenceLanguageDesign,
+  materializeReferenceLanguageFonts, PINK_SCRIPT_SOURCE_SHA256, PINK_SCRIPT_SOURCE_URL, verifyReferenceLanguageMarkup } from './reference-language.js'
 import {
   createStaticDeploymentSnapshot,
   removeStaticDeploymentSnapshot,
@@ -24,6 +41,7 @@ import { fetchPublicUrl, validatePublicUrl, stripHtml } from './network-policy.j
 import { detectCommandPort, ProcessManager, runCommand } from './process-manager.js'
 import { injectMaterializedReferenceFonts, materializeReferenceFonts } from './reference-fonts.js'
 import { findSensitiveValues } from './redaction.js'
+import { invalidToolJsonDiagnostic } from './tool-argument-diagnostics.js'
 import {
   contractIsGroundedInEvidence,
   extractReferenceStyleSourceProfile,
@@ -32,7 +50,11 @@ import {
   normalizeReferenceStyleContract,
   normalizeReferenceStyleContractAgainstEvidence,
   referenceStyleGroundingGaps,
-  verifyHtmlAgainstReferenceStyle,
+  referenceTextLayoutRequiresUpgrade,
+  referenceUrlsAreRelated,
+  type DurableReferenceStyleContract,
+  type ReferenceStyleEvidence,
+  type RenderedReferencePhaseProfile,
 } from './reference-style.js'
 import type {
   ReferenceFontEvidenceManifest,
@@ -91,6 +113,12 @@ export interface ToolExecutionResult {
   modelCallCount?: number
   speechUsage?: SpeechProviderMetering
   webProviderUsage?: WebProviderMetering
+  /** Private byte-read attestation, kept outside the frozen Arena result JSON. */
+  researchPageRead?: ResearchPageRead
+  /** Private verifier identity; never accepted from model-authored result text. */
+  fileEvidence?: FileEvidenceReceipt
+  /** Private owning-tool recovery classification; never accepted from JSON. */
+  capabilityFailure?: import('./tool-recovery.js').ToolCapabilityFailure
 }
 
 export type ConnectorToolExecutor = (
@@ -216,8 +244,11 @@ const ARENA_STRUCTURED_RESULT_TOOLS = new Set<string>([
   'add_voice',
   'ask_user',
   'compact',
+  'compose_reference_html',
+  'read_reference_resource',
   'fetch_page',
   'record_reference_style',
+  'record_research_brief',
   'verify_reference_style',
   'generate_speech',
   'get_process_output',
@@ -305,6 +336,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         offset: { type: 'integer', minimum: 1, description: 'Optional 1-based starting line' },
         limit: { type: 'integer', minimum: 1, maximum: 5_000, description: 'Optional maximum number of lines' },
       }, ['path']),
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_reference_resource',
+      description: 'Read immutable resources bound to the current exact reference without fetching, executing, writing, or verifying the artifact. Omit resource_id for a compact resource manifest. Use template for original HTML, runtime/N for the original script, or runtime-loader/N for the composer-generated HTML script loader. Resource content is bounded UTF-8 text; copy every next_cursor field exactly to continue. A manifest is a resource receipt, not a read of the source HTML. Copy a referenceable loader descriptor into edit_file.reference_resource instead of echoing its large content.',
+      parameters: objectSchema({
+        source_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        resource_id: { type: 'string', pattern: '^(template|runtime(?:-loader)?/[0-9]+)$', maxLength: 64 },
+        resource_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        byte_offset: { type: 'integer', minimum: 0 },
+        max_bytes: { type: 'integer', minimum: REFERENCE_RESOURCE_MIN_PAGE_BYTES, maximum: REFERENCE_RESOURCE_MAX_PAGE_BYTES },
+      }, ['source_sha256']),
     },
   },
   {
@@ -448,6 +493,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'read_context',
+      description: 'Retrieve an immutable historical context record by the sha256 in its excerpt. Read pages or search within it before relying on omitted details. This reads session history, not current workspace state, and never re-executes an action.',
+      parameters: objectSchema({ sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 12000 }, query: { type: 'string', minLength: 1, maxLength: 200 } }, ['sha256']),
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'compact',
       description: 'Request a durable context checkpoint when earlier tool results or conversation history are too large. The Harness may also compact automatically under context pressure.',
       parameters: objectSchema({}),
@@ -567,11 +620,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       parameters: objectSchema({
         source_url: { type: 'string', format: 'uri', maxLength: 2_000 },
         strictness: { type: 'string', enum: ['exact', 'inspired'] },
+        language: { type: 'string', enum: ['zh-CN'], description: 'For Chinese copy in the documented pink-script template, request its source-authorized CJK variant. Keep fonts/colors/markers grounded in the original HTML; the Harness separately validates the author’s CJK design document, maps real text roles, and materializes final-character subsets.' },
         colors: { type: 'array', minItems: 2, maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 180, description: 'One exact CSS color token. In exact mode include it only when a real DOM-connected rule consumes it directly or through a referenced custom property; omit values from unused variable declarations. A short source label/description may surround it and will be normalized away.' } },
         fonts: { type: 'array', minItems: 1, maxItems: 5, items: { type: 'string', minLength: 1, maxLength: 220, description: 'One exact font-family name consumed by a real DOM-connected rule in exact mode; weights or a short role description may follow it.' } },
         layout: { type: 'array', minItems: 2, maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 300 } },
         components: { type: 'array', minItems: 2, maxItems: 10, items: { type: 'string', minLength: 1, maxLength: 300 } },
-        required_markers: { type: 'array', minItems: 2, maxItems: 10, items: { type: 'string', minLength: 1, maxLength: 300, description: 'One distinctive literal selector, consumed CSS variable, or layout identifier from the source. In exact mode the selector must occur in a real DOM relationship backed by connected CSS. Custom elements (for example deck-stage) and simple compound selectors or relationships (for example section.slide or deck-stage > section.slide) are valid. A short explanation may follow it.' } },
+        required_markers: { type: 'array', minItems: 2, maxItems: 10, items: { type: 'string', minLength: 1, maxLength: 300, description: 'One distinctive literal selector, consumed CSS variable, or layout identifier from the source. In exact mode the selector must occur in a real DOM relationship backed by connected CSS. Prefer shared component/chrome plus cover/closing markers; do not list every mutually exclusive interior slide-layout root as if all variants must coexist in a shorter adapted deck—the Browser captures that alternative layout library separately. Custom elements (for example deck-stage) and simple compound selectors or relationships (for example section.slide or deck-stage > section.slide) are valid. A short explanation may follow it.' } },
         signature: { type: 'string', minLength: 1, maxLength: 600 },
         avoid: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 240 } },
         viewport: objectSchema({
@@ -589,6 +643,57 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       parameters: objectSchema({
         path: { type: 'string', description: 'Canonical HTML path under /home/user' },
       }, ['path']),
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_research_brief',
+      description: 'Finish a research pass with a compact item-by-item news brief before drafting Slides. Continue search/fetch while coverage, dates or source quality remain unresolved. Each item needs exact supporting passages from fully read article bodies and an explicit source-quality assessment; publisher homepages, hourly aggregates and disclosed AI-generated text are discovery, not sole factual support. Preserve exact source numbers/units and distinguish event dates from publication dates. This records excerpt-backed planning, not independent truth verification. Never invent items, citations, statistics or certainty to fill a template.',
+      parameters: objectSchema({
+        scope: { type: 'string', minLength: 1, maxLength: 600, description: 'Requested topics and reporting window, grounded in the user request and current calendar.' },
+        limitations: { type: 'array', maxItems: 12, items: { type: 'string', minLength: 1, maxLength: 600 } },
+        items: { type: 'array', minItems: 1, maxItems: 16, items: objectSchema({
+          title: { type: 'string', minLength: 1, maxLength: 180 },
+          summary: { type: 'string', minLength: 1, maxLength: 1_600, description: 'Task-language supported factual summary. Keep each number and unit exactly as in a supporting excerpt; omit unsupported extrapolations.' },
+          date_note: { type: 'string', minLength: 1, maxLength: 400, description: 'Explain the actual event/publication date, the new development inside the requested window, and any uncertainty. Never fabricate a precise day from vague source dates.' },
+          sources: { type: 'array', minItems: 1, maxItems: 3, items: { ...objectSchema({
+            url: { type: 'string', format: 'uri' },
+            role: { type: 'string', enum: ['primary', 'reporting', 'aggregation'] },
+            quality_note: { type: 'string', minLength: 1, maxLength: 600, description: 'Why this specific source can support the item; attribution and primary/original-reporting status, not merely a publisher name.' },
+            excerpt: { type: 'string', minLength: 1, maxLength: 2_400, description: 'One exact contiguous supporting passage copied from the retrieved body, preserving words, numbers, units and qualifications. Do not paraphrase or splice passages with ellipses; never a search snippet or invented quotation.' },
+            passage_ref: { ...objectSchema({
+              snapshot_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+              start_byte: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+              end_byte: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+            }, ['snapshot_sha256', 'start_byte', 'end_byte']), description: 'Copy the passage_ref issued with a relevant research source passage; the server extracts the exact same-snapshot UTF-8 bytes. Provide exactly one of excerpt or passage_ref. The same 2400-character limit and source/numeric checks apply; this is not independent fact verification.' },
+          }, ['url', 'role', 'quality_note']), oneOf: [
+            { type: 'object', required: ['excerpt'] },
+            { type: 'object', required: ['passage_ref'] },
+          ] } },
+        }, ['title', 'summary', 'date_note', 'sources']) },
+      }, ['scope', 'limitations', 'items']),
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'compose_reference_html',
+      description: 'Create one HTML presentation by binding task copy to the exact recorded template. Preserve original CSS/DOM and embed its declared script dependencies. Use only catalog variant IDs and fill every text slot; omit unused interior variants or repeat a suitable one. Link cited content slots to exact retrieved article URLs. This creates a file, not a verification pass; continue source and Browser checks afterward. Never use this to overwrite an existing deliverable.',
+      parameters: objectSchema({
+        path: { type: 'string', minLength: 1 },
+        source_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        title: { type: 'string', minLength: 1, maxLength: 200 },
+        slides: {
+          type: 'array', minItems: 3, maxItems: 64,
+          items: objectSchema({
+            variant: { type: 'string', pattern: '^v[0-9]+$' },
+            label: { type: 'string', minLength: 1, maxLength: 160 },
+            texts: { type: 'object', description: 'Every selected catalog text slot ID (t1, t2, ...) must be bound. Explicit unit and ordinal slots must be replaced too. Only catalog allowEmpty slots may be an empty string when that affix no longer applies; ordinary copy cannot be empty.', additionalProperties: { type: 'string', maxLength: 2_000 } },
+            links: { type: 'object', description: 'Map existing linkable text slot IDs on THIS slide to exact supporting article URLs, e.g. {"t7":"https://news.example/article"} only if t7 is a selected linkable slot. Keys are never research item IDs (n1) or names. Cover each accepted item with a supporting link.', additionalProperties: { type: 'string', format: 'uri' } },
+          }, ['variant', 'label', 'texts']),
+        },
+      }, ['path', 'source_sha256', 'title', 'slides']),
     },
   },
   {
@@ -1119,14 +1224,14 @@ export const ARENA_ACTIVE_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = ARENA_ACTIV
 
 /**
  * Anera's capability overlay keeps Arena's frozen 19-tool names and order, but
- * restores deterministic text pagination on read_file. The exact Arena bundle
- * contract above intentionally remains unchanged for parity auditing.
+ * restores deterministic text pagination and source-bound text-slot edits.
+ * The exact Arena bundle contract above remains unchanged for parity auditing.
  */
 const ANERA_RUNTIME_READ_FILE_DEFINITION: ToolDefinition = {
   type: 'function',
   function: {
     name: 'read_file',
-    description: `${ARENA_ACTIVE_TOOL_DESCRIPTIONS.read_file} Large text files are returned in bounded UTF-8 pages. When nextContentOffset is returned, continue the same offset line with that exact value as content_offset. Otherwise, when nextOffset is returned, continue at that line. Do not skip or repeat a cursor.`,
+    description: `${ARENA_ACTIVE_TOOL_DESCRIPTIONS.read_file} Large text files are returned in bounded UTF-8 pages. When nextContentOffset is returned, continue the same offset line with that exact value as content_offset. Otherwise, continue at nextOffset. For source-authorized text, view=reference_text returns marked CJK and unambiguous Latin/numeric slots with current file/language hashes, not HTML. Use edit_file.reference_text; omit view for raw edits.`,
     parameters: objectSchema({
       path: {
         type: 'string',
@@ -1135,6 +1240,49 @@ const ANERA_RUNTIME_READ_FILE_DEFINITION: ToolDefinition = {
       offset: { type: 'integer', minimum: 1, description: 'Optional 1-based starting line. Use the exact nextOffset returned by the previous page.' },
       content_offset: { type: 'integer', minimum: 0, description: 'Optional 0-based UTF-8 byte offset within offset. Use only the exact nextContentOffset returned by the previous page, with the same path and offset.' },
       limit: { type: 'integer', minimum: 1, maximum: 5_000, description: `Optional maximum number of complete lines. Defaults to ${config.textReadPageLines}.` },
+      view: { type: 'string', enum: ['reference_text'], description: 'Source-bound literal text view. Do not combine with pagination.' },
+    }, ['path']),
+  },
+}
+
+const ANERA_RUNTIME_EDIT_FILE_DEFINITION: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'edit_file',
+    description: `${ARENA_ACTIVE_TOOL_DESCRIPTIONS.edit_file} For raw replacements use old_text/new_text or atomic edits. To substitute one exact unique old_text with a verified reference runtime loader, copy its source_sha256/resource_id/resource_sha256 from a successful read_reference_resource descriptor into reference_resource; omit new_text, edits and reference_text. The server resolves the full loader bytes, so never echo base64. For source-bound literal slots, copy hashes and exact targets from the current text view into reference_text: use slide_index/slot/expected_text plus outer new_text for one slot, or nested edits for 2–16 slots sharing one hash. Text batches validate one snapshot and commit once; a later mismatch leaves no partial edit. Never combine modes or supply HTML in text mode.`,
+    parameters: objectSchema({
+      path: activePathSchema,
+      old_text: { type: 'string', minLength: 1, description: 'Text to find for a single raw replacement. Omit when using edits or reference_text.' },
+      new_text: { type: 'string', description: 'Replacement for old_text, or literal copy for reference_text. Omit when using edits.' },
+      reference_resource: objectSchema({
+        source_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        resource_id: { type: 'string', pattern: '^runtime-loader/[0-9]+$', maxLength: 64 },
+        resource_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+      }, ['source_sha256', 'resource_id', 'resource_sha256']),
+      reference_text: objectSchema({
+        hash: { type: 'string', pattern: '^[A-Za-z0-9_-]{43}$', description: 'Current file hash from the text view, not a source/template hash.' },
+        language_manifest_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'Exact current language manifest from the text view.' },
+        slide_index: { type: 'integer', minimum: 1, maximum: 64, description: '1-based page number from the text view; repeated variants have separate page numbers.' },
+        slot: { type: 'string', pattern: '^t[1-9][0-9]{0,2}$' },
+        expected_text: { type: 'string', description: 'Exact decoded current slot text, including spaces and punctuation.' },
+        edits: { type: 'array', minItems: 2, maxItems: 16, description: 'Atomic literal-text batch; omit outer new_text and single-slot fields.',
+          items: objectSchema({
+            slide_index: { type: 'integer', minimum: 1, maximum: 64 },
+            slot: { type: 'string', pattern: '^t[1-9][0-9]{0,2}$' },
+            expected_text: { type: 'string' }, new_text: { type: 'string', minLength: 1, maxLength: 8_000 },
+          }, ['slide_index', 'slot', 'expected_text', 'new_text']),
+        },
+      }, ['hash', 'language_manifest_sha256']),
+      edits: {
+        type: 'array',
+        minItems: 2,
+        maxItems: 16,
+        description: 'Ordered non-contiguous replacements applied atomically to this one file. Use this when one coherent correction touches multiple locations.',
+        items: objectSchema({
+          old_text: { type: 'string', minLength: 1, description: 'Current text to find exactly once.' },
+          new_text: { type: 'string', description: 'Replacement text; empty deletes the match.' },
+        }, ['old_text', 'new_text']),
+      },
     }, ['path']),
   },
 }
@@ -1180,6 +1328,7 @@ const ANERA_RUNTIME_FETCH_PAGE_DEFINITION: ToolDefinition = {
 
 const ANERA_RUNTIME_TOOL_DEFINITION_OVERRIDES: Readonly<Record<string, ToolDefinition>> = {
   ...ACTIVE_TOOL_DEFINITION_OVERRIDES,
+  edit_file: ANERA_RUNTIME_EDIT_FILE_DEFINITION,
   fetch_page: ANERA_RUNTIME_FETCH_PAGE_DEFINITION,
   list_files: ANERA_RUNTIME_LIST_FILES_DEFINITION,
   read_file: ANERA_RUNTIME_READ_FILE_DEFINITION,
@@ -1196,13 +1345,17 @@ const ANERA_RUNTIME_TOOL_DEFINITION_BY_NAME = new Map(
 )
 
 export const EXTENSION_TOOL_NAMES = [
+  'read_context',
   'extract_attachment',
   'inspect_image',
   'install_npm_packages',
   'list_processes',
   'web_fetch',
   'record_reference_style',
+  'record_research_brief',
   'verify_reference_style',
+  'compose_reference_html',
+  'read_reference_resource',
   'http_request',
   'browser',
   'deploy_project',
@@ -1270,9 +1423,27 @@ function exactReferenceInspectionPhase(
 
 function exactReferenceAttestedComparisonPrompt(
   prompt: string,
-  typographyTextAlignAttested: boolean,
+  phaseProfile: RenderedReferencePhaseProfile,
 ): string {
-  return `${prompt}\n\nHarness-grounded deterministic evidence for this phase (authoritative): the candidate screenshot already passed the source-bound render-profile verifier with score 100. Every required phase DOM anchor was present and its computed style, geometry, occlusion, viewport, declared font-family, and private font-asset loading were attested. This does not prove that every visible Unicode glyph is covered by the first declared family. Do not claim that an attested component or decoration is missing, and do not contradict attested background, border, radius, shadow, or navigation-chrome properties by merely relabeling a matching dark square control as a light, rounded, or card-like widget. Do not infer clipping from line-height or an unfamiliar glyph shape; report clipping only when visible ink is actually cut off at a hard boundary relative to the reference image. Do not infer a missing CSS font declaration from glyph shape alone. Localized body copy in a general body-text role may legitimately use a system CJK fallback and is not a reference mismatch by itself. Only when fallback visibly erases the distinctive character of a display or mono decorative role should you report a precise glyph-coverage or typography-role mismatch. [ATTESTED_FACT: pagination_copy_not_a_defect] Slide totals, counter copy, and pagination labels are task content and may intentionally differ from the longer reference deck; never report their text or numbers as a defect.${typographyTextAlignAttested ? ' [ATTESTED_FACT: typography_text_align_matches] The reference and candidate computed text-align values for the visible phase typography match exactly; never report a left/center/right text-alignment mismatch.' : ''} Vision remains responsible for concrete visible raster differences such as clipping, overlap, contrast, readability, or a material reference-style mismatch that is not contradicted by those measurements.`
+  const typographyTextAlignAttested = Boolean(
+    phaseProfile.typographyProbes?.some((probe) => typeof probe.styles['text-align'] === 'string'),
+  )
+  const selectors = (intrinsic: boolean): string => {
+    const values = phaseProfile.anchors
+      .filter((anchor) => anchor.geometry.startsWith('intrinsic') === intrinsic)
+      .map((anchor) => anchor.selector.replace(/\s+/gu, ' ').trim())
+      .filter(Boolean)
+    let result = ''
+    for (const value of [...new Set(values)]) {
+      const candidate = result ? `${result} | ${value}` : value
+      if (candidate.length > 600) break
+      result = candidate
+    }
+    return result || '(none)'
+  }
+  const fixedSelectors = selectors(false)
+  const intrinsicSelectors = selectors(true)
+  return `${prompt}\n\nHarness-grounded deterministic evidence for this phase (authoritative): the candidate screenshot already passed the source-bound render-profile verifier with score 100. Every required phase DOM anchor was present and its computed style, geometry policy, occlusion, viewport, declared font-family, and private font-asset loading were attested. [ATTESTED_FIXED_SELECTORS: ${fixedSelectors}] Do not claim these fixed anchors are missing, smaller/larger, or misaligned, and do not contradict their attested background, border, radius, shadow, or navigation-chrome properties. [ATTESTED_INTRINSIC_SELECTORS: ${intrinsicSelectors}] Intrinsic anchors intentionally permit content-driven width, height, and wrapping changes. [ATTESTED_FACT: localized_copy_not_a_defect] Compare visual roles rather than literal copy: translated/replaced words, localized CJK body text, natural line wrapping, and content-driven label/pill/badge/kicker dimensions are not defects by themselves. This does not prove that every visible Unicode glyph is covered by the first declared family. Do not infer clipping from line-height or an unfamiliar glyph shape; report it only when candidate ink is visibly cut off at a hard boundary. Do not infer glyph overlap merely because Chinese uses a different fallback shape; require a visible ink collision. Only when fallback visibly erases a display or mono decorative role should you report a precise glyph-coverage or typography-role mismatch. [ATTESTED_FACT: pagination_copy_not_a_defect] Slide totals, counter copy, and pagination labels are task content and may intentionally differ from the longer reference deck; never report their text or numbers as a defect.${typographyTextAlignAttested ? ' [ATTESTED_FACT: typography_text_align_matches] The computed text-align values for visible phase typography match exactly; never report a left/center/right text-alignment mismatch.' : ''} Vision remains responsible for concrete candidate pixels: clipping, collision/occlusion, unreadable contrast, or a material reference-style feature not contradicted by these measurements.`
 }
 
 interface ExactCandidateRenderAttestation {
@@ -1459,13 +1630,13 @@ export function validateToolCallArguments(
     ?? additionalDefinitions.get(call.name)
   if (!definition) throw new Error(`Tool "${call.name}" not found`)
   if (call.arguments._parse_error) {
-    throw new Error(`Validation failed for tool "${call.name}": invalid JSON arguments`)
+    throw new Error(`Validation failed for tool "${call.name}": invalid JSON arguments. ${invalidToolJsonDiagnostic(call.arguments._raw)}`)
   }
 
   const schema = definition.function.parameters as JsonSchema
   const required = new Set(schema.required ?? [])
   for (const [name, value] of Object.entries(call.arguments)) {
-    if (value === null && !required.has(name)) delete call.arguments[name]
+    if (value === null && !required.has(name) && !strictAneraReferenceArguments(call)) delete call.arguments[name]
   }
   const errors: string[] = []
   validateSchemaValue(call.arguments, schema, '', errors)
@@ -1489,6 +1660,42 @@ export function validateToolCallArguments(
       }
     }
   }
+  if (call.name === 'edit_file') {
+    const hasSingleOld = typeof call.arguments.old_text === 'string'
+    const hasSingleNew = typeof call.arguments.new_text === 'string'
+    const hasBatch = Array.isArray(call.arguments.edits)
+    const hasReferenceText = Object.hasOwn(call.arguments, 'reference_text')
+    const hasReferenceResource = Object.hasOwn(call.arguments, 'reference_resource')
+    if (hasReferenceResource) {
+      if (!hasSingleOld || ['new_text', 'edits', 'reference_text'].some((key) => Object.hasOwn(call.arguments, key))) {
+        errors.push('edit_file: reference_resource requires exact old_text and cannot be combined with new_text, edits or reference_text')
+      }
+    } else if (hasReferenceText) {
+      const text = call.arguments.reference_text as Record<string, unknown> | undefined
+      const textBatch = text && Object.hasOwn(text, 'edits')
+      if (textBatch) {
+        if (hasBatch || hasSingleOld || hasSingleNew || ['slide_index', 'slot', 'expected_text'].some((key) => Object.hasOwn(text, key))) {
+          errors.push('edit_file: reference_text batch cannot be combined with outer new_text, old_text, edits or single-slot fields')
+        }
+      } else if (hasBatch || hasSingleOld || !hasSingleNew
+        || !text || ['slide_index', 'slot', 'expected_text'].some((key) => !Object.hasOwn(text, key))) {
+        errors.push('edit_file: reference_text requires slide_index, slot, expected_text and literal new_text and cannot be combined with old_text or edits')
+      }
+    } else if (hasBatch === (hasSingleOld || hasSingleNew)) {
+      errors.push('edit_file: provide either old_text/new_text or edits, but not both')
+    } else if (!hasBatch && (!hasSingleOld || !hasSingleNew)) {
+      errors.push('edit_file: old_text and new_text must be provided together')
+    }
+  }
+  if (call.name === 'read_reference_resource') {
+    try { validateReferenceResourceReadRequest(call.arguments) } catch (error) {
+      errors.push(`read_reference_resource: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  if (call.name === 'read_file' && call.arguments.view !== undefined
+    && ['offset', 'content_offset', 'limit'].some((key) => call.arguments[key] !== undefined)) {
+    errors.push('read_file: reference_text view cannot be combined with offset, content_offset or limit')
+  }
   if (errors.length > 0) {
     throw new Error(`Validation failed for tool "${call.name}":\n${errors.map((error) => `- ${error}`).join('\n')}`)
   }
@@ -1509,9 +1716,52 @@ export function normalizeArenaPublicToolCall(call: ToolCallRecord): ToolCallReco
 
 /** Normalize a call against the provider-visible Anera runtime overlay. */
 export function normalizeAneraRuntimeToolCall(call: ToolCallRecord): ToolCallRecord {
+  // Preserve unknown/misspelled target fields at this hash-bound boundary.
+  // Never turn an intended slot edit into an ordinary fuzzy replacement.
+  if (strictAneraReferenceArguments(call)) return { ...call, arguments: structuredClone(call.arguments) }
   const definition = ANERA_RUNTIME_TOOL_DEFINITION_BY_NAME.get(call.name)
     ?? TOOL_DEFINITIONS.find((tool) => tool.function.name === call.name)
-  return normalizeToolCallWithDefinition(call, definition)
+  let runtimeCall = call
+  if (
+    call.name === 'edit_file'
+    && call.arguments.old_text === undefined
+    && call.arguments.new_text === undefined
+    && Array.isArray(call.arguments.edits)
+    && call.arguments.edits.length === 1
+  ) {
+    const onlyEdit = call.arguments.edits[0]
+    if (
+      onlyEdit
+      && typeof onlyEdit === 'object'
+      && !Array.isArray(onlyEdit)
+      && typeof (onlyEdit as Record<string, unknown>).old_text === 'string'
+      && typeof (onlyEdit as Record<string, unknown>).new_text === 'string'
+    ) {
+      const { edits: _edits, ...rest } = call.arguments
+      runtimeCall = {
+        ...call,
+        arguments: {
+          ...rest,
+          old_text: (onlyEdit as Record<string, unknown>).old_text,
+          new_text: (onlyEdit as Record<string, unknown>).new_text,
+        },
+      }
+    }
+  }
+  return normalizeToolCallWithDefinition(runtimeCall, definition)
+}
+
+function strictAneraReferenceArguments(call: ToolCallRecord): boolean {
+  if (call.name === 'read_reference_resource') return true
+  if (call.name !== 'edit_file') return false
+  const args = call.arguments
+  if (Object.hasOwn(args, 'reference_text') || Object.hasOwn(args, 'reference_resource')) return true
+  // Unknown selectors (including a misspelled resource mode) must be rejected,
+  // never stripped into a different ordinary edit. Documented legacy aliases
+  // and the existing single-edit-array normalization remain supported.
+  if (Object.keys(args).some((key) => !['path', 'old_text', 'new_text', 'edits', 'context', 'replacement'].includes(key))) return true
+  return Array.isArray(args.edits) && args.edits.some((edit) => edit && typeof edit === 'object' && !Array.isArray(edit)
+    && Object.keys(edit).some((key) => !['old_text', 'new_text'].includes(key)))
 }
 
 function normalizeToolCallWithDefinition(
@@ -1520,6 +1770,11 @@ function normalizeToolCallWithDefinition(
 ): ToolCallRecord {
   if (!ARENA_STRUCTURED_RESULT_TOOLS.has(call.name) || call.arguments._parse_error) return call
   if (!definition) return call
+  // This Anera-only evidence boundary is strict, not a public Arena/Zod
+  // projection. Preserve misspelled fields (e.g. passage_ref.sha256) so schema
+  // errors can name both the supplied key and required snapshot_sha256. Never
+  // silently erase the diagnostic, infer a hash, or unwrap nested arguments.
+  if (call.name === 'record_research_brief') return { ...call, arguments: structuredClone(call.arguments) }
   let rawArguments: Record<string, unknown> = { ...call.arguments }
   if (call.name === 'web_search' && typeof rawArguments.depth === 'number') {
     rawArguments.depth = String(rawArguments.depth)
@@ -1579,9 +1834,14 @@ function normalizeArgumentsBySchema(value: unknown, schema: JsonSchema): unknown
     if (record[name] !== undefined) normalized[name] = normalizeArgumentsBySchema(record[name], property)
     else if (property.default !== undefined) normalized[name] = property.default
   }
-  if (schema.additionalProperties === true) {
+  if (schema.additionalProperties === true || (schema.additionalProperties && typeof schema.additionalProperties === 'object')) {
     for (const [name, item] of Object.entries(record)) {
-      if (!(name in properties)) normalized[name] = item
+      if (!Object.hasOwn(properties, name)) {
+        Object.defineProperty(normalized, name, {
+          value: schema.additionalProperties === true ? item : normalizeArgumentsBySchema(item, schema.additionalProperties),
+          enumerable: true, configurable: true, writable: true,
+        })
+      }
     }
   }
   return normalized
@@ -1589,9 +1849,10 @@ function normalizeArgumentsBySchema(value: unknown, schema: JsonSchema): unknown
 
 interface JsonSchema {
   type?: string
+  oneOf?: JsonSchema[]
   properties?: Record<string, JsonSchema>
   required?: string[]
-  additionalProperties?: boolean
+  additionalProperties?: boolean | JsonSchema
   items?: JsonSchema
   enum?: unknown[]
   minimum?: number
@@ -1623,6 +1884,14 @@ function validateSchemaValue(value: unknown, schema: JsonSchema, path: string, e
   if (!validType) {
     errors.push(`${label}: expected ${String(schema.type)}`)
     return
+  }
+  if (schema.oneOf) {
+    const matches = schema.oneOf.filter((alternative) => {
+      const alternativeErrors: string[] = []
+      validateSchemaValue(value, alternative, path, alternativeErrors)
+      return alternativeErrors.length === 0
+    }).length
+    if (matches !== 1) errors.push(`${label}: must match exactly one schema alternative (${schema.oneOf.map((alternative) => (alternative.required ?? []).join(' + ')).join(' or ')})`)
   }
   if (schema.enum && !schema.enum.includes(value)) {
     errors.push(`${label}: expected one of ${schema.enum.map(String).join(', ')}`)
@@ -1659,7 +1928,8 @@ function validateSchemaValue(value: unknown, schema: JsonSchema, path: string, e
       }
     }
     for (const [name, item] of Object.entries(record)) {
-      const property = properties[name]
+      const property = Object.hasOwn(properties, name) ? properties[name]
+        : schema.additionalProperties && typeof schema.additionalProperties === 'object' ? schema.additionalProperties : undefined
       if (property) validateSchemaValue(item, property, path ? `${path}.${name}` : name, errors)
     }
   }
@@ -2071,12 +2341,33 @@ export class ToolExecutor {
             isError: false,
           }
         }
+        case 'read_reference_resource': {
+          const resources = await this.readReferenceResources(context.sessionId, requiredString(args, 'source_sha256'))
+          context.signal.throwIfAborted()
+          return { content: JSON.stringify(readReferenceResource(resources, args as unknown as ReferenceResourceReadRequest)), isError: false }
+        }
+        case 'read_context': {
+          const result = await readContextRecord(resolve(this.store.sessionDir(context.sessionId), 'context-records'), args as { sha256: string })
+          context.signal.throwIfAborted()
+          return { content: JSON.stringify(result), isError: false }
+        }
         case 'read_file': {
           const path = requiredWorkspacePath(args, 'path')
           const target = resolveWorkspacePath(workspace, path)
           await assertNoSymlinkTraversal(workspace, target)
           const info = await stat(target)
           if (!info.isFile()) throw new Error('Path is not a file')
+          if (args.view === 'reference_text') {
+            if (!/\.html?$/iu.test(path)) throw new Error('Reference text view requires an HTML file; omit view for ordinary reading')
+            const language = await this.referenceTextLanguage(context.sessionId)
+            const current = await readBoundedReferenceTextFile(target, context.signal)
+            const view = readReferenceText(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(current), language)
+            const content = JSON.stringify({ status: 'success', path, ...view })
+            if (Buffer.byteLength(content) > Math.min(REFERENCE_TEXT_VIEW_MAX_BYTES, config.textReadPageBytes)) {
+              throw new Error('Reference text view exceeds the current read budget; omit view for ordinary paginated read_file')
+            }
+            return { content, isError: false }
+          }
           const extension = extname(path).toLowerCase()
           if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'].includes(extension)) {
             if (args.offset !== undefined || args.content_offset !== undefined || args.limit !== undefined) {
@@ -2165,7 +2456,9 @@ export class ToolExecutor {
           const itemStart = typeof args.item_start === 'number' ? args.item_start : undefined
           const itemEnd = typeof args.item_end === 'number' ? args.item_end : undefined
           const contentOffset = typeof args.content_offset === 'number' ? args.content_offset : undefined
-          const extracted = await extractAttachmentPage(target, config.attachmentPageBytes, { pageStart, pageEnd, itemStart, itemEnd, contentOffset }, context.signal)
+          const { value: extracted, receipt } = await withFileEvidenceSnapshot(target, path, ATTACHMENT_VERIFIER,
+            (snapshot) => extractAttachmentPage(snapshot, config.attachmentPageBytes, { pageStart, pageEnd, itemStart, itemEnd, contentOffset }, context.signal),
+            context.signal)
           let content = extracted.content
           if (extracted.format === 'text' && extracted.truncated) {
             content += `\n\n[Text attachment output reached the ${config.attachmentPageBytes}-byte limit. Use read_file with offset/limit to continue.]`
@@ -2178,7 +2471,8 @@ export class ToolExecutor {
             content = `[ATTACHMENT_CONTINUATION_REQUIRED: ${key}=${extracted.nextItem}]\n\n${content}`
             content += `\n\n[Showing ${extracted.unit}s ${extracted.startItem}-${extracted.endItem} of ${extracted.totalItems}. Use extract_attachment with ${key}=${extracted.nextItem} to continue.]`
           }
-          return { content, isError: false }
+          const coverage = attachmentExtractionCoverage(extracted, { pageStart, pageEnd, itemStart, itemEnd, contentOffset })
+          return { content, isError: false, fileEvidence: { ...receipt, ...(coverage ? { coverage } : {}) } }
         }
         case 'inspect_image': {
           const path = requiredWorkspacePath(args, 'path')
@@ -2252,14 +2546,9 @@ export class ToolExecutor {
             if (referencePngSha256 !== phaseEvidence.sha256) {
               throw new Error(`Exact ${phase} reference PNG does not match its durable manifest SHA-256`)
             }
-            const typographyTextAlignAttested = Boolean(
-              renderProfile.phases[phase].typographyProbes?.some((probe) => (
-                typeof probe.styles['text-align'] === 'string'
-              )),
-            )
             const comparisonPrompt = exactReferenceAttestedComparisonPrompt(
               prompt,
-              typographyTextAlignAttested,
+              renderProfile.phases[phase],
             )
             const result = await compare.call(this.vision, referenceTarget, target, comparisonPrompt, context.signal)
             let afterBytes: Buffer
@@ -2383,6 +2672,9 @@ export class ToolExecutor {
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
           }
+          const expectedReferenceStyleSha256 = before
+            ? await this.referencePreservingWriteConstraint(context.sessionId, path, before, content)
+            : undefined
           if (context.signal.aborted) throw context.signal.reason
           await this.store.commitWorkspaceWrite(context.sessionId, {
             path,
@@ -2392,6 +2684,7 @@ export class ToolExecutor {
             artifact: this.artifactForPath(context, path),
             context: { turnId: context.turnId, stepId: context.stepId, callId: context.callId },
             ...(before ? { expectedBefore: before } : {}),
+            ...(expectedReferenceStyleSha256 ? { expectedReferenceStyleSha256 } : {}),
           })
           return {
             content: JSON.stringify({ status: 'success', hash: arenaContentHash(content) }),
@@ -2400,28 +2693,68 @@ export class ToolExecutor {
         }
         case 'edit_file': {
           const path = requiredWorkspacePath(args, 'path')
-          const editContext = requiredString(args, 'old_text')
-          const replacement = typeof args.new_text === 'string' ? args.new_text : (() => { throw new Error('new_text must be a string') })()
           const target = resolveWorkspacePath(workspace, path)
           await assertNoSymlinkTraversal(workspace, target)
-          const current = await readFile(target)
+          const current = args.reference_text !== undefined
+            ? await readBoundedReferenceTextFile(target, context.signal) : await readFile(target)
           if (current.length > config.maxReadBytes * 4) throw new Error('File is too large for bounded editing')
-          const edited = applyArenaEdit(current.toString('utf8'), editContext, replacement)
+          const referenceState = /\.html?$/iu.test(path) ? await this.store.get(context.sessionId) : undefined
+          let editedContent = current.toString('utf8')
+          let expectedReferenceStyleSha256: string | undefined
+          if (args.reference_resource !== undefined) {
+            if (!/\.html?$/iu.test(path)) throw new Error('Reference runtime loader replacements require an HTML file')
+            const binding = args.reference_resource as unknown as ReferenceResourceBinding
+            const resources = await this.readReferenceResources(context.sessionId, binding.source_sha256)
+            expectedReferenceStyleSha256 = resources.referenceContractSha256
+            await this.assertReferenceResourceReceipt(context.sessionId, binding)
+            editedContent = resolveReferenceResourceReplacement(resources, binding, requiredString(args, 'old_text'),
+              new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(current)).content
+          } else if (args.reference_text !== undefined) {
+            if (!/\.html?$/iu.test(path)) throw new Error('Reference text edits require an HTML file')
+            const language = await this.referenceTextLanguage(context.sessionId)
+            editedContent = applyReferenceTextEdit(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(current),
+              language, args.reference_text as unknown as ReferenceTextEditTarget | ReferenceTextEditBatch,
+              args.new_text === undefined ? undefined : requiredString(args, 'new_text'))
+          } else if (Array.isArray(args.edits)) {
+            for (const [index, rawEdit] of args.edits.entries()) {
+              if (!rawEdit || typeof rawEdit !== 'object' || Array.isArray(rawEdit)) {
+                throw new Error(`edits[${index}] must be an object`)
+              }
+              const edit = rawEdit as Record<string, unknown>
+              const editContext = requiredString(edit, 'old_text')
+              const replacement = typeof edit.new_text === 'string'
+                ? edit.new_text
+                : (() => { throw new Error(`edits[${index}].new_text must be a string`) })()
+              editedContent = applyArenaEdit(editedContent, editContext, replacement).content
+            }
+          } else {
+            const editContext = requiredString(args, 'old_text')
+            const replacement = typeof args.new_text === 'string'
+              ? args.new_text
+              : (() => { throw new Error('new_text must be a string') })()
+            editedContent = applyArenaEdit(editedContent, editContext, replacement).content
+          }
+          const preservingConstraint = await this.referencePreservingWriteConstraint(context.sessionId, path, current, editedContent, referenceState)
+          if (preservingConstraint && expectedReferenceStyleSha256 && preservingConstraint !== expectedReferenceStyleSha256) {
+            throw new Error('Reference identity changed while preparing the edit; no artifact was changed. Re-read the current reference inputs.')
+          }
+          expectedReferenceStyleSha256 ??= preservingConstraint
           if (context.signal.aborted) throw context.signal.reason
           await this.store.commitWorkspaceWrite(context.sessionId, {
             path,
-            content: edited.content,
+            content: editedContent,
             mode: 'replace',
             operation: 'edited',
             artifact: this.artifactForPath(context, path),
             context: { turnId: context.turnId, stepId: context.stepId, callId: context.callId },
             expectedBefore: current,
+            ...(expectedReferenceStyleSha256 ? { expectedReferenceStyleSha256 } : {}),
           })
           return {
             content: JSON.stringify({
               status: 'success',
               message: `Edited ${path}.`,
-              hash: arenaContentHash(edited.content),
+              hash: arenaContentHash(editedContent),
             }),
             isError: false,
           }
@@ -2606,10 +2939,27 @@ export class ToolExecutor {
             typeof args.format === 'string' ? args.format : 'markdown',
             context,
           )
+        case 'record_research_brief': {
+          const state = await this.store.get(context.sessionId)
+          const snapshots = researchSnapshotsFromEvents(await this.store.events(context.sessionId), state.activeTaskResearchEvidence?.pageReads ?? [])
+          const brief = createResearchBrief(args, snapshots)
+          return { content: JSON.stringify({ status: 'success', brief,
+            notice: 'Source passages and numeric consistency checked. Source role, factual interpretation and coverage still require editorial judgment; this is not independent truth verification.' }), isError: false }
+        }
         case 'record_reference_style': {
           const proposedContract = normalizeReferenceStyleContract(args)
           const state = await this.store.get(context.sessionId)
-          const evidence = findReferenceStyleEvidence(state.messages, [proposedContract.sourceUrl])
+          let evidence = findReferenceStyleEvidence(state.messages, [proposedContract.sourceUrl])
+          const previousReference = state.activeReferenceStyleContract
+          if (!evidence && previousReference
+            && (referenceTemplateCatalogRequiresUpgrade(previousReference.templateCatalog)
+              || (previousReference.contract.strictness === 'exact' && referenceTextLayoutRequiresUpgrade(previousReference.renderProfile)))
+            && !state.referenceStyleEvidenceInvalidation
+            && referenceUrlsAreRelated(proposedContract.sourceUrl, previousReference.contract.sourceUrl)) {
+            // Catalog/render-observation upgrades can follow compaction. Reuse only the
+            // immutable hash-bound journal source, never model summaries.
+            evidence = await this.resolveBoundTemplateEvidence(context.sessionId, state, previousReference)
+          }
           if (!evidence) {
             throw new Error('No concrete style-bearing reference source was retrieved for source_url. Fetch the actual design specification or template source; a directory listing or template name is not enough.')
           }
@@ -2635,6 +2985,22 @@ export class ToolExecutor {
           if (contract.strictness === 'exact' && !sourceProfile) {
             throw new Error('Exact reference verification requires a concrete template containing both usable CSS rules and their actual DOM classes or ids. Fetch the real HTML template; a prose design summary, CSS-only fragment, or link shell cannot establish exact fidelity.')
           }
+          // Only supported source shapes offer a composition lane. Capture
+          // their actual native runtime now and reuse these same immutable
+          // dependency bytes for the later task artifact.
+          let templateCatalog: ReturnType<typeof referenceTemplateCatalog> | undefined
+          if (contract.strictness === 'exact') {
+            try { templateCatalog = referenceTemplateCatalog(evidence.content, evidence.resolvedUrl) } catch { /* Ordinary exact-write fallback. */ }
+          }
+          if (args.language !== undefined && (args.language !== 'zh-CN' || !templateCatalog
+            || evidence.sha256 !== PINK_SCRIPT_SOURCE_SHA256 || evidence.resolvedUrl !== PINK_SCRIPT_SOURCE_URL)) {
+            throw new Error('A documented language adapter is not available for this source revision. Omit language for the ordinary reference workflow; do not invent a font substitution.')
+          }
+          const languageDesign = args.language === 'zh-CN' ? await fetchReferenceLanguageDesign(context.signal, this.externalFetchImpl) : undefined
+          const textParents = languageDesign ? referenceTemplateTextParents(evidence.content, evidence.resolvedUrl) : undefined
+          const runtimeScripts = templateCatalog?.dependencies.length
+            ? await materializeReferenceTemplateDependencies(templateCatalog, evidence.resolvedUrl, context.signal, this.externalFetchImpl)
+            : []
           const materializedFonts = contract.strictness === 'exact'
             ? await materializeReferenceFonts(
               evidence.content,
@@ -2652,16 +3018,26 @@ export class ToolExecutor {
               contract.viewport,
               {
                 signal: context.signal,
+                ...(textParents ? { textParents } : {}),
+                ...(runtimeScripts.length ? { runtimeScripts } : {}),
                 ...(materializedFonts.manifest ? {
                   fontCss: materializedFonts.fontCss,
                   expectedFontFamilies: materializedFonts.familyNames,
                 } : {}),
               },
             ).catch((error) => {
+              if (error instanceof ToolCapabilityUnavailableError) throw error
               throw new Error(`Exact reference verification could not establish a browser-rendered bundle: ${error instanceof Error ? error.message : String(error)}`)
             })
             : undefined
           const renderProfile = renderBundle?.profile
+          const languageVariant = languageDesign && textParents && renderBundle?.textFontFamilies
+            ? createReferenceLanguageVariant(evidence.content, evidence.resolvedUrl, languageDesign, textParents, renderBundle.textFontFamilies)
+            : undefined
+          if (languageDesign && !languageVariant) throw new Error('The Browser did not attest the source text roles required for the CJK variant')
+          const runtimeEvidence = runtimeScripts.length
+            ? await this.store.commitReferenceRuntimeEvidence(context.sessionId, evidence.sha256, evidence.resolvedUrl, runtimeScripts)
+            : undefined
           const renderProfileSha256 = renderProfile
             ? createHash('sha256').update(JSON.stringify(renderProfile)).digest('hex')
             : undefined
@@ -2697,6 +3073,9 @@ export class ToolExecutor {
               ...(renderProfile ? { renderProfile } : {}),
               ...(visualEvidence ? { visualEvidence } : {}),
               ...(fontEvidence ? { fontEvidence } : {}),
+              ...(templateCatalog ? { templateCatalog } : {}),
+              ...(runtimeEvidence ? { runtimeEvidence } : {}),
+              ...(languageVariant ? { languageVariant } : {}),
             }
             next.activeReferenceStyleEvidenceGeneration = createId('ref')
             delete next.referenceStyleEvidenceInvalidation
@@ -2728,9 +3107,100 @@ export class ToolExecutor {
               } : {}),
               ...(sourceProfile ? { source_profile: sourceProfile } : {}),
               ...(renderProfile ? { render_profile: renderProfile } : {}),
+              ...(templateCatalog ? { composition_template: templateCatalog } : {}),
+              ...(runtimeEvidence ? { runtime_evidence: runtimeEvidence } : {}),
               ...(visualEvidence ? { visual_evidence: visualEvidence } : {}),
               ...(fontEvidence ? { font_evidence: fontEvidence } : {}),
+              ...(languageVariant ? { language_variant: languageVariant } : {}),
             }),
+            isError: false,
+          }
+        }
+        case 'compose_reference_html': {
+          const path = requiredWorkspacePath(args, 'path')
+          if (!/\.html?$/iu.test(path)) throw new Error('Reference composition requires an HTML output path')
+          const target = resolveWorkspacePath(workspace, path)
+          await assertNoSymlinkTraversal(workspace, target)
+          try {
+            await stat(target)
+            throw new Error('The HTML target already exists. Use a targeted edit; composition never overwrites an existing file.')
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          }
+          const state = await this.store.get(context.sessionId)
+          const reference = state.activeReferenceStyleContract
+          if (!reference?.templateCatalog || reference.contract.strictness !== 'exact' || state.referenceStyleEvidenceInvalidation) {
+            throw new Error('A current exact StyleContract and source-derived template catalog are required')
+          }
+          if (reference.templateCatalog.version !== REFERENCE_TEMPLATE_CATALOG_VERSION) {
+            throw new Error(`Reference composition catalog v${reference.templateCatalog.version} is stale. Call record_reference_style with the same source-grounded contract to obtain catalog v${REFERENCE_TEMPLATE_CATALOG_VERSION}, including explicit unit and reviewed ordinal slots, before composing. Old text IDs must not be reinterpreted.`)
+          }
+          const sourceHash = requiredString(args, 'source_sha256')
+          if (sourceHash !== reference.provenance.evidenceSha256 || sourceHash !== reference.templateCatalog.sourceSha256) {
+            throw new Error('Composition source SHA-256 does not match the current StyleContract')
+          }
+          const evidence = await this.resolveBoundTemplateEvidence(context.sessionId, state, reference)
+          // Re-derive network targets from the hash-checked original bytes,
+          // never from a stale or modified provider-facing catalog.
+          const catalog = referenceTemplateCatalog(evidence.content, evidence.resolvedUrl)
+          if (catalog.dependencies.length && (!reference.runtimeEvidence || reference.runtimeEvidence.sourceEvidenceSha256 !== sourceHash)) {
+            throw new Error('Reference runtime snapshots are missing or stale. Record the exact StyleContract again before composing.')
+          }
+          const dependencies = reference.runtimeEvidence ? await this.store.resolveReferenceRuntimeEvidence(context.sessionId, reference.runtimeEvidence) : []
+          if (JSON.stringify(dependencies.map(({ url }) => url)) !== JSON.stringify(catalog.dependencies)) {
+            throw new Error('Reference runtime snapshots do not match the source-declared dependency list')
+          }
+          const retrievedSourceUrls = researchPageReadProgress(state.activeTaskResearchEvidence?.pageReads ?? []).sourceUrls
+          const bindingReview = referenceTemplateBindingReview(catalog, args.slides, retrievedSourceUrls)
+          const compositionGaps = [...bindingReview.issues]
+          const proposedSlides = Array.isArray(args.slides) ? args.slides : []
+          const researchBrief = state.activeTaskResearchEvidence?.brief
+          if (researchBrief) {
+            if (!researchBriefMatchesReads(researchBrief, state.activeTaskResearchEvidence?.pageReads ?? [])) {
+              throw new Error('The research brief no longer matches the latest source snapshots. Complete the research review again before composition.')
+            }
+            const links = bindingReview.citationUrls
+            const newsSourceUrls = retrievedSourceUrls.filter((url) => ![reference.contract.sourceUrl, evidence.resolvedUrl]
+              .some((referenceUrl) => referenceUrlsAreRelated(referenceUrl, url)))
+            const membershipIssue = researchBriefMembershipIssue(researchBrief, links, newsSourceUrls)
+            // Keep the hash-bound membership diagnostic on its original first
+            // line so recovery/compaction still reopen research, not writing.
+            if (membershipIssue) throw new Error(researchBriefMembershipMessage(membershipIssue)
+              + (compositionGaps.length ? `\nIndependent composition gaps (no file was written):\n${compositionGaps.join('\n')}` : ''))
+            const missing = missingResearchBriefLinks(researchBrief, links)
+            if (missing.length) {
+              const exampleSlideIndex = proposedSlides.findIndex((slide) => slide && typeof slide === 'object' && catalog.variants
+                .find((variant) => variant.id === slide.variant)?.slots.some((slot) => slot.linkable !== false))
+              const exampleSlot = catalog.variants.find((variant) => variant.id === proposedSlides[exampleSlideIndex]?.variant)
+                ?.slots.find((slot) => slot.linkable !== false)
+              const missingItem = researchBrief.items.find((item) => item.id === missing[0])!
+              const example = exampleSlot ? ` For example, slides[${exampleSlideIndex}].links = ${JSON.stringify({ [exampleSlot.id]: missingItem.sources.find((source) => source.role !== 'aggregation')!.url })}; use the relevant visible source label/content slot for each item.` : ''
+              compositionGaps.push(`Bind at least one supporting primary/reporting source link for each accepted research item before composition. Missing item links: ${missing.join(', ')}. These are news item IDs, NOT binding keys. links keys must be existing linkable catalog text slot IDs (t1, t2, ...), never n1 or a person/title.${example} A filled text slot or discovery digest is not source support.`)
+            }
+          }
+          if (state.activeVisualWebSlidePlan?.explicitlyRequested && proposedSlides.length !== state.activeVisualWebSlidePlan.count) {
+            compositionGaps.push(`The user requested exactly ${state.activeVisualWebSlidePlan.count} slides; bind that many complete slides`)
+          }
+          if (compositionGaps.length) throw new Error(`Reference composition rejected; no file was written. Resolve these independent gaps together:\n${compositionGaps.join('\n')}`)
+          const compiled = composeReferenceTemplate({
+            source: evidence.content, sourceUrl: evidence.resolvedUrl, sourceSha256: sourceHash,
+            title: requiredString(args, 'title'), slides: args.slides as ReferenceTemplateSlide[], dependencies,
+            allowedSourceUrls: retrievedSourceUrls,
+            ...(reference.languageVariant ? { languageVariant: reference.languageVariant } : {}),
+          })
+          if (researchBrief) {
+            const claimGap = researchHtmlClaimGap(researchBrief.items, compiled.html)
+            if (claimGap) throw new Error(claimGap)
+          }
+          context.signal.throwIfAborted()
+          await this.store.commitWorkspaceWrite(context.sessionId, {
+            path, content: compiled.html, mode: 'create', operation: 'reference-template-composed',
+            artifact: this.artifactForPath(context, path),
+            context: { turnId: context.turnId, stepId: context.stepId, callId: context.callId },
+          })
+          return {
+            content: JSON.stringify({ status: 'success', path, hash: arenaContentHash(compiled.html),
+              source_template_sha256: sourceHash, template_dependencies: compiled.dependencies, template_slide_count: compiled.slideCount }),
             isError: false,
           }
         }
@@ -2738,7 +3208,7 @@ export class ToolExecutor {
           const path = requiredWorkspacePath(args, 'path')
           if (!/\.html?$/iu.test(path)) throw new Error('verify_reference_style path must identify an HTML file')
           const state = await this.store.get(context.sessionId)
-          const durable = state.activeReferenceStyleContract
+          let durable = state.activeReferenceStyleContract
             ?? (state.referenceStyleEvidenceInvalidation
               ? undefined
               : latestSuccessfulReferenceStyleContract(state.messages))
@@ -2759,7 +3229,46 @@ export class ToolExecutor {
           if (info.size > config.maxReadBytes * 4) throw new Error('Canonical HTML is too large for bounded reference-style verification')
           const htmlBytes = await readFile(target)
           const html = htmlBytes.toString('utf8')
-          const verification = verifyHtmlAgainstReferenceStyle(html, durable.contract, durable.sourceProfile)
+          const languageViolations: string[] = []
+          if (/data-anera-cjk[=\s-]/u.test(html) && !durable.languageVariant) {
+            languageViolations.push('The artifact declares CJK adaptation without source-authorized language evidence; remove unapproved adaptation or record the documented variant before composition')
+          }
+          if (durable.languageVariant && durable.fontEvidence) {
+            let characters = ''
+            try { characters = verifyReferenceLanguageMarkup(html, durable.languageVariant).characters } catch (error) {
+              languageViolations.push(`Source-authorized CJK typography: ${error instanceof Error ? error.message : String(error)}. Preserve the existing data-anera-cjk wrappers and their exact role styles when editing copy.`)
+            }
+            const fonts = await this.store.resolveReferenceFontEvidence(context.sessionId, durable.fontEvidence)
+            let missingCoverage = false
+            try { assertReferenceLanguageFontCoverage(fonts.fontCss, characters) } catch { missingCoverage = true }
+            if (missingCoverage) {
+              const source = await this.resolveBoundTemplateEvidence(context.sessionId, state, durable)
+              const materialized = await materializeReferenceLanguageFonts(source.content, html, durable.languageVariant, context.signal, this.externalFetchImpl)
+              const fontEvidence = await this.store.commitReferenceFontEvidence(context.sessionId, {
+                sourceEvidenceSha256: durable.provenance.evidenceSha256, fontCss: materialized.fontCss,
+                familyNames: materialized.familyNames, materializationManifest: materialized.manifest,
+              })
+              const sourceSha = durable.provenance.evidenceSha256
+              const variantSha = durable.languageVariant.manifestSha256
+              await this.store.update(context.sessionId, (next) => {
+                if (next.activeReferenceStyleContract?.provenance.evidenceSha256 !== sourceSha
+                  || next.activeReferenceStyleContract.languageVariant?.manifestSha256 !== variantSha) throw new Error('Reference language evidence changed during font materialization')
+                next.activeReferenceStyleContract.fontEvidence = fontEvidence
+                next.activeReferenceStyleEvidenceGeneration = createId('ref')
+              })
+              durable = { ...durable, fontEvidence }
+            }
+          }
+          const boundTemplateSource = durable.templateCatalog && durable.renderProfile && durable.visualEvidence
+            ? await this.resolveBoundTemplateEvidence(context.sessionId, state, durable)
+            : undefined
+          const runtimeDiagnostic = await inspectStoredReferenceRuntime(this.store.sessionDir(context.sessionId), durable, html)
+          const verification = verifyDurableReferenceSource(html, durable, boundTemplateSource)
+          if (languageViolations.length) {
+            verification.fidelity = 'mismatch'
+            verification.violations.source.push(...languageViolations)
+            verification.score = Math.min(verification.score, 99)
+          }
           return {
             content: JSON.stringify({
               status: 'success',
@@ -2777,6 +3286,7 @@ export class ToolExecutor {
               ...(durable.renderProfile ? {
                 render_profile_sha256: createHash('sha256').update(JSON.stringify(durable.renderProfile)).digest('hex'),
               } : {}),
+              ...(runtimeDiagnostic ? { runtime_diagnostic: runtimeDiagnostic } : {}),
               ...verification,
             }),
             isError: false,
@@ -2947,6 +3457,7 @@ export class ToolExecutor {
           : message,
         isError: true,
         ...(aborted ? { aborted: true } : {}),
+        ...(!aborted && error instanceof ToolCapabilityUnavailableError ? { capabilityFailure: { ...error.failure } } : {}),
         ...(modelUsage ? { modelUsage } : {}),
         ...(estimatedCostUsd !== undefined ? { estimatedCostUsd } : {}),
         ...(modelRequestCount !== undefined ? { modelRequestCount } : {}),
@@ -2957,6 +3468,117 @@ export class ToolExecutor {
         ...(webProviderUsage ? { webProviderUsage } : {}),
       }
     }
+  }
+
+  private async referencePreservingWriteConstraint(
+    sessionId: string, path: string, before: Buffer, proposed: string, snapshot?: StoredSession,
+  ): Promise<string | undefined> {
+    if (!/\.html?$/iu.test(path)) return undefined
+    const state = snapshot ?? await this.store.get(sessionId)
+    const reference = state.activeReferenceStyleContract
+    if (state.activeVisualArtifact?.path !== path || reference?.contract.strictness !== 'exact'
+      || !reference.sourceProfile || state.referenceStyleEvidenceInvalidation) return undefined
+    if (before.length > config.maxReadBytes * 4 || Buffer.byteLength(proposed) > config.maxReadBytes * 4) {
+      throw new Error('Canonical HTML is too large for bounded reference-preserving editing; no artifact was changed')
+    }
+    const boundSource = reference.templateCatalog && reference.renderProfile && reference.visualEvidence
+      ? await this.resolveBoundTemplateEvidence(sessionId, state, reference) : undefined
+    assertReferenceSourcePreserved(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(before), proposed, reference, boundSource)
+    // The preflight and resource replacement, if any, must agree on one
+    // contract. The existing transaction checks this identity and before bytes
+    // again before admission; an async source lookup cannot create a race.
+    return createHash('sha256').update(JSON.stringify(reference)).digest('hex')
+  }
+
+  private async readReferenceResources(sessionId: string, sourceSha256: string) {
+    try {
+      const state = await this.store.get(sessionId)
+      const reference = state.activeReferenceStyleContract
+      if (!reference?.templateCatalog || reference.contract.strictness !== 'exact' || state.referenceStyleEvidenceInvalidation
+        || sourceSha256 !== reference.provenance.evidenceSha256 || sourceSha256 !== reference.templateCatalog.sourceSha256) {
+        throw new Error('Current exact source identity is unavailable')
+      }
+      const evidence = await this.resolveBoundTemplateEvidence(sessionId, state, reference)
+      const catalog = referenceTemplateCatalog(evidence.content, evidence.resolvedUrl)
+      const manifest = reference.runtimeEvidence
+      if (catalog.dependencies.length && (!manifest || manifest.sourceEvidenceSha256 !== sourceSha256
+        || manifest.sourceUrl !== evidence.resolvedUrl)) throw new Error('Source runtime identity is unavailable')
+      // This is deliberately the non-creating resolver: a resource read must
+      // not initialize/recover a historical Session or materialize new bytes.
+      const dependencies = manifest ? await resolveReferenceRuntimeEvidence(this.store.sessionDir(sessionId), manifest) : []
+      if (JSON.stringify(catalog.dependencies) !== JSON.stringify(dependencies.map(({ url }) => url))) {
+        throw new Error('Source-declared runtime dependency list changed')
+      }
+      return {
+        ...buildReferenceResourceSet({ source: evidence.content, sourceUrl: evidence.resolvedUrl,
+          sourceSha256, dependencies, ...(manifest ? { manifestSha256: manifest.manifestSha256 } : {}) }),
+        referenceContractSha256: createHash('sha256').update(JSON.stringify(reference)).digest('hex'),
+      }
+    } catch {
+      // OS failures may contain server-private evidence paths. Return only a
+      // path-free identity diagnostic, and never silently refetch or recapture.
+      throw new Error('Reference resources are missing, invalid, or no longer bound to the current source. Use read_reference_resource with the current source_sha256; no artifact was changed.')
+    }
+  }
+
+  private async assertReferenceResourceReceipt(sessionId: string, binding: ReferenceResourceBinding): Promise<void> {
+    let events: SessionEvent[]
+    try { events = await this.store.events(sessionId) } catch {
+      throw new Error('Reference resource receipts are unavailable; use read_reference_resource again before editing. No artifact was changed.')
+    }
+    for (const event of events) {
+      const call = event.data.call as ToolCallRecord | undefined
+      if (event.type !== 'tool.completed' || event.data.isError !== false || event.data.notExecuted === true
+        || call?.name !== 'read_reference_resource' || call.arguments?.source_sha256 !== binding.source_sha256
+        || typeof event.data.result !== 'string') continue
+      let payload: Record<string, unknown>
+      try { payload = JSON.parse(event.data.result) as Record<string, unknown> } catch { continue }
+      if (!payload || payload.status !== 'success' || payload.kind !== 'reference_resource' || payload.schemaVersion !== 1
+        || payload.source_sha256 !== binding.source_sha256 || !Array.isArray(payload.resources)) continue
+      if (payload.resources.some((resource) => resource && typeof resource === 'object'
+        && resource.resource_id === binding.resource_id && resource.resource_sha256 === binding.resource_sha256
+        && resource.referenceable === true)) return
+    }
+    throw new Error('Read this runtime-loader descriptor with read_reference_resource in the current Session before using reference_resource; no artifact was changed.')
+  }
+
+  private async referenceTextLanguage(sessionId: string) {
+    const state = await this.store.get(sessionId)
+    const reference = state.activeReferenceStyleContract
+    if (!reference?.languageVariant || reference.contract.strictness !== 'exact' || state.referenceStyleEvidenceInvalidation
+      || reference.languageVariant.sourceSha256 !== reference.provenance.evidenceSha256) {
+      throw new Error('Reference text view/edit requires a current exact source-authorized language contract; use ordinary read_file/edit_file otherwise')
+    }
+    return reference.languageVariant
+  }
+
+  private async resolveBoundTemplateEvidence(
+    sessionId: string,
+    state: StoredSession,
+    reference: DurableReferenceStyleContract,
+  ): Promise<ReferenceStyleEvidence> {
+    const sourceHash = reference.provenance.evidenceSha256
+    let evidence = findReferenceStyleEvidence(state.messages, [reference.contract.sourceUrl])
+    if (evidence?.sha256 !== sourceHash) {
+      // Raw journal results survive provider compaction. Reassemble the exact
+      // paginated source; never substitute a source-profile summary or refetch.
+      const messages: ModelMessage[] = []
+      evidence = undefined
+      for (const event of await this.store.events(sessionId)) {
+        const call = event.data.call as ToolCallRecord | undefined
+        if (event.type !== 'tool.completed' || event.data.notExecuted === true || event.data.isError === true
+          || !call || !['fetch_page', 'web_fetch'].includes(call.name) || typeof event.data.result !== 'string') continue
+        messages.push({ role: 'assistant', content: null, tool_calls: [{
+          id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+        }] }, { role: 'tool', tool_call_id: call.id, content: event.data.result, tool_result_status: 'succeeded' })
+        const candidate = findReferenceStyleEvidence(messages, [reference.contract.sourceUrl])
+        if (candidate?.sha256 === sourceHash) { evidence = candidate; break }
+      }
+    }
+    if (!evidence || evidence.sha256 !== sourceHash) {
+      throw new Error('The exact recorded template bytes are unavailable; do not reconstruct them from a summary')
+    }
+    return evidence
   }
 
   private async fileChanged(context: ToolContext, path: string, bytes: number, operation: string): Promise<void> {
@@ -3509,11 +4131,10 @@ export class ToolExecutor {
         if (!sourceEntryPath) {
           throw new Error('Exact reference deployment requires a successful font-bound verify_reference_style result')
         }
-        transformEntryHtml = (html) => injectMaterializedReferenceFonts(
-          html,
-          resolvedFonts.fontCss,
-          fontEvidence.manifestSha256,
-        )
+        transformEntryHtml = (html) => {
+          assertReferenceLanguageDelivery(html, resolvedFonts.fontCss, exactReference.languageVariant)
+          return injectMaterializedReferenceFonts(html, resolvedFonts.fontCss, fontEvidence.manifestSha256)
+        }
       }
       snapshot = await createStaticDeploymentSnapshot(
         this.store.workspaceDir(context.sessionId),
@@ -3661,7 +4282,16 @@ export class ToolExecutor {
         isError: true,
       }
     }
-    return { content: JSON.stringify({ status: 'success', title, content: truncateText(content) }), isError: false }
+    const boundedContent = truncateText(content)
+    const visibleContent = boundedContent === content ? boundedContent : `${boundedContent}\n\n[Content truncated]`
+    return {
+      content: JSON.stringify({ status: 'success', title, content: visibleContent }),
+      researchPageRead: researchPageReadFromResult({ name: 'web_fetch', arguments: { url: rawUrl, format } }, {
+        status: 'success', url: finalUrl, content: visibleContent,
+        truncated: bounded.truncated || visibleContent !== content,
+      }),
+      isError: false,
+    }
   }
 
   private async fetchPage(
@@ -3686,14 +4316,14 @@ export class ToolExecutor {
         const firecrawlCached = this.getFetchPageSnapshot(firecrawlKey)
         if (firecrawlCached) {
           return withWebProviderUsage(
-            this.fetchPageChunkResult(firecrawlCached, chunkIndex),
+            this.fetchPageChunkResult(firecrawlCached, chunkIndex, rawUrl, format),
             webProviderMetering('hit', requests, 'firecrawl'),
           )
         }
         const directCached = this.getFetchPageSnapshot(directKey)
         if (directCached) {
           return withWebProviderUsage(
-            this.fetchPageChunkResult(directCached, chunkIndex),
+            this.fetchPageChunkResult(directCached, chunkIndex, rawUrl, format),
             webProviderMetering('hit', requests, 'direct'),
           )
         }
@@ -3701,7 +4331,7 @@ export class ToolExecutor {
           const snapshot = await this.fetchPageWithFirecrawl(url, context.signal, requests)
           this.cacheFetchPageSnapshot(firecrawlKey, snapshot)
           return withWebProviderUsage(
-            this.fetchPageChunkResult(snapshot, chunkIndex),
+            this.fetchPageChunkResult(snapshot, chunkIndex, rawUrl, format),
             webProviderMetering('miss', requests),
           )
         } catch (error) {
@@ -3713,7 +4343,7 @@ export class ToolExecutor {
       const cached = this.getFetchPageSnapshot(directKey)
       if (cached) {
         return withWebProviderUsage(
-          this.fetchPageChunkResult(cached, chunkIndex),
+          this.fetchPageChunkResult(cached, chunkIndex, rawUrl, format),
           webProviderMetering('hit', requests, 'direct'),
         )
       }
@@ -3721,7 +4351,7 @@ export class ToolExecutor {
       if ('result' in loaded) return withWebProviderUsage(loaded.result, webProviderMetering('miss', requests))
       this.cacheFetchPageSnapshot(directKey, loaded.snapshot)
       return withWebProviderUsage(
-        this.fetchPageChunkResult(loaded.snapshot, chunkIndex),
+        this.fetchPageChunkResult(loaded.snapshot, chunkIndex, rawUrl, format),
         webProviderMetering('miss', requests),
       )
     } catch (error) {
@@ -3735,7 +4365,7 @@ export class ToolExecutor {
     requests: WebProviderRequestMetering[],
   ): Promise<FetchPageSnapshot> {
     const attempt = beginWebProviderRequest(requests, 'firecrawl', 'fetch')
-    const response = await this.externalFetchImpl(`${this.firecrawlBaseUrl}/scrape`, {
+    const response = await dispatchWebProviderRequest(attempt, this.externalFetchImpl, `${this.firecrawlBaseUrl}/scrape`, {
       method: 'POST',
       redirect: 'manual',
       signal,
@@ -3802,7 +4432,7 @@ export class ToolExecutor {
     let response: Response | undefined
     for (let redirect = 0; redirect <= 5; redirect += 1) {
       attempt.calls += 1
-      response = await this.externalFetchImpl(url, {
+      response = await dispatchWebProviderRequest(attempt, this.externalFetchImpl, url, {
         redirect: 'manual',
         signal,
         headers: { 'user-agent': 'Anera-Agent/0.1 (+Arena-compatible harness)', accept: 'text/html,text/plain,application/json;q=0.9,*/*;q=0.5' },
@@ -3869,7 +4499,7 @@ export class ToolExecutor {
     }
   }
 
-  private fetchPageChunkResult(snapshot: FetchPageSnapshot, chunkIndex: number): ToolExecutionResult {
+  private fetchPageChunkResult(snapshot: FetchPageSnapshot, chunkIndex: number, requestedUrl: string, format: string): ToolExecutionResult {
     const chunks = splitUtf8Chunks(snapshot.readable, config.maxReadBytes)
     if (chunkIndex >= chunks.length) throw new Error(`chunkIndex ${chunkIndex} is past the final chunk ${Math.max(0, chunks.length - 1)}`)
     const hasMore = chunkIndex + 1 < chunks.length || snapshot.sourceTruncated
@@ -3882,6 +4512,13 @@ export class ToolExecutor {
         chunkIndex,
         hasMore,
         totalChunks: chunks.length,
+      }),
+      researchPageRead: researchPageReadFromResult({
+        name: 'fetch_page', arguments: { url: requestedUrl, format },
+      }, {
+        status: 'success', url: snapshot.url, content: chunks[chunkIndex] ?? '',
+        chunkIndex, hasMore, totalChunks: chunks.length,
+        snapshot_sha256: createHash('sha256').update(snapshot.readable).digest('hex'),
       }),
       isError: false,
     }
@@ -4123,7 +4760,7 @@ export class ToolExecutor {
       provider.url.searchParams.set('q', query)
       const attempt = beginWebProviderRequest(requests, provider.name as 'bing' | 'duckduckgo', 'search')
       try {
-        const response = await this.externalFetchImpl(provider.url, {
+        const response = await dispatchWebProviderRequest(attempt, this.externalFetchImpl, provider.url, {
           method: 'GET',
           signal,
           headers: {
@@ -4175,7 +4812,7 @@ export class ToolExecutor {
     requests: WebProviderRequestMetering[],
   ): Promise<ToolExecutionResult | undefined> {
     const attempt = beginWebProviderRequest(requests, 'tavily', 'search')
-    const response = await this.externalFetchImpl(`${this.tavilyBaseUrl}/search`, {
+    const response = await dispatchWebProviderRequest(attempt, this.externalFetchImpl, `${this.tavilyBaseUrl}/search`, {
       method: 'POST',
       redirect: 'manual',
       signal,
@@ -4453,7 +5090,7 @@ export class ToolExecutor {
     requests: WebProviderRequestMetering[],
   ): Promise<ImageSearchCandidate[]> {
     const attempt = beginWebProviderRequest(requests, 'tavily', 'search')
-    const response = await this.externalFetchImpl(`${this.tavilyBaseUrl}/search`, {
+    const response = await dispatchWebProviderRequest(attempt, this.externalFetchImpl, `${this.tavilyBaseUrl}/search`, {
       method: 'POST',
       redirect: 'manual',
       signal,
@@ -4576,6 +5213,9 @@ export class ToolExecutor {
     if (!info.isFile()) throw new Error('Path is not a file')
     const bytes = await readFile(target)
     const artifactHash = createHash('sha256').update(bytes).digest('base64url')
+    const freshnessGap = attachmentEvidenceFreshnessGap(await this.store.events(context.sessionId), path,
+      createHash('sha256').update(bytes).digest('hex'), bytes.length)
+    if (freshnessGap) throw new Error(freshnessGap)
     const state = await this.store.get(context.sessionId)
     const artifact = state.artifacts.find((item) => item.path === path) ?? this.artifactForPath(context, path)
     if (!state.artifacts.some((item) => item.path === path)) {
@@ -5470,6 +6110,27 @@ function toolWebProviderUsageFromError(error: unknown): WebProviderMetering | un
   const usage = (error as { webProviderUsage?: WebProviderMetering } | null)?.webProviderUsage
   if (!usage || usage.schemaVersion !== 1 || !Array.isArray(usage.requests)) return undefined
   return usage
+}
+
+async function readBoundedReferenceTextFile(target: string, signal: AbortSignal): Promise<Buffer> {
+  signal.throwIfAborted()
+  const info = await stat(target)
+  if (!info.isFile() || info.size > REFERENCE_TEMPLATE_MAX_OUTPUT_BYTES) throw new Error('Reference text view/edit requires a bounded regular HTML file')
+  const handle = await open(target, 'r')
+  try {
+    if (!(await handle.stat()).isFile()) throw new Error('Reference text view/edit requires a regular HTML file')
+    const bytes = Buffer.alloc(REFERENCE_TEMPLATE_MAX_OUTPUT_BYTES + 1)
+    let length = 0
+    while (length < bytes.length) {
+      signal.throwIfAborted()
+      const chunk = await handle.read(bytes, length, bytes.length - length, length)
+      if (!chunk.bytesRead) break
+      length += chunk.bytesRead
+    }
+    signal.throwIfAborted()
+    if (length > REFERENCE_TEMPLATE_MAX_OUTPUT_BYTES) throw new Error('Reference text HTML grew beyond its bounded file size')
+    return bytes.subarray(0, length)
+  } finally { await handle.close() }
 }
 
 export async function readBoundedResponseText(response: Response, maxBytes: number): Promise<{ text: string; bytesRead: number; truncated: boolean }> {

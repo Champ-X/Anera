@@ -39,9 +39,9 @@ button { color: inherit; }
   min-width: 0; min-height: 0; padding: 11px 10px 10px; background: var(--paper);
   border-right: 1px solid var(--line);
 }
-.brand-row { height: 40px; display: flex; align-items: center; gap: 5px; padding: 0 7px 7px; color: #363431; }
-.brand-logo { width: 25px; height: 25px; flex: none; object-fit: contain; }
-.brand-name { font-family: Georgia, "Times New Roman", serif; font-size: 24px; font-weight: 600; letter-spacing: -.045em; }
+.brand-row { height: 50px; display: flex; align-items: center; gap: 7px; padding: 0 7px 8px; color: #363431; }
+.brand-logo { width: 33px; height: 33px; flex: none; object-fit: contain; }
+.brand-name { font-family: Georgia, "Times New Roman", serif; font-size: 30px; line-height: 1; font-weight: 600; letter-spacing: -.045em; }
 .new-chat {
   height: 36px; display: flex; align-items: center; gap: 9px; width: 100%;
   padding: 0 6px; border: 0; border-radius: 6px;
@@ -119,7 +119,9 @@ button { color: inherit; }
 .workspace-toggle-global { position: absolute; z-index: 6; top: 11px; right: 15px; border: 0; cursor: pointer; }
 
 .conversation-viewport { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
-.conversation-scroll { width: 100%; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; scrollbar-width: thin; }
+/* Hydration, resize and streamed output are state synchronization, not user
+   navigation. Explicit jump-to-bottom opts into smooth motion in App.tsx. */
+.conversation-scroll { width: 100%; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; scroll-behavior: auto; scrollbar-width: thin; }
 .scroll-to-bottom {
   position: absolute; z-index: 7; bottom: 11px; left: 50%; width: 32px; height: 32px;
   display: grid; place-items: center; transform: translateX(-50%); border: 1px solid #d8d5cd;
@@ -158,7 +160,17 @@ button { color: inherit; }
 .thought-row.running > button { color: #45433e; }
 .thought-disclosure { display: inline-flex; color: #aaa79f; opacity: 0; transition: opacity 120ms ease; }
 .thought-row > button:hover .thought-disclosure, .thought-row > button:focus-visible .thought-disclosure { opacity: 1; }
-.thought-body { margin: 2px 0 10px 21px; max-width: 680px; color: #77746e; font-size: 11.5px; line-height: 1.6; white-space: pre-wrap; }
+.thought-body { margin: 2px 0 10px 7px; padding: 6px 0 6px 17px; border-left: 1px solid var(--line); max-width: 680px; color: #696761; font: 11.5px/1.75 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.thought-row.running .thought-body { max-height: 192px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; mask-image: linear-gradient(to bottom, transparent, #000 18px, #000 calc(100% - 18px), transparent); }
+.thought-row.running .thought-body::-webkit-scrollbar { display: none; }
+.thought-row.running > button { color: #99968f; }
+.thought-body:focus-visible { outline: 2px solid #aaa79f; outline-offset: 3px; }
+.thinking-activity-dot { display: block; width: 9px; height: 9px; margin: 9px 0 14px 3px; background: #252622; border-radius: 50%; animation: thinking-breathe 1.6s ease-in-out infinite; }
+.assistant-progress { margin: 2px 0 10px; color: #393833; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
+.assistant-progress > :first-child { margin-top: 0; }
+.assistant-progress > :last-child { margin-bottom: 0; }
+@keyframes thinking-breathe { 0%, 100% { transform: scale(.88); opacity: .8; } 50% { transform: scale(1); opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .thinking-activity-dot { animation: none; } }
 .assistant-activity { min-height: 30px; display: flex; align-items: center; gap: 6px; margin: 0 0 2px; padding: 0 1px; color: #45433e; font-size: 12px; }
 .plan-card { margin: 9px 0 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #faf9f6; }
 .plan-heading { min-height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 11px; color: #55534d; }
@@ -246,8 +258,9 @@ button { color: inherit; }
 .artifact-card { min-height: 46px; display: flex; align-items: center; gap: 8px; margin: 6px 0; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .artifact-card.website-artifact { min-height: 46px; display: block; padding: 0; overflow: hidden; background: #fff; }
 .website-artifact-heading { min-height: 45px; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
-.website-artifact-preview { width: 100%; aspect-ratio: 16 / 9; min-height: 190px; max-height: 310px; overflow: hidden; background: #f5f4ef; }
-.website-artifact-preview iframe { width: 100%; height: 100%; display: block; border: 0; background: white; }
+.website-artifact-preview { position: relative; width: 100%; aspect-ratio: 16 / 9; min-height: 190px; max-height: 310px; overflow: hidden; background: #f5f4ef; }
+/* Keep hover on the thumbnail; the sandboxed frame otherwise consumes it. */
+.website-artifact-preview iframe { width: 100%; height: 100%; display: block; border: 0; background: white; pointer-events: none; }
 .artifact-icon { width: 22px; height: 22px; flex: none; display: grid; place-items: center; border: 0; border-radius: 4px; background: transparent; color: #77746e; }
 .artifact-copy { min-width: 0; flex: 1; display: block; }
 .artifact-copy strong { display: block; overflow: hidden; color: #4e4b45; font-size: 11.5px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
@@ -259,6 +272,9 @@ button { color: inherit; }
 .artifact-card:hover > a, .artifact-card:focus-within > a { opacity: 1; }
 .website-artifact-heading > a { width: 24px; border-color: transparent; padding: 0; opacity: 0; transition: opacity 120ms ease, background-color 120ms ease; }
 .website-artifact:hover .website-artifact-heading > a, .website-artifact:focus-within .website-artifact-heading > a { opacity: 1; }
+.website-artifact button.website-artifact-open { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -42%); height: 34px; padding: 0 13px; border: 1px solid #dedbd3; border-radius: 7px; background: #fff; color: #393833; box-shadow: 0 2px 12px #0002; font-family: inherit; font-size: 12px; line-height: 1.2; opacity: 0; pointer-events: none; transition: opacity 140ms ease, transform 140ms ease; }
+.website-artifact-preview:hover .website-artifact-open, .website-artifact:focus-within .website-artifact-open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%); }
+@media (hover: none) { .website-artifact button.website-artifact-open { left: auto; top: auto; right: 10px; bottom: 10px; opacity: 1; pointer-events: auto; transform: none; } }
 .approval-card { display: flex; align-items: flex-start; gap: 10px; margin: 9px 0; padding: 11px; border: 1px solid #ddc9ae; border-radius: 8px; background: #faf6ef; }
 .approval-card.approved { border-color: #c4d9cf; background: #f1f7f4; }
 .approval-card.denied { border-color: #dfc5c1; background: #faf3f2; }
@@ -489,6 +505,11 @@ button { color: inherit; }
 .connections-button svg:last-child.open { transform: rotate(180deg); }
 .coding-product-label { height: 27px; display: flex; align-items: center; gap: 5px; padding: 0 7px; border-radius: 6px; color: #66635d; background: #f1f0ec; font-size: 9.5px; }
 .composer-spacer { flex: 1; }
+.composer-model-picker { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 10px; padding: 7px 10px; border-top: 1px solid var(--line); }
+.composer-model-picker select { max-width: 100%; min-width: 160px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); color: var(--ink); font: inherit; font-size: 11px; cursor: pointer; }
+.composer-model-picker select:focus-visible { outline: 2px solid #278be3; outline-offset: 2px; }
+.composer-model-picker select:disabled { opacity: .6; cursor: default; }
+.composer-model-note { flex: 1 1 180px; color: #716f69; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
 .credit-control { position: relative; flex: none; }
 .credit-gauge-trigger { width: 31px; height: 31px; display: grid; place-items: center; border: 0; border-radius: 7px; background: transparent; cursor: pointer; }
 .credit-gauge-trigger:hover, .credit-gauge-trigger[aria-expanded="true"] { background: var(--soft); }

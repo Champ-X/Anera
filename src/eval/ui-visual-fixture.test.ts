@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -9,14 +9,138 @@ import {
   advanceVisualWorkspacePersistenceSaving,
   advanceVisualWorkspacePersistenceScanning,
   advanceVisualWorkspacePersistenceUploading,
+  appendVisualLongThoughtChunk,
+  completeVisualLongThoughtFixture,
   completeVisualWorkspacePersistenceFixture,
   seedVisualFixtureSessions,
+  seedVisualLongThoughtFixture,
   seedVisualRunningFixture,
   seedVisualWritingFixture,
   seedVisualWorkspacePersistenceFixture,
 } from './ui-visual-fixture.js'
 
 describe('deterministic UI visual fixture', () => {
+  it('seeds bounded synthetic thoughts, streams two chunks, and completes separate progress with zero provider usage', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-ui-long-thought-fixture-test-'))
+    try {
+      const store = new SessionStore(root, 'fixture-model')
+      await store.initialize()
+      const fixture = await seedVisualLongThoughtFixture(store)
+      const zeroUsage = {
+        promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedPromptTokens: 0,
+        modelCalls: 0, modelRequests: 0, toolCalls: 0, estimatedCostUsd: 0,
+      }
+      expect((await store.get(fixture.id)).summary).toMatchObject({
+        title: fixture.title, model: 'synthetic-ui-zero-provider', status: 'running', usage: zeroUsage,
+      })
+      const seeded = await store.events(fixture.id)
+      const prior = seeded.find((event) => event.type === 'assistant.thought.completed')!
+      const active = seeded.filter((event) => event.type === 'assistant.thought.started').at(-1)!
+      expect(prior.stepId).not.toBe(active.stepId)
+      expect(prior.data.text).toContain('Synthetic prior thought')
+      expect(seeded.some((event) => event.type === 'assistant.thought.completed' && event.stepId === active.stepId)).toBe(false)
+      const initialDelta = seeded.find((event) => event.type === 'assistant.thought.delta')!
+      expect(String(initialDelta.data.delta).trimEnd().split('\n')).toHaveLength(24)
+      expect(initialDelta.data.visibleProgress).toBeUndefined()
+      expect(seeded.at(-1)?.type).toBe('assistant.progress.delta')
+
+      await appendVisualLongThoughtChunk(store, fixture.id, 1)
+      await appendVisualLongThoughtChunk(store, fixture.id, 2)
+      const streaming = await store.events(fixture.id)
+      const thoughtText = streaming.filter((event) => event.type === 'assistant.thought.delta')
+        .map((event) => event.data.delta).join('')
+      expect(thoughtText.trimEnd().split('\n')).toHaveLength(48)
+      expect(thoughtText).toContain('Synthetic chunk 2, line 12')
+      expect(Buffer.byteLength(thoughtText)).toBeLessThan(10_000)
+      expect(streaming.filter((event) => event.type === 'assistant.thought.completed')).toHaveLength(1)
+
+      await completeVisualLongThoughtFixture(store, fixture.id)
+      const completed = await store.events(fixture.id)
+      expect(completed.slice(-6).map((event) => event.type)).toEqual([
+        'assistant.progress', 'assistant.thought.completed', 'assistant.started', 'assistant.final', 'turn.completed', 'run.status',
+      ])
+      expect(completed.find((event) => event.type === 'assistant.progress')?.data.content)
+        .toBe(seeded.at(-1)?.data.delta)
+      expect(completed.filter((event) => event.type === 'assistant.thought.completed').at(-1)?.data.text).toBe(thoughtText)
+      expect(completed.find((event) => event.type === 'assistant.final')?.data.content)
+        .toBe('Synthetic UI fixture complete. No model or provider was called.')
+      expect(completed.find((event) => event.type === 'assistant.final')?.stepId).not.toBe(active.stepId)
+      expect(completed.some((event) => event.type.startsWith('tool.') || event.type === 'usage.updated')).toBe(false)
+      expect((await store.get(fixture.id)).summary).toMatchObject({ status: 'completed', usage: zeroUsage })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses historical and reopened sessions without changing their state or journal', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-ui-long-thought-ownership-test-'))
+    try {
+      const store = new SessionStore(root, 'fixture-model')
+      await store.initialize()
+      const historical = await store.create()
+      const owned = await seedVisualLongThoughtFixture(store)
+      const reopened = new SessionStore(root, 'fixture-model')
+      for (const [targetStore, id] of [[store, historical.summary.id], [reopened, owned.id]] as const) {
+        const statePath = resolve(store.sessionDir(id), 'state.json')
+        const journalPath = resolve(store.sessionDir(id), 'events.jsonl')
+        const before = await Promise.all([readFile(statePath, 'utf8'), readFile(journalPath, 'utf8')])
+        await expect(appendVisualLongThoughtChunk(targetStore, id, 1)).rejects.toThrow('not owned')
+        await expect(completeVisualLongThoughtFixture(targetStore, id)).rejects.toThrow('not owned')
+        expect(await Promise.all([readFile(statePath, 'utf8'), readFile(journalPath, 'utf8')])).toEqual(before)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects skipped, concurrent duplicate, and terminal transitions without extra events', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-ui-long-thought-order-test-'))
+    try {
+      const store = new SessionStore(root, 'fixture-model')
+      await store.initialize()
+      const fixture = await seedVisualLongThoughtFixture(store)
+      const seeded = await store.events(fixture.id)
+      await expect(appendVisualLongThoughtChunk(store, fixture.id, 2)).rejects.toThrow('out of order')
+      await expect(completeVisualLongThoughtFixture(store, fixture.id)).rejects.toThrow('out of order')
+      expect(await store.events(fixture.id)).toEqual(seeded)
+      const concurrent = await Promise.allSettled([
+        appendVisualLongThoughtChunk(store, fixture.id, 1),
+        appendVisualLongThoughtChunk(store, fixture.id, 1),
+      ])
+      expect(concurrent.map((result) => result.status)).toEqual(['fulfilled', 'rejected'])
+      expect(await store.events(fixture.id)).toHaveLength(seeded.length + 1)
+      await expect(appendVisualLongThoughtChunk(store, fixture.id, 1)).rejects.toThrow('duplicate')
+      await expect(completeVisualLongThoughtFixture(store, fixture.id)).rejects.toThrow('out of order')
+      await appendVisualLongThoughtChunk(store, fixture.id, 2)
+      await completeVisualLongThoughtFixture(store, fixture.id)
+      const completed = await store.events(fixture.id)
+      await expect(completeVisualLongThoughtFixture(store, fixture.id)).rejects.toThrow('duplicate')
+      await expect(appendVisualLongThoughtChunk(store, fixture.id, 2)).rejects.toThrow('duplicate')
+      expect(await store.events(fixture.id)).toEqual(completed)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['journal', 'status', 'usage'] as const)('refuses a fixture whose %s was changed outside its transitions', async (change) => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-ui-long-thought-change-test-'))
+    try {
+      const store = new SessionStore(root, 'fixture-model')
+      await store.initialize()
+      const fixture = await seedVisualLongThoughtFixture(store)
+      if (change === 'journal') await store.append(fixture.id, 'assistant.started', { step: 99 })
+      else await store.update(fixture.id, (state) => {
+        if (change === 'status') state.summary.status = 'completed'
+        else state.summary.usage.modelCalls = 1
+      })
+      const before = await store.events(fixture.id)
+      await expect(appendVisualLongThoughtChunk(store, fixture.id, 1)).rejects.toThrow('changed outside')
+      expect(await store.events(fixture.id)).toEqual(before)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('seeds ten lifecycle, structured HITL, both feedback variants, free-credit, and coding projections without a model call', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-ui-fixture-test-'))
     try {

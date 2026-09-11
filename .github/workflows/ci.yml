@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A new commit supersedes the old verification run for the same PR/branch.
+# Do not keep paying runner time for obsolete builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,11 +21,20 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      - name: Changed module boundaries (including affected browsers)
+        if: github.event_name == 'pull_request'
+        env:
+          ANERA_CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: npm run test:changed -- --base "$ANERA_CI_BASE_SHA" --include-browser
+      - name: Complete offline acceptance
+        if: github.event_name != 'pull_request'
+        run: npm run test:full
       - run: npm run build:showcase

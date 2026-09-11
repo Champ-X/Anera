@@ -234,6 +234,78 @@ describe('DeepSeek vision client', () => {
     expect(recoveryMessages[0].content[0].text).toContain('pagination text/numbers')
   })
 
+  it('recovers language, wrapping, and intrinsic-label claims unless candidate pixels visibly fail', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-vision-compare-localized-copy-recovery-'))
+    roots.push(root)
+    const referencePath = resolve(root, 'reference.png')
+    const candidatePath = resolve(root, 'candidate.png')
+    await writeFile(referencePath, pngFixtureBytes(1_280, 720))
+    await writeFile(candidatePath, pngFixtureBytes(1_280, 720))
+    const submitted: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      submitted.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      const content = submitted.length === 1
+        ? '- Candidate body copy uses a Chinese fallback and wraps to two lines unlike the English reference.\n- The candidate pill label is wider because its wording is localized.'
+        : 'NO DEFECTS\nREFERENCE MATCH'
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: 'stop', message: { content } }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: submitted.length === 1 ? 18 : 5,
+          total_tokens: submitted.length === 1 ? 118 : 105,
+          prompt_cache_hit_tokens: 20,
+          prompt_cache_miss_tokens: 80,
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekVisionClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'vision-test', maxImageBytes: 2_048, maxOutputTokens: 4_096,
+    })
+    const prompt = `REFERENCE FIDELITY check. PASS: output exactly these two lines only:\nNO DEFECTS\nREFERENCE MATCH\n[ATTESTED_FACT: localized_copy_not_a_defect]`
+
+    const result = await client.compare(referencePath, candidatePath, prompt, new AbortController().signal)
+
+    expect(result).toMatchObject({
+      content: 'NO DEFECTS\nREFERENCE MATCH',
+      modelRequestCount: 2,
+      modelCallCount: 2,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const recoveryMessages = submitted[1].messages as Array<{ content: Array<{ text?: string }> }>
+    expect(recoveryMessages[0].content[0].text).toContain('localized/replaced copy')
+    expect(recoveryMessages[0].content[0].text).toContain('candidate pixels visibly clip')
+  })
+
+  it('keeps a concrete localized-copy clipping verdict as a valid failure', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-vision-compare-localized-copy-clipping-'))
+    roots.push(root)
+    const referencePath = resolve(root, 'reference.png')
+    const candidatePath = resolve(root, 'candidate.png')
+    await writeFile(referencePath, pngFixtureBytes(1_280, 720))
+    await writeFile(candidatePath, pngFixtureBytes(1_280, 720))
+    const failure = 'Candidate Chinese body copy is visibly clipped at the right edge of the pink panel.'
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { content: failure } }],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 12,
+        total_tokens: 112,
+        prompt_cache_hit_tokens: 20,
+        prompt_cache_miss_tokens: 80,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new DeepSeekVisionClient({
+      apiKey: 'test', baseUrl: 'https://api.example', model: 'vision-test', maxImageBytes: 2_048, maxOutputTokens: 4_096,
+    })
+    const prompt = `REFERENCE FIDELITY check. PASS: output exactly these two lines only:\nNO DEFECTS\nREFERENCE MATCH\n[ATTESTED_FACT: localized_copy_not_a_defect]`
+
+    await expect(client.compare(referencePath, candidatePath, prompt, new AbortController().signal))
+      .resolves.toMatchObject({ content: failure, modelRequestCount: 1, modelCallCount: 1 })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
   it('fails closed after one malformed exact-reference verdict recovery and retains both calls usage', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-vision-compare-verdict-bounded-'))
     roots.push(root)

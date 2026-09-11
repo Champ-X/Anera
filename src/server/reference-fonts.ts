@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { parse, type DefaultTreeAdapterMap } from 'parse5'
 import { fetchPublicUrl } from './network-policy.js'
 
 export const REFERENCE_FONT_MAX_STYLESHEETS = 2
@@ -13,6 +14,17 @@ const GOOGLE_STYLESHEET_HOST = 'fonts.googleapis.com'
 const GOOGLE_FONT_HOST = 'fonts.gstatic.com'
 const WOFF2_MAGIC = Buffer.from('wOF2', 'ascii')
 const GOOGLE_FONT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+const GOOGLE_FONT_FETCH_ATTEMPTS = 3
+const GOOGLE_FONT_FETCH_ATTEMPT_TIMEOUT_MS = 12_000
+const GOOGLE_FONT_FETCH_RETRY_DELAYS_MS = [150, 500] as const
+const GOOGLE_FONT_STYLESHEET_CACHE_ENTRIES = 16
+const GOOGLE_FONT_FILE_CACHE_ENTRIES = 32
+const GOOGLE_FONT_SUBSET_KIT_MAX_CHARS = 8_192
+const RETRYABLE_GOOGLE_FONT_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504])
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+  'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH',
+  'ENOTFOUND', 'EPIPE', 'ETIMEDOUT',
+])
 
 export interface ReferenceFontStylesheetManifestEntry {
   /** SHA-256 and bytes of the exact server response before URL rewriting. */
@@ -57,7 +69,8 @@ export interface MaterializedReferenceFonts {
  * workspace artifact stays immutable; preview, download, and deployment can
  * therefore share one deterministic derived representation without exposing
  * the private CSS through model context or trusting a candidate insertion
- * point.
+ * point. Supported Google Fonts links are removed only from this delivery
+ * copy: the verified private CSS replaces their external font dependency.
  */
 export function injectMaterializedReferenceFonts(
   html: string,
@@ -79,13 +92,14 @@ export function injectMaterializedReferenceFonts(
   if (/\bdata-anera-reference-fonts(?:\s|=|>)/iu.test(html)) {
     throw new Error('HTML contains an invalid reserved reference font evidence marker')
   }
+  const deliveryHtml = removeMaterializedGoogleFontLinks(html)
   const style = `<style data-anera-reference-fonts data-manifest-sha256="${manifestSha256.toLowerCase()}">\n${fontCss}\n</style>`
   // Prefixing after a leading doctype avoids trusting a regex match inside a
   // script/style raw-text body. Browsers place a pre-<html> style in the head
   // while preserving standards mode.
-  const doctype = /^\uFEFF?\s*<!doctype\b[^>]*>/iu.exec(html)
+  const doctype = /^\uFEFF?\s*<!doctype\b[^>]*>/iu.exec(deliveryHtml)
   const insertion = doctype?.[0].length ?? 0
-  return `${html.slice(0, insertion)}${style}${html.slice(insertion)}`
+  return `${deliveryHtml.slice(0, insertion)}${style}${deliveryHtml.slice(insertion)}`
 }
 
 interface HtmlLink {
@@ -106,6 +120,22 @@ interface DownloadedStylesheet {
 interface DownloadedFont {
   content: Buffer
   sha256: string
+}
+
+/**
+ * Only production downloads enter these bounded process-local caches. Test
+ * seams and caller-supplied fetch implementations stay isolated. A complete
+ * StyleContract persists the same bytes durably; this smaller cache covers
+ * transient tool retries before that durable boundary exists.
+ */
+const downloadedStylesheetCache = new Map<string, DownloadedStylesheet>()
+const downloadedFontCache = new Map<string, DownloadedFont>()
+
+class RetryableGoogleFontNetworkError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause })
+    this.name = 'RetryableGoogleFontNetworkError'
+  }
 }
 
 interface Replacement {
@@ -152,11 +182,19 @@ export async function materializeReferenceFonts(
   const stylesheets: DownloadedStylesheet[] = []
   for (const link of stylesheetLinks) {
     throwIfAborted(signal)
-    const response = await fetchChecked(link.href, signal, fetchImpl, 'stylesheet')
-    const source = await readBoundedResponse(
-      response,
-      REFERENCE_FONT_MAX_STYLESHEET_BYTES,
+    const cached = fetchImpl === fetchPublicUrl
+      ? cachedValue(downloadedStylesheetCache, link.href)
+      : undefined
+    if (cached) {
+      stylesheets.push(cached)
+      continue
+    }
+    const source = await downloadCheckedResource(
+      link.href,
       signal,
+      fetchImpl,
+      'stylesheet',
+      REFERENCE_FONT_MAX_STYLESHEET_BYTES,
       'Google Fonts stylesheet',
     )
     const css = decodeCss(source)
@@ -168,7 +206,11 @@ export async function materializeReferenceFonts(
     if (familyNames.length === 0) {
       throw new Error('Google Fonts stylesheet did not declare a font family')
     }
-    stylesheets.push({ source, css, fontUrls, familyNames })
+    const stylesheet = { source, css, fontUrls, familyNames }
+    if (fetchImpl === fetchPublicUrl) {
+      cacheValue(downloadedStylesheetCache, link.href, stylesheet, GOOGLE_FONT_STYLESHEET_CACHE_ENTRIES)
+    }
+    stylesheets.push(stylesheet)
   }
 
   const orderedFontUrls = unique(stylesheets.flatMap((stylesheet) => stylesheet.fontUrls))
@@ -176,21 +218,24 @@ export async function materializeReferenceFonts(
     throw new Error(`Google Fonts stylesheets declare more than ${REFERENCE_FONT_MAX_FILES} WOFF2 files`)
   }
 
-  const downloadedFonts = new Map<string, DownloadedFont>()
-  let fontBytes = 0
-  for (const url of orderedFontUrls) {
+  // Google CSS commonly expands a few requested families into several WOFF2
+  // subsets. Downloading those independent immutable files concurrently keeps
+  // one slow socket from consuming the entire visual-tool deadline. Waiting
+  // for every outcome also lets successful siblings seed the bounded cache
+  // before a transient peer failure is reported.
+  const fontOutcomes = await Promise.allSettled(orderedFontUrls.map(async (url): Promise<DownloadedFont> => {
     throwIfAborted(signal)
-    const response = await fetchChecked(url, signal, fetchImpl, 'font')
-    const remaining = REFERENCE_FONT_MAX_TOTAL_FILE_BYTES - fontBytes
-    if (remaining <= 0) {
-      await cancelResponse(response)
-      throw new Error(`Google Fonts files exceed the ${REFERENCE_FONT_MAX_TOTAL_FILE_BYTES}-byte total limit`)
-    }
-    const content = await readBoundedResponse(
-      response,
-      Math.min(REFERENCE_FONT_MAX_FILE_BYTES, remaining),
+    const cached = fetchImpl === fetchPublicUrl
+      ? cachedValue(downloadedFontCache, url)
+      : undefined
+    if (cached) return cached
+    const content = await downloadCheckedResource(
+      url,
       signal,
-      remaining < REFERENCE_FONT_MAX_FILE_BYTES ? 'Google Fonts aggregate' : 'Google Fonts WOFF2 file',
+      fetchImpl,
+      'font',
+      REFERENCE_FONT_MAX_FILE_BYTES,
+      'Google Fonts WOFF2 file',
     )
     if (content.length > REFERENCE_FONT_MAX_FILE_BYTES) {
       throw new Error(`Google Fonts WOFF2 file exceeds the ${REFERENCE_FONT_MAX_FILE_BYTES}-byte limit`)
@@ -198,11 +243,23 @@ export async function materializeReferenceFonts(
     if (content.length < WOFF2_MAGIC.length || !content.subarray(0, WOFF2_MAGIC.length).equals(WOFF2_MAGIC)) {
       throw new Error('Google Fonts response does not have the wOF2 magic signature')
     }
-    fontBytes += content.length
+    const font = { content, sha256: sha256(content) }
+    if (fetchImpl === fetchPublicUrl) {
+      cacheValue(downloadedFontCache, url, font, GOOGLE_FONT_FILE_CACHE_ENTRIES)
+    }
+    return font
+  }))
+
+  const downloadedFonts = new Map<string, DownloadedFont>()
+  let fontBytes = 0
+  for (let index = 0; index < fontOutcomes.length; index += 1) {
+    const outcome = fontOutcomes[index]
+    if (outcome.status === 'rejected') throw outcome.reason
+    fontBytes += outcome.value.content.length
     if (fontBytes > REFERENCE_FONT_MAX_TOTAL_FILE_BYTES) {
       throw new Error(`Google Fonts files exceed the ${REFERENCE_FONT_MAX_TOTAL_FILE_BYTES}-byte total limit`)
     }
-    downloadedFonts.set(url, { content, sha256: sha256(content) })
+    downloadedFonts.set(orderedFontUrls[index], outcome.value)
   }
 
   const materializedCss = stylesheets.map((stylesheet) => rewriteFontUrls(stylesheet.css, downloadedFonts))
@@ -263,31 +320,9 @@ function findGoogleFontLinks(html: string): HtmlLink[] {
     const raw = match[0]
     const start = match.index
     const attributes = parseHtmlAttributes(raw)
-    const href = attributes.get('href')
-    if (!href) continue
-    const decodedHref = decodeHtmlAttribute(href)
-    const target = parseAbsoluteUrl(decodedHref)
-    const hostname = target?.hostname.toLowerCase()
-    const rel = (attributes.get('rel') ?? '').toLowerCase().split(/\s+/u).filter(Boolean)
-    const isStylesheet = rel.includes('stylesheet')
-    const isConnectionHint = rel.includes('preconnect') || rel.includes('dns-prefetch')
-
-    if (hostname !== GOOGLE_STYLESHEET_HOST && hostname !== GOOGLE_FONT_HOST) {
-      if (/fonts\.(?:googleapis|gstatic)\.com/iu.test(decodedHref)) {
-        throw new Error('Google Fonts link URL is malformed or uses an ambiguous host')
-      }
-      continue
-    }
-
-    if (isConnectionHint) {
-      links.push({ start, end: start + raw.length, raw, href: decodedHref, role: 'discard' })
-      continue
-    }
-    if (hostname !== GOOGLE_STYLESHEET_HOST || !isStylesheet) {
-      throw new Error('Reference HTML contains an unsupported Google Fonts link')
-    }
-    validateGoogleStylesheetUrl(target)
-    links.push({ start, end: start + raw.length, raw, href: target.toString(), role: 'stylesheet' })
+    attributes.set('href', decodeHtmlAttribute(attributes.get('href') ?? ''))
+    const fontLink = classifyGoogleFontLink(attributes)
+    if (fontLink) links.push({ start, end: start + raw.length, raw, ...fontLink })
   }
 
   const withoutLinks = applyReplacements(html, links.map((link) => ({
@@ -299,6 +334,56 @@ function findGoogleFontLinks(html: string): HtmlLink[] {
     throw new Error('Reference HTML contains an unsupported external Google Fonts declaration')
   }
   return links
+}
+
+/** Classify decoded link attributes identically for source and delivery HTML. */
+function classifyGoogleFontLink(attributes: ReadonlyMap<string, string>): Pick<HtmlLink, 'href' | 'role'> | undefined {
+  const href = attributes.get('href')
+  if (!href) return undefined
+  const target = parseAbsoluteUrl(href)
+  const hostname = target?.hostname.toLowerCase()
+  const rel = (attributes.get('rel') ?? '').toLowerCase().split(/\s+/u).filter(Boolean)
+  const isStylesheet = rel.includes('stylesheet')
+  const isConnectionHint = rel.includes('preconnect') || rel.includes('dns-prefetch')
+
+  if (hostname !== GOOGLE_STYLESHEET_HOST && hostname !== GOOGLE_FONT_HOST) {
+    if (/fonts\.(?:googleapis|gstatic)\.com/iu.test(href)) {
+      throw new Error('Google Fonts link URL is malformed or uses an ambiguous host')
+    }
+    return undefined
+  }
+  if (isConnectionHint) return { href, role: 'discard' }
+  if (hostname !== GOOGLE_STYLESHEET_HOST || !isStylesheet) {
+    throw new Error('Reference HTML contains an unsupported Google Fonts link')
+  }
+  validateGoogleStylesheetUrl(target)
+  return { href: target.toString(), role: 'stylesheet' }
+}
+
+function removeMaterializedGoogleFontLinks(html: string): string {
+  const pending: DefaultTreeAdapterMap['node'][] = [parse(html, { sourceCodeLocationInfo: true })]
+  const replacements: Replacement[] = []
+  while (pending.length) {
+    const node = pending.pop()!
+    if ('tagName' in node && node.tagName === 'link' && node.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+      // parse5 distinguishes real nodes from raw-text, comments and attribute
+      // strings, and decodes attributes using browser-compatible semantics.
+      const attributes = new Map(node.attrs.map((attribute) => [attribute.name, attribute.value]))
+      if (classifyGoogleFontLink(attributes)) {
+        const location = node.sourceCodeLocation?.startTag
+        if (!location) throw new Error('Reference font link has no source location')
+        // parse5 retains the first duplicate attribute. Keep the existing
+        // font-link rejection for ambiguous href/rel instead of hiding it.
+        parseHtmlAttributes(html.slice(location.startOffset, location.endOffset))
+        replacements.push({ start: location.startOffset, end: location.endOffset, value: '' })
+      }
+    }
+    if ('childNodes' in node) {
+      for (const child of node.childNodes) pending.push(child)
+    }
+    if ('content' in node) pending.push(node.content)
+  }
+  return applyReplacements(html, replacements)
 }
 
 function parseHtmlAttributes(tag: string): Map<string, string> {
@@ -357,6 +442,98 @@ function validateGoogleStylesheetUrl(url: URL | null): asserts url is URL {
   }
 }
 
+function allowedGoogleFontPath(url: URL): boolean {
+  if (url.hash) return false
+  if (url.pathname.toLowerCase().endsWith('.woff2')) return true
+  // CSS2 text= subsets use this endpoint, not a .woff2 pathname. Admit
+  // only its bounded, opaque resource identity; MIME, magic, host and all
+  // transfer limits still apply exactly as for ordinary WOFF2 files.
+  if (url.pathname !== '/l/font') return false
+  const params = url.searchParams
+  const keys = [...params.keys()]
+  if (keys.length !== 3 || new Set(keys).size !== 3 || keys.some((key) => !['kit', 'skey', 'v'].includes(key))) return false
+  const kit = params.get('kit') ?? ''
+  return kit.length > 0 && kit.length <= GOOGLE_FONT_SUBSET_KIT_MAX_CHARS
+    && /^[a-z0-9_-]+$/iu.test(kit)
+    && /^[a-f0-9]{16}$/iu.test(params.get('skey') ?? '')
+    && /^v\d{1,6}$/u.test(params.get('v') ?? '')
+}
+
+async function downloadCheckedResource(
+  url: string,
+  signal: AbortSignal,
+  fetchImpl: typeof fetch,
+  kind: 'stylesheet' | 'font',
+  limit: number,
+  label: string,
+): Promise<Buffer> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < GOOGLE_FONT_FETCH_ATTEMPTS; attempt += 1) {
+    throwIfAborted(signal)
+    const attemptScope = fetchImpl === fetchPublicUrl
+      ? boundedAttemptSignal(signal, label)
+      : { signal, dispose: () => undefined }
+    try {
+      const response = await fetchChecked(url, attemptScope.signal, fetchImpl, kind)
+      return await readBoundedResponse(response, limit, attemptScope.signal, label)
+    } catch (error) {
+      if (signal.aborted) throw abortReason(signal, error)
+      lastError = error
+      if (!isRetryableGoogleFontNetworkError(error) || attempt === GOOGLE_FONT_FETCH_ATTEMPTS - 1) break
+    } finally {
+      attemptScope.dispose()
+    }
+    await waitForRetry(GOOGLE_FONT_FETCH_RETRY_DELAYS_MS[attempt] ?? 0, signal)
+  }
+  if (isRetryableGoogleFontNetworkError(lastError)) {
+    throw new Error(
+      `${errorMessage(lastError)} after ${GOOGLE_FONT_FETCH_ATTEMPTS} attempts`,
+      { cause: lastError },
+    )
+  }
+  throw lastError
+}
+
+function boundedAttemptSignal(
+  parent: AbortSignal,
+  label: string,
+): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController()
+  const onParentAbort = (): void => controller.abort(abortReason(parent))
+  parent.addEventListener('abort', onParentAbort, { once: true })
+  if (parent.aborted) onParentAbort()
+  const timeout = setTimeout(() => {
+    controller.abort(new DOMException(
+      `${label} request attempt exceeded ${GOOGLE_FONT_FETCH_ATTEMPT_TIMEOUT_MS}ms`,
+      'TimeoutError',
+    ))
+  }, GOOGLE_FONT_FETCH_ATTEMPT_TIMEOUT_MS)
+  timeout.unref()
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout)
+      parent.removeEventListener('abort', onParentAbort)
+    },
+  }
+}
+
+async function waitForRetry(durationMs: number, signal: AbortSignal): Promise<void> {
+  if (durationMs <= 0) return
+  throwIfAborted(signal)
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => finish(resolve), durationMs)
+    const onAbort = (): void => finish(() => reject(abortReason(signal)))
+    const finish = (callback: () => void): void => {
+      clearTimeout(timeout)
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+  })
+}
+
 async function fetchChecked(
   url: string,
   signal: AbortSignal,
@@ -382,13 +559,20 @@ async function fetchChecked(
     })
   } catch (error) {
     if (signal.aborted || isAbortError(error)) throw abortReason(signal, error)
-    throw new Error(`Failed to fetch Google Fonts ${kind}: ${errorMessage(error)}`, { cause: error })
+    throw new RetryableGoogleFontNetworkError(
+      `Failed to fetch Google Fonts ${kind}: ${errorMessage(error)}`,
+      error,
+    )
   }
   throwIfAborted(signal)
 
   if (response.status !== 200) {
     await cancelResponse(response)
-    throw new Error(`Google Fonts ${kind} returned HTTP ${response.status}; expected 200`)
+    const message = `Google Fonts ${kind} returned HTTP ${response.status}; expected 200`
+    if (RETRYABLE_GOOGLE_FONT_STATUSES.has(response.status)) {
+      throw new RetryableGoogleFontNetworkError(message)
+    }
+    throw new Error(message)
   }
   const finalUrl = parseAbsoluteUrl(response.url)
   const expectedHost = kind === 'stylesheet' ? GOOGLE_STYLESHEET_HOST : GOOGLE_FONT_HOST
@@ -402,6 +586,10 @@ async function fetchChecked(
   ) {
     await cancelResponse(response)
     throw new Error(`Google Fonts ${kind} redirected to a disallowed final host`)
+  }
+  if (kind === 'font' && !allowedGoogleFontPath(finalUrl)) {
+    await cancelResponse(response)
+    throw new Error('Google Fonts font redirected to a disallowed final path')
   }
 
   const mime = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase()
@@ -453,6 +641,9 @@ async function readBoundedResponse(
   } catch (error) {
     await reader.cancel().catch(() => undefined)
     if (signal.aborted || isAbortError(error)) throw abortReason(signal, error)
+    if (isRetryableNodeNetworkError(error)) {
+      throw new RetryableGoogleFontNetworkError(`Failed to read ${label}: ${errorMessage(error)}`, error)
+    }
     throw error
   } finally {
     reader.releaseLock()
@@ -523,7 +714,7 @@ function extractFontUrls(css: string): string[] {
       || url.protocol !== 'https:'
       || url.hostname.toLowerCase() !== GOOGLE_FONT_HOST
       || url.port
-      || !url.pathname.toLowerCase().endsWith('.woff2')
+      || !allowedGoogleFontPath(url)
       || url.username
       || url.password
     ) {
@@ -605,12 +796,43 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
+function isRetryableGoogleFontNetworkError(error: unknown): boolean {
+  return error instanceof RetryableGoogleFontNetworkError
+    || (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError'))
+    || isRetryableNodeNetworkError(error)
+}
+
+function isRetryableNodeNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code = (error as NodeJS.ErrnoException).code
+  if (code && RETRYABLE_NETWORK_ERROR_CODES.has(code)) return true
+  return /(?:socket hang up|fetch failed|premature close|other side closed|network connection was lost|terminated)/iu.test(error.message)
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
 function unique<T>(values: readonly T[]): T[] {
   return [...new Set(values)]
+}
+
+function cachedValue<T>(cache: Map<string, T>, key: string): T | undefined {
+  const value = cache.get(key)
+  if (value === undefined) return undefined
+  cache.delete(key)
+  cache.set(key, value)
+  return value
+}
+
+function cacheValue<T>(cache: Map<string, T>, key: string, value: T, maxEntries: number): void {
+  cache.delete(key)
+  cache.set(key, value)
+  while (cache.size > maxEntries) {
+    const oldest = cache.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    cache.delete(oldest)
+  }
 }
 
 function sha256(content: Buffer): string {

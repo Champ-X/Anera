@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { extname, resolve } from 'node:path'
 import {
   canonicalTraceWithUsageProvenance,
@@ -8,14 +8,19 @@ import {
   type CanonicalTraceRecord,
 } from '../shared/canonical-trace.js'
 import type { SessionEvent, SessionSnapshot } from '../shared/types.js'
+import { readHydratedSessionEventLog } from '../server/session-store.js'
 import { normalizeAneraTrace, traceToJsonl } from '../server/trace-normalizer.js'
 import { importArenaEventsFile } from './arena-importer.js'
 
-export function loadCanonicalTrace(path: string): CanonicalTrace {
+export async function loadCanonicalTrace(path: string): Promise<CanonicalTrace> {
   const absolute = resolve(path)
   if (extname(absolute).toLowerCase() === '.md') return importArenaEventsFile(absolute)
-  const text = readFileSync(absolute, 'utf8')
+  const text = await readFile(absolute, 'utf8')
   if (extname(absolute).toLowerCase() === '.json') return traceFromJson(JSON.parse(text) as unknown)
+  const first = firstJsonlValue(text)
+  if (first && isSessionEvent(first)) {
+    return normalizeAneraTrace({ events: await readHydratedSessionEventLog(absolute) })
+  }
   return traceFromJsonl(text)
 }
 
@@ -48,7 +53,12 @@ export function traceFromJsonl(text: string): CanonicalTrace {
   if (values.length === 0) throw new Error('Trace JSONL is empty')
   const first = values[0] as Record<string, unknown>
   if (first.recordType) return canonicalRecordsToTrace(values as CanonicalTraceRecord[])
-  if (isSessionEvent(first)) return normalizeAneraTrace({ events: values as SessionEvent[] })
+  if (isSessionEvent(first)) {
+    if (values.some(hasPersistedEventPayloadReferences)) {
+      throw new Error('Raw SessionEvent JSONL contains durable payload references; load it from its file path so event-payloads can be verified and hydrated')
+    }
+    return normalizeAneraTrace({ events: values as SessionEvent[] })
+  }
   if (isCanonicalTrace(first)) {
     if (values.length !== 1) throw new Error('A complete canonical trace JSONL value cannot be followed by additional records')
     return canonicalTraceWithUsageProvenance(first as unknown as CanonicalTrace)
@@ -96,4 +106,27 @@ function isCanonicalTrace(value: Record<string, unknown>): boolean {
 
 function isSessionEvent(value: Record<string, unknown>): boolean {
   return typeof value.sessionId === 'string' && typeof value.type === 'string' && typeof value.seq === 'number' && value.data !== undefined
+}
+
+function firstJsonlValue(text: string): Record<string, unknown> | undefined {
+  const firstLine = text.split(/\r?\n/u).find((line) => line.trim())
+  if (!firstLine) return undefined
+  try {
+    const value = JSON.parse(firstLine) as unknown
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined
+  } catch {
+    // traceFromJsonl reports the precise line-numbered syntax failure.
+    return undefined
+  }
+}
+
+function hasPersistedEventPayloadReferences(value: unknown): boolean {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.prototype.hasOwnProperty.call(value, '_aneraStorage'),
+  )
 }

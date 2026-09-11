@@ -61,6 +61,9 @@ cp .env.example .env
 | 变量 | 必需 | 用途 |
 | --- | ---: | --- |
 | `DEEPSEEK_API_KEY` | 是 | Agent 文本推理与 DeepSeek 视觉理解 |
+| `DEEPSEEK_MODEL` | 否 | 默认文本模型；未设置或为空时默认 `deepseek-flash`，保留显式配置，不改写历史会话 |
+| `ANERA_AGENT_MODELS` | 否 | 对话输入区的可选模型白名单，逗号分隔；官方端点默认提供 Flash 与 V4 Pro，自定义端点默认仅提供配置模型 |
+| `ANERA_MAX_AGENT_TOTAL_TOKENS_PER_TURN` | 否 | 默认 `0`，关闭单轮累计 token 强制停止；正整数可显式启用，费用和 token 记账始终保留 |
 | `TAVILY_API_KEY` | 建议 | Web Search 与图片搜索 |
 | `FIRECRAWL_API_KEY` | 建议 | 网页正文抓取 |
 | `PEXELS_API_KEY` | 否 | Pexels 图片/视频搜索；图片搜索也可回退到 Tavily |
@@ -69,6 +72,14 @@ cp .env.example .env
 | `ANERA_MODEL_FIRST_EVENT_TIMEOUT_MS` | 否 | DeepSeek 首个流事件等待上限；默认 `20000`，超时会安全重试 |
 | `ANERA_PUBLIC_BASE_URL` | 否 | 反向代理部署时的公开 origin |
 | `ANERA_REQUIRE_OS_SANDBOX` | 否 | 默认 `true`；仅受信任的本地调试可关闭 |
+
+对话框底部可选择主 Agent 模型；新消息和 Continue 都会使用所选模型，并在启动任务时保存到会话。运行中不可切换，打开旧会话保留其原模型，不改写历史。视觉理解、图片生成和语音等独立工具仍使用各自配置。界面提交具体模型 ID，不使用随机 Auto 路由。
+
+模型目录依据 [DeepSeek 官方文档](https://api-docs.deepseek.com/zh-cn/)（2026-09-10）：`deepseek-flash` 为 V4.1 Flash；旧 `deepseek-v4-flash` 是兼容别名；V4 Pro 将于北京时间 2026-09-14 12:00 起转路由至 V4.1 Flash，界面提供相应提示。自定义兼容端点不会自动添加官方模型。
+
+上下文采用持久证据与模型输入分离：已消费的大段工具文本按需投影为摘录，原文保留于会话，并以 session-local SHA-256 记录供 `read_context` 分页/搜索取回。新结果、失败/未知执行结果及图像不做此投影；检索不等于重新验证，也不放宽修改与交付门禁。摘要尾部按消息大小留出空间，同时保留强制证据锚点及最新工具配对。累计 token 上限关闭不代表上下文窗口、96 次物理请求保护、超时或无进展保护被关闭。
+
+工具能力采用单一执行定义：当前阶段的工具名称及参数约束同时用于模型请求、上下文压力计量和执行准入；不再为缓存命中向模型发送不可执行的工具全集。启用归档检索时，当前控制尾部会附上最多 8 条哈希有效的证据定位符和分页/搜索用法，计入同一上下文预算；最终无工具阶段不附加检索能力。样式证据从有界原始 CSS 声明解析，精简 profile 仅负责摘要，不以摘要遗漏判定证据不存在；颜色仍须由实际 DOM 关联的绘制属性消费，不能靠字符串、URL、未使用变量或无对应元素的规则通过。
 
 只填写 `DEEPSEEK_API_KEY` 即可运行 Agent 主链；Tavily 与 Firecrawl 用于生产级联网研究，Pexels 与 OpenAI-compatible 媒体 Provider 用于补齐图片/语音能力。`TAVILY_API_KRY` 这个历史拼写仍兼容，但新配置应使用 `TAVILY_API_KEY`。未配置 Tavily 或 Firecrawl 时，Harness 会使用受网络安全策略约束的 fallback。配置模板见 [.env.example](.env.example)，完整媒体 Provider 配置与真实 canary 见 [PRODUCTION_CANARY_RUNBOOK.md](PRODUCTION_CANARY_RUNBOOK.md)。
 
@@ -146,14 +157,17 @@ Session / Event / Workspace 持久化
 
 | 场景 | 命令 | 外部调用 |
 | --- | --- | ---: |
-| 日常工程门禁 | `npm run typecheck && npm test && npm run build && npm run build:showcase` | 无 |
+| 日常模块检查 | `npm test`，持续开发用 `npm run test:watch` | 禁止真实 Provider |
+| 改动影响检查 | `npm run test:plan` → `npm run test:changed` | 禁止真实 Provider；明确报告延后的浏览器层 |
+| 跨模块交接门禁 | `npm run verify` | 禁止真实 Provider；类型检查 + 模块/集成 |
+| 浏览器 / 完整验收 | `npm run test:browser` / `npm run test:full` | 禁止真实 Provider；保留全部用例 |
 | 依赖安全审计 | `npm audit --audit-level=high` | npm registry |
-| 19-tool 综合回归 | `npm run test:harness-convergence` | DeepSeek；其他 Provider 使用 fixtures |
-| Tavily / Firecrawl canary | `npm run canary:web-research-providers` | Tavily、Firecrawl |
-| 完整 HTML Slides E2E | `npm run canary:html-slides` | DeepSeek、Tavily、Firecrawl、Browser |
+| 旧真实模型 smoke / 综合回归 | 已封存，原入口默认拒绝执行 | 未接入累计预算，不可用开关绕过 |
+| 旧 Tavily / Firecrawl canary | 已封存，待独立费用策略 | 不允许无预算按量调用 |
+| 真实模型预算预检 / 验收 | `npm run test:paid:preflight` / `npm run test:paid` | 预检仅本地；验收须满足现有累计授权 |
 | Arena 公开契约审计 | `npm run audit:arena-public-contract` | Arena 公开页面与静态资源 |
 
-真实 Provider canary 会消耗 API 配额并受实时网络状态影响；普通开发提交优先运行“日常工程门禁”。综合回归使用真实配置的 DeepSeek provider，模型采样仍可能带来轻微波动。
+测试已按模块、集成、浏览器和付费验收分层，详见 [TESTING.md](TESTING.md)。`npm test` 只代表模块层通过，不再隐含完整验收；不删除关键断言、不缓存跨运行的“成功”、不自动重试失败或重复构建两个前端。真实模型验收不会由日常测试或 CI 自动触发。
 
 可提交的脱敏摘要证据位于 [evidence/](evidence/README.md)，详细能力与限制见 [AGENT_HARNESS_CAPABILITY_MATRIX.md](AGENT_HARNESS_CAPABILITY_MATRIX.md) 和 [FIDELITY_AUDIT.md](FIDELITY_AUDIT.md)。
 

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BrowserManager } from './browser-manager.js'
+import { publicReadTransport } from '../eval/public-read-transport.js'
+import { visualWebArtifactCompletionGap, visualWebArtifactRequiredToolNames } from './agent-service.js'
 import { config } from './config.js'
 import { GitHubConnector, createGitHubCodingShellCommandBroker } from './github-connector.js'
 import { ProcessManager, type ProcessEvent, type ProcessManagerOptions } from './process-manager.js'
@@ -399,12 +401,12 @@ describe('tool executor vision integration', () => {
     })
   })
 
-  it('keeps the exact Arena surface frozen while exposing Anera read_file pagination at runtime', () => {
+  it('keeps the exact Arena surface frozen while exposing Anera pagination and atomic multi-edit at runtime', () => {
     const arenaRead = ARENA_ACTIVE_AGENT_TOOL_DEFINITIONS.find((tool) => tool.function.name === 'read_file')!
     const runtimeRead = ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS.find((tool) => tool.function.name === 'read_file')!
     expect(Object.keys((arenaRead.function.parameters as { properties: Record<string, unknown> }).properties)).toEqual(['path'])
     expect(Object.keys((runtimeRead.function.parameters as { properties: Record<string, unknown> }).properties)).toEqual([
-      'path', 'offset', 'content_offset', 'limit',
+      'path', 'offset', 'content_offset', 'limit', 'view',
     ])
     expect(ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS.map((tool) => tool.function.name)).toEqual(ARENA_ACTIVE_AGENT_TOOL_NAMES)
     const raw = {
@@ -417,6 +419,51 @@ describe('tool executor vision integration', () => {
       path: 'large.txt', offset: 2001, content_offset: 80_000, limit: 500,
     })
     expect(() => validateToolCallArguments(normalizeAneraRuntimeToolCall(raw))).not.toThrow()
+
+    const arenaEdit = ARENA_ACTIVE_AGENT_TOOL_DEFINITIONS.find((tool) => tool.function.name === 'edit_file')!
+    const runtimeEdit = ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS.find((tool) => tool.function.name === 'edit_file')!
+    expect(Object.keys((arenaEdit.function.parameters as { properties: Record<string, unknown> }).properties)).toEqual([
+      'path', 'old_text', 'new_text',
+    ])
+    expect(Object.keys((runtimeEdit.function.parameters as { properties: Record<string, unknown> }).properties)).toEqual([
+      'path', 'old_text', 'new_text', 'reference_resource', 'reference_text', 'edits',
+    ])
+    const batchEdit = normalizeAneraRuntimeToolCall({
+      id: 'batch-edit',
+      name: 'edit_file',
+      arguments: {
+        path: 'deck.html',
+        edits: [
+          { old_text: 'layout-a layout-b', new_text: 'layout-a' },
+          { old_text: 'layout-c layout-d', new_text: 'layout-c' },
+        ],
+      },
+    })
+    expect(() => validateToolCallArguments(batchEdit)).not.toThrow()
+    expect(() => validateToolCallArguments(normalizeAneraRuntimeToolCall({
+      ...batchEdit,
+      arguments: { ...batchEdit.arguments, old_text: 'also', new_text: 'invalid' },
+    }))).toThrow(/either old_text\/new_text or edits/iu)
+
+    const singleEdit = {
+      id: 'single-edit',
+      name: 'edit_file',
+      arguments: {
+        path: 'deck.html',
+        edits: [{ old_text: 'position:relative', new_text: 'position:absolute' }],
+      },
+    }
+    // Arena's frozen public schema still strips its unknown `edits` overlay.
+    expect(normalizeArenaPublicToolCall(singleEdit).arguments).toEqual({ path: 'deck.html' })
+    // The provider-visible Anera overlay can repair this unambiguous model
+    // shape before schema validation instead of spending a failed tool step.
+    const normalizedSingleEdit = normalizeAneraRuntimeToolCall(singleEdit)
+    expect(normalizedSingleEdit.arguments).toEqual({
+      path: 'deck.html',
+      old_text: 'position:relative',
+      new_text: 'position:absolute',
+    })
+    expect(() => validateToolCallArguments(normalizedSingleEdit)).not.toThrow()
 
     const arenaList = ARENA_ACTIVE_AGENT_TOOL_DEFINITIONS.find((tool) => tool.function.name === 'list_files')!
     const runtimeList = ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS.find((tool) => tool.function.name === 'list_files')!
@@ -1274,7 +1321,7 @@ describe('tool executor vision integration', () => {
     const session = await store.create()
     const workspace = store.workspaceDir(session.summary.id)
     const entryPath = 'verified-deck.html'
-    const sourceHtml = '<!doctype html><html><head><title>Exact</title></head><body>EXACT DEPLOYMENT</body></html>'
+    const sourceHtml = '<!doctype html><html><head><title>Exact</title><link rel="preconnect" href="https://fonts.gstatic.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter"></head><body>EXACT DEPLOYMENT</body></html>'
     const decoyHtml = '<!doctype html><title>DECOY</title>'
     await writeFile(resolve(workspace, entryPath), sourceHtml)
     await writeFile(resolve(workspace, 'index.html'), decoyHtml)
@@ -1332,6 +1379,7 @@ describe('tool executor vision integration', () => {
       `<style data-anera-reference-fonts data-manifest-sha256="${fixture.fontEvidence.manifestSha256}">`,
     )
     expect(deliveredHtml).toContain('EXACT DEPLOYMENT')
+    expect(deliveredHtml).not.toMatch(/fonts\.(?:googleapis|gstatic)\.com/u)
     expect(await readFile(resolve(workspace, entryPath), 'utf8')).toBe(sourceHtml)
     await expect(readFile(resolve(store.deploymentRevisionDir(session.summary.id, 1), 'index.html'), 'utf8'))
       .resolves.toBe(decoyHtml)
@@ -1493,6 +1541,29 @@ describe('tool executor vision integration', () => {
       hash: expect.any(String),
     })
     await tools.execute({
+      id: 'call_batch_create',
+      name: 'create_file',
+      arguments: { path: 'batch.html', content: '<section class="layout-a layout-b"></section><section class="layout-c layout-d"></section>\n' },
+    }, context)
+    const batchEdited = await tools.execute({
+      id: 'call_batch_edit',
+      name: 'edit_file',
+      arguments: {
+        path: 'batch.html',
+        edits: [
+          { old_text: 'layout-a layout-b', new_text: 'layout-a' },
+          { old_text: 'layout-c layout-d', new_text: 'layout-c' },
+        ],
+      },
+    }, context)
+    expect(JSON.parse(batchEdited.content)).toMatchObject({ status: 'success', hash: expect.any(String) })
+    await expect(readFile(resolve(store.workspaceDir(session.summary.id), 'batch.html'), 'utf8')).resolves.toBe(
+      '<section class="layout-a"></section><section class="layout-c"></section>\n',
+    )
+    await tools.execute({
+      id: 'call_batch_delete', name: 'delete_file', arguments: { path: 'batch.html' },
+    }, context)
+    await tools.execute({
       id: 'call_temp', name: 'create_file', arguments: { path: 'temp.txt', content: 'remove\n' },
     }, context)
 
@@ -1548,7 +1619,9 @@ describe('tool executor vision integration', () => {
       expect.objectContaining({ path: 'config.ts', mime: 'text/javascript' }),
     ])
     const events = await store.events(session.summary.id)
-    expect(events.filter((event) => event.type === 'artifact.removed').map((event) => event.data.path)).toEqual(['temp.txt', 'extra.txt'])
+    expect(events.filter((event) => event.type === 'artifact.removed').map((event) => event.data.path)).toEqual([
+      'batch.html', 'temp.txt', 'extra.txt',
+    ])
     expect(events
       .filter((event) => event.type === 'file.changed')
       .map((event) => String(event.data.path))
@@ -1642,7 +1715,12 @@ describe('tool executor vision integration', () => {
         name: 'fetch_page',
         arguments: { url: 'https://example.com/large.txt', chunkIndex },
       }, context)
-      expect(result.isError).toBe(false)
+      expect(result.isError, result.content).toBe(false)
+      expect(result.researchPageRead).toMatchObject({
+        url: 'https://example.com/large.txt', requestedUrl: 'https://example.com/large.txt',
+        format: 'markdown', chunkIndex,
+        snapshotSha256: createHash('sha256').update(source).digest('hex'),
+      })
       expect(result.webProviderUsage).toMatchObject(chunkIndex === 0 ? {
         schemaVersion: 1,
         cache: 'miss',
@@ -2348,6 +2426,7 @@ describe('tool executor vision integration', () => {
   })
 
   it.each([
+    ['local capability denial', () => { throw new Error('Unpriced tool-provider route unavailable in this canary') }],
     ['HTTP 401', () => new Response('credential rejected', { status: 401 })],
     ['HTTP 429', () => new Response('rate limited', { status: 429 })],
     ['HTTP 503', () => new Response('provider unavailable', { status: 503 })],
@@ -2400,6 +2479,53 @@ describe('tool executor vision integration', () => {
     expect(result.content).not.toContain(secret)
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
+
+  it.each(['fetch', 'search', 'image', 'fetch-failed'] as const)(
+    'keeps %s local non-dispatch separate from actual fallback usage and evidence', async (kind) => {
+      const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-dispatch-'))
+      roots.push(root)
+      const store = new SessionStore(root, 'test-model')
+      await store.initialize()
+      const session = await store.create()
+      const publicFetch = vi.fn<typeof fetch>(async (input, init) => {
+        const request = new Request(input, init)
+        expect(request.method).toBe('GET')
+        expect(request.headers.has('authorization')).toBe(false)
+        if (kind === 'search') return new Response('<li class="b_algo"><h2><a href="https://docs.example/article">Source</a></h2><p>Observed public evidence</p></li>',
+          { headers: { 'content-type': 'text/html' } })
+        return new Response('<title>Source</title><main>Observed public evidence</main>', {
+          status: kind === 'fetch-failed' ? 404 : 200, headers: { 'content-type': 'text/html' },
+        })
+      })
+      const localFetch = vi.fn<typeof fetch>()
+      const executor = new ToolExecutor(store, persistedProcessManager(store), new BrowserManager(),
+        { inspect: vi.fn() }, async () => false, {
+          fetch: publicReadTransport({ publicFetch, localFetch, localBaseUrl: () => '' }),
+          validatePublicUrl: async raw => new URL(raw),
+          firecrawlApiKey: 'synthetic-secret-fc', tavilyApiKey: 'synthetic-secret-tv', pexelsApiKey: '',
+        })
+      const controller = new AbortController()
+      const result = await executor.execute({ id: 'dispatch-case',
+        name: kind === 'search' ? 'web_search' : kind === 'image' ? 'image_search' : 'fetch_page',
+        arguments: kind === 'search' ? { query: 'public evidence', depth: '1' }
+          : kind === 'image' ? { query: 'public evidence', count: 1 } : { url: 'https://docs.example/article' },
+      }, { sessionId: session.summary.id, turnId: 'turn_dispatch', stepId: 'step_dispatch', signal: controller.signal })
+      expect(result.isError).toBe(kind === 'image' || kind === 'fetch-failed')
+      expect(result.webProviderUsage?.providerCalls).toBe(kind === 'image' ? 0 : 1)
+      expect(result.webProviderUsage?.requests[0]).toMatchObject({
+        provider: kind === 'search' || kind === 'image' ? 'tavily' : 'firecrawl',
+        calls: 0, responseBytes: 0, outcome: 'not_dispatched',
+      })
+      if (kind !== 'image') expect(result.webProviderUsage?.requests[1]).toMatchObject({
+        provider: kind === 'search' ? 'bing' : 'direct', calls: 1,
+        outcome: kind === 'fetch-failed' ? 'error' : 'success',
+      })
+      expect(result.webProviderUsage).toMatchObject({ costUsd: null, costStatus: 'not_available' })
+      expect(result.content).not.toContain('synthetic-secret')
+      expect(publicFetch).toHaveBeenCalledTimes(kind === 'image' ? 0 : 1)
+      expect(localFetch).not.toHaveBeenCalled()
+      expect(controller.signal.aborted).toBe(false)
+    })
 
   it('validates the target before Firecrawl and does not fall back after cancellation', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-tools-firecrawl-policy-'))
@@ -3942,12 +4068,15 @@ describe('tool executor vision integration', () => {
       const submittedPrompt = compare.mock.calls[index][2]
       expect(submittedPrompt).toContain('Harness-grounded deterministic evidence for this phase (authoritative)')
       expect(submittedPrompt).toContain('passed the source-bound render-profile verifier with score 100')
-      expect(submittedPrompt).toContain('Do not claim that an attested component or decoration is missing')
+      expect(submittedPrompt).toContain('[ATTESTED_FIXED_SELECTORS:')
+      expect(submittedPrompt).toContain('[ATTESTED_INTRINSIC_SELECTORS:')
+      expect(submittedPrompt).toContain('[ATTESTED_FACT: localized_copy_not_a_defect]')
+      expect(submittedPrompt).toContain('Do not claim these fixed anchors are missing')
       expect(submittedPrompt).toContain('does not prove that every visible Unicode glyph is covered')
       expect(submittedPrompt).toContain('glyph-coverage or typography-role mismatch')
-      expect(submittedPrompt).toContain('matching dark square control as a light, rounded, or card-like widget')
-      expect(submittedPrompt).toContain('Localized body copy in a general body-text role')
-      expect(submittedPrompt).toContain('report clipping only when visible ink is actually cut off')
+      expect(submittedPrompt).toContain('translated/replaced words')
+      expect(submittedPrompt).toContain('content-driven label/pill/badge/kicker dimensions')
+      expect(submittedPrompt).toContain('report it only when candidate ink is visibly cut off')
     }
     expect(inspect).not.toHaveBeenCalled()
     expect(await readFile(candidateTarget)).toEqual(candidate)
@@ -5280,7 +5409,7 @@ describe('tool executor vision integration', () => {
     const referenceUrl = 'https://example.com/reference.html'
     const cssUrl = 'https://fonts.googleapis.com/css2?family=Inter&display=swap'
     const fontUrl = 'https://fonts.gstatic.com/s/inter/v1/inter.woff2'
-    const referenceHtml = `<!doctype html><html><head>
+    const referenceHtml = `<!doctype html><html><head><title>Reference demo</title>
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
       <link rel="stylesheet" href="${cssUrl.replaceAll('&', '&amp;')}">
       <style>
@@ -5289,9 +5418,9 @@ describe('tool executor vision integration', () => {
         .slide{position:absolute;inset:0}.layout-cover{display:flex}.layout-content{display:grid}
         .layout-closing{display:flex}.progress-bar{position:fixed;bottom:0;height:3px;background:var(--primary)}
       </style></head><body>
-      <section class="slide layout-cover">Cover</section>
+      <main><section class="slide layout-cover">Cover</section>
       <section class="slide layout-content">Content</section>
-      <section class="slide layout-closing">Closing</section>
+      <section class="slide layout-closing">Closing</section></main>
       <div class="progress-bar"></div></body></html>`
     const fetchCall = {
       id: 'reference-bundle-fetch',
@@ -5347,9 +5476,9 @@ describe('tool executor vision integration', () => {
       evidenceSha256,
       viewport,
       phases: {
-        cover: { anchors: [structural('.layout-cover'), chrome], overlayProbes: [] },
-        content: { anchors: [structural('.layout-content'), chrome], overlayProbes: [] },
-        closing: { anchors: [structural('.layout-closing'), chrome], overlayProbes: [] },
+        cover: { anchors: [structural('.layout-cover'), chrome], overlayProbes: [], textLayout: { version: 2 as const, complete: true, collisions: [] } },
+        content: { anchors: [structural('.layout-content'), chrome], overlayProbes: [], textLayout: { version: 2 as const, complete: true, collisions: [] } },
+        closing: { anchors: [structural('.layout-closing'), chrome], overlayProbes: [], textLayout: { version: 2 as const, complete: true, collisions: [] } },
       },
     }
     const screenshots = {
@@ -5409,6 +5538,14 @@ describe('tool executor vision integration', () => {
     const payload = JSON.parse(recorded.content) as Record<string, unknown>
     expect(payload).toMatchObject({
       status: 'success',
+      composition_template: {
+        version: 3, sourceSha256: evidenceSha256, dependencies: [],
+        variants: [
+          { id: 'v1', slots: [{ id: 't1', sample: 'Cover' }] },
+          { id: 'v2', slots: [{ id: 't1', sample: 'Content' }] },
+          { id: 'v3', slots: [{ id: 't1', sample: 'Closing' }] },
+        ],
+      },
       visual_evidence: {
         sourceEvidenceSha256: evidenceSha256,
         renderProfileSha256: createHash('sha256').update(JSON.stringify(renderProfile)).digest('hex'),
@@ -5427,6 +5564,7 @@ describe('tool executor vision integration', () => {
       renderProfile,
       visualEvidence: payload.visual_evidence,
       fontEvidence: payload.font_evidence,
+      templateCatalog: payload.composition_template,
     })
     expect(await store.resolveReferenceFontEvidence(session.summary.id, durable!.fontEvidence!)).toMatchObject({
       familyNames: ['Inter'],
@@ -5471,6 +5609,66 @@ describe('tool executor vision integration', () => {
     })
     expect(fontCommit).toHaveBeenCalledOnce()
     expect((await store.get(session.summary.id)).activeReferenceStyleContract).toEqual(priorDurable)
+
+    // Persisted v1/v2 catalogs must leave the composer lane, even after the
+    // provider checkpoint has discarded the original reference body.
+    for (const version of [1, 2] as const) {
+      const upgradedPath = `upgraded-v${version}.html`
+      const legacy = { ...priorDurable!, templateCatalog: { ...priorDurable!.templateCatalog!, version } }
+      await store.append(session.summary.id, 'tool.completed', {
+        call: { id: fetchCall.id, name: 'web_fetch', arguments: { url: referenceUrl, format: 'html' } },
+        result: JSON.stringify({ status: 'success', url: referenceUrl, content: referenceHtml }),
+      }, { turnId: context.turnId, callId: fetchCall.id })
+      await store.update(session.summary.id, (state) => {
+        state.messages = [{ role: 'assistant', content: 'Legacy checkpoint; source bytes are only in the journal.' }]
+        state.activeReferenceStyleContract = legacy
+      })
+      const legacyGap = visualWebArtifactCompletionGap([], {
+        forceTask: true, requiresResearch: false, referenceContract: legacy,
+        referenceRequest: { urls: [referenceUrl], strictness: 'exact' },
+      })!
+      expect(legacyGap.missingPhases).toContain('reference_contract')
+      expect([...visualWebArtifactRequiredToolNames(legacyGap)!]).toEqual(['record_reference_style'])
+      const composeCall = { id: 'legacy-compose', name: 'compose_reference_html', arguments: {
+        path: upgradedPath, source_sha256: evidenceSha256, title: 'Upgraded fixture',
+        slides: legacy.templateCatalog.variants.map((variant) => ({ variant: variant.id, label: variant.id,
+          texts: Object.fromEntries(variant.slots.map((slot) => [slot.id, `Task ${slot.sample}`])) })),
+      } }
+      const staleCompose = await tools.execute(composeCall, context)
+      expect(staleCompose.isError).toBe(true)
+      expect(staleCompose.content).toMatch(new RegExp(`catalog v${version} is stale[\\s\\S]*record_reference_style`))
+      await expect(readFile(resolve(store.workspaceDir(session.summary.id), upgradedPath))).rejects.toMatchObject({ code: 'ENOENT' })
+      const upgrade = await tools.execute({ id: 'upgrade-reference', name: 'record_reference_style', arguments: contractArguments }, context)
+      expect(upgrade.isError, upgrade.content).toBe(false)
+      const upgraded = (await store.get(session.summary.id)).activeReferenceStyleContract!
+      expect(upgraded.templateCatalog?.version).toBe(3)
+      expect(upgraded.provenance).toEqual(legacy.provenance)
+      const upgradedGap = visualWebArtifactCompletionGap([], {
+        forceTask: true, requiresResearch: false, referenceContract: upgraded,
+        referenceRequest: { urls: [referenceUrl], strictness: 'exact' },
+      })!
+      expect(upgradedGap.missingPhases).not.toContain('reference_contract')
+      expect([...visualWebArtifactRequiredToolNames(upgradedGap)!]).toEqual(['compose_reference_html'])
+      const composed = await tools.execute({ ...composeCall, id: 'upgraded-compose' }, context)
+      expect(composed.isError, composed.content).toBe(false)
+      expect(await readFile(resolve(store.workspaceDir(session.summary.id), upgradedPath), 'utf8')).toContain('Task Content')
+    }
+
+    // Text-layout upgrades must also work after compaction when the current
+    // catalog is already up to date. Only hash-bound journal bytes qualify.
+    const legacyTextReference = structuredClone(priorDurable!)
+    for (const phase of Object.values(legacyTextReference.renderProfile!.phases)) delete phase.textLayout
+    await store.update(session.summary.id, (state) => {
+      state.messages = [{ role: 'assistant', content: 'Only the journal retains the exact source.' }]
+      state.activeReferenceStyleContract = legacyTextReference
+    })
+    const textUpgrade = await tools.execute({
+      id: 'upgrade-reference-text-layout', name: 'record_reference_style', arguments: contractArguments,
+    }, context)
+    expect(textUpgrade.isError, textUpgrade.content).toBe(false)
+    const textUpgraded = (await store.get(session.summary.id)).activeReferenceStyleContract!
+    expect(textUpgraded.provenance).toEqual(legacyTextReference.provenance)
+    expect(textUpgraded.renderProfile?.phases.cover.textLayout).toEqual({ version: 2, complete: true, collisions: [] })
   })
 
   it('maps a constrained Pexels image search to the exact Arena fetch_media result', async () => {
