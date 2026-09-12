@@ -93,6 +93,20 @@ async function waitForCompleted(created: Awaited<ReturnType<typeof createTestApp
 }
 
 describe('Arena current atomic create-chat transport', () => {
+  it('preserves a manual title when the first message starts while still naming untitled sessions', async () => {
+    const created = await createTestApp()
+    const named = await created.store.create()
+    await created.store.updateMetadata(named.summary.id, { title: 'My saved conversation name' })
+    await created.agent.submit(named.summary.id, { content: 'Hello from the first message' })
+    await waitForCompleted(created, named.summary.id)
+    expect((await created.store.get(named.summary.id)).summary.title).toBe('My saved conversation name')
+
+    const automatic = await created.store.create()
+    await created.agent.submit(automatic.summary.id, { content: 'Hello from the first message' })
+    await waitForCompleted(created, automatic.summary.id)
+    expect((await created.store.get(automatic.summary.id)).summary.title).toBe('Hello from the first message')
+  })
+
   it('creates and starts exactly one Session from the current first-message envelope', async () => {
     const created = await createTestApp()
     const base = await listen(created.app)

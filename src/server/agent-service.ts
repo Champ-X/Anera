@@ -246,6 +246,8 @@ Workspace snapshots exclude generated dependency/cache/build directory names: ${
 
 ${processSection}Note, when user views a workspace file they will see a preview. The preview renders in a sandboxed iframe (\`sandbox="allow-scripts"\`) with no network access, so external stylesheets, scripts, images, and fonts will not load. Use inline styles, embedded SVGs, and data URIs instead. If the user explicitly needs external resources (e.g. a live API, CDN library), that's fine — just know the in-app preview will degrade gracefully (missing styles/images) while the downloaded file will work fully in a browser.
 
+For images requested in the conversation, include Markdown images directly in your answer: ![Descriptive caption](assets/image.jpg). Use actual workspace-relative paths or verified HTTPS image URLs, and place each image next to its explanation. Reading an image with read_file gives you visual evidence; it does not replace embedding the image in the answer. Do not create an HTML gallery unless the user asks for a separate file or website.
+
 The viewer renders rich previews for these formats: plain text and code, Markdown, HTML, SVG, images, audio, video, PDF, CSV, and Microsoft Office documents — Word (\`.docx\`), Excel (\`.xlsx\`), and PowerPoint (\`.pptx\`). Any other type is offered to the user as a download rather than a preview. When creating Office deliverables, always use the modern OOXML formats — \`.docx\`, \`.pptx\`, and \`.xlsx\` (Python's \`python-docx\`, \`python-pptx\`, and \`openpyxl\` produce these by default). Do not emit legacy binary \`.doc\` or \`.ppt\` files: they cannot be previewed in-app and are only offered as a download. If a user explicitly requires a legacy format, produce it but tell them it will download rather than preview.
 
 Use the workspace to write code, notes, or any text content the user requests as a file (implicitly or explicity) and build up projects incrementally across multiple messages.
@@ -1554,7 +1556,7 @@ export class AgentService {
         createdAt: new Date().toISOString(),
       }, (next) => {
         const displaySummary = content || `Uploaded ${attachments.map((path) => path.split('/').at(-1) || path).join(', ')}`
-        if (next.messages.length === 0) next.summary.title = titleFromPrompt(this.store.redactTextForDisplay(sessionId, displaySummary))
+        if (next.messages.length === 0 && !next.titleCustomized) next.summary.title = titleFromPrompt(this.store.redactTextForDisplay(sessionId, displaySummary))
         next.summary.lastMessage = this.store.redactTextForDisplay(sessionId, displaySummary)
         next.summary.model = selectedModel.model
         next.summary.modelSelection = selectedModel.selection

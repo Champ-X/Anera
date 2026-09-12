@@ -4,12 +4,14 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import type { SessionSnapshot } from '../shared/types.js'
+import type { SessionSnapshot, SessionSummary } from '../shared/types.js'
 import { createApp } from './app.js'
+import { SessionStore } from './session-store.js'
 
 async function withSnapshotApi(run: (context: {
   created: Awaited<ReturnType<typeof createApp>>
   id: string
+  root: string
   url: string
 }) => Promise<void>): Promise<void> {
   const root = await mkdtemp(resolve(tmpdir(), 'anera-readonly-snapshot-api-'))
@@ -25,7 +27,7 @@ async function withSnapshotApi(run: (context: {
     await new Promise<void>((ready) => server.listen(0, '127.0.0.1', ready))
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('Snapshot API test server did not bind')
-    await run({ created, id: session.summary.id, url: `http://127.0.0.1:${address.port}/api/sessions/${session.summary.id}` })
+    await run({ created, id: session.summary.id, root, url: `http://127.0.0.1:${address.port}/api/sessions/${session.summary.id}` })
   } finally {
     vi.restoreAllMocks()
     await created.agent.shutdown()
@@ -120,6 +122,63 @@ describe('read-only session snapshot API', () => {
         release()
         await pendingResponse
       }
+    })
+  })
+})
+
+describe('session metadata API', () => {
+  it('persists rename, archive and restore without changing activity order or deleting content', async () => {
+    await withSnapshotApi(async ({ created, id, root, url }) => {
+      const newer = await created.store.create()
+      await created.store.update(id, (state) => { state.summary.status = 'completed' }, { updatedAt: '2026-09-01T00:00:00.000Z' })
+      await created.store.append(id, 'assistant.final', { content: 'Keep this response.' })
+      await writeFile(resolve(created.store.workspaceDir(id), 'keep.txt'), 'Keep this workspace file.')
+      const journal = await created.store.events(id)
+      const before = (await created.store.get(id)).summary
+      for (const patch of [{ title: '  中文会话名  ' }, { archived: true }, { archived: false }]) {
+        const response = await fetch(url, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
+        expect(response.status).toBe(200)
+        const { session } = await response.json() as { session: SessionSummary }
+        expect(session).toMatchObject({ title: '中文会话名', updatedAt: before.updatedAt, status: 'completed' })
+        expect(Boolean(session.archivedAt)).toBe('archived' in patch && patch.archived === true)
+        const reloaded = await new SessionStore(root, 'snapshot-fixture').get(id)
+        expect(reloaded.summary).toEqual(session)
+        expect(reloaded.titleCustomized).toBe(true)
+        expect(await created.store.events(id)).toEqual(journal)
+        expect(await readFile(resolve(created.store.workspaceDir(id), 'keep.txt'), 'utf8')).toBe('Keep this workspace file.')
+        expect((await created.store.list()).map((item) => item.id)).toEqual([newer.summary.id, id])
+      }
+    })
+  })
+
+  it('serializes concurrent metadata and run updates without losing either change', async () => {
+    await withSnapshotApi(async ({ created, id, url }) => {
+      const responses = await Promise.all([
+        fetch(url, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Renamed during run' }) }),
+        fetch(url, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ archived: true }) }),
+        created.store.update(id, (state) => { state.summary.lastMessage = 'Concurrent progress'; state.summary.workspaceBytes = 45 }),
+      ])
+      expect(responses[0].status).toBe(200)
+      expect(responses[1].status).toBe(200)
+      expect((await created.store.get(id)).summary).toMatchObject({
+        title: 'Renamed during run', archivedAt: expect.any(String), metadataVersion: 2,
+        lastMessage: 'Concurrent progress', workspaceBytes: 45,
+      })
+    })
+  })
+
+  it('rejects invalid edits without writing state and returns 404 for a missing session', async () => {
+    await withSnapshotApi(async ({ created, id, url }) => {
+      const before = await durableEvidence(created.store.sessionDir(id))
+      for (const patch of [{}, [], { title: '' }, { title: '  ' }, { title: 12 }, { title: 'a'.repeat(201) }, { title: 'two\nlines' }, { archived: 'true' }, { status: 'running' }, { title: 'valid', archived: null }]) {
+        const response = await fetch(url, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
+        expect(response.status, JSON.stringify(patch)).toBe(400)
+        expect(await durableEvidence(created.store.sessionDir(id))).toEqual(before)
+      }
+      const missing = await fetch(url.replace(id, 'ses_00000000000000000000'), {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ archived: true }),
+      })
+      expect(missing.status).toBe(404)
     })
   })
 })

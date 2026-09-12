@@ -179,6 +179,9 @@ export interface SessionEvent<T = Record<string, unknown>> {
 export interface SessionSummary {
   id: string
   title: string
+  archivedAt?: string
+  /** Monotonic revision for user edits, independent of conversation activity. */
+  metadataVersion?: number
   createdAt: string
   updatedAt: string
   status: RunStatus
@@ -196,6 +199,11 @@ export interface SessionSummary {
   feedbackType?: AgentFeedbackType
   /** Public Arena experiment arm; treatment-2 suppresses the thank-you toast. */
   customFeedbackArm?: AgentCustomFeedbackArm
+}
+
+export interface SessionMetadataPatch {
+  title?: string
+  archived?: boolean
 }
 
 export type CodingSessionStatus = 'active' | 'pr_open' | 'closed' | 'pr_merged' | 'error'

@@ -14,6 +14,7 @@ import type {
   ProcessRecord,
   RunStatus,
   SessionEvent,
+  SessionMetadataPatch,
   SessionSummary,
   ToolCallRecord,
   UsageTotals,
@@ -59,6 +60,7 @@ export interface StoredSession {
   activeArtifactReviewRepair?: import('./visual-artifact-review.js').ArtifactReviewRepair
   activeArtifactContentReviewReceipt?: import('./visual-artifact-review.js').ArtifactContentReviewReceipt
   summary: SessionSummary
+  titleCustomized?: boolean
   messages: ModelMessage[]
   /** Durable boundary between materializing a new Session and publishing session.created. */
   pendingCreation?: DurablePendingSessionCreation
@@ -1828,6 +1830,25 @@ export class SessionStore {
     return sessions
       .filter((session): session is SessionSummary => Boolean(session))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  }
+
+  async updateMetadata(id: string, patch: SessionMetadataPatch): Promise<SessionSummary> {
+    if (patch.title !== undefined && (!patch.title.trim() || patch.title.trim().length > 200 || /[\r\n\u0000-\u001f\u007f]/u.test(patch.title))) {
+      throw new Error('Invalid title: use 1–200 characters on a single line')
+    }
+    return this.enqueue(id, async () => {
+      const state = await this.get(id)
+      if (patch.title !== undefined) {
+        state.summary.title = patch.title.trim()
+        state.titleCustomized = true
+      }
+      if (patch.archived === true) state.summary.archivedAt ??= new Date().toISOString()
+      if (patch.archived === false) delete state.summary.archivedAt
+      state.summary.metadataVersion = (state.summary.metadataVersion ?? 0) + 1
+      // Organizing history must not change its activity date or restart a run.
+      await this.writeState(id, state)
+      return this.redactForDisplay(id, state.summary)
+    })
   }
 
   async get(id: string): Promise<StoredSession> {

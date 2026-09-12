@@ -1,3 +1,4 @@
+import { ChevronDown } from 'lucide-react'
 import type { AgentModelOption } from '../shared/types'
 
 export function ModelSelector(props: {
@@ -24,7 +25,6 @@ export function ModelSelector(props: {
         {model.displayName || model.publicName}
       </option>)}
     </select>
-    {selected?.description && <span className="composer-model-note">{selected.description}</span>}
-    {props.unavailable && <span className="composer-model-note" role="status">模型列表不可用，请刷新重试</span>}
+    <ChevronDown size={12} aria-hidden="true" />
   </div>
 }

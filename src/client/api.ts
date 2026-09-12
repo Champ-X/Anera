@@ -8,6 +8,7 @@ import type {
   OfficeArtifactPreview,
   PointwiseFeedbackValue,
   SessionSnapshot,
+  SessionMetadataPatch,
   SessionSummary,
   TaskReviewDismissAction,
   TaskCompletionFeedbackValue,
@@ -111,6 +112,11 @@ export const api = {
   },
   async createSession(): Promise<SessionSummary> {
     return (await request<{ session: SessionSummary }>('/api/sessions', { method: 'POST', body: '{}' })).session
+  },
+  async updateSession(id: string, patch: SessionMetadataPatch): Promise<SessionSummary> {
+    return (await request<{ session: SessionSummary }>(`/api/sessions/${id}`, {
+      method: 'PATCH', body: JSON.stringify(patch),
+    })).session
   },
   async createAgentChat(
     content: string,

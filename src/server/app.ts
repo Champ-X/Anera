@@ -385,6 +385,27 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     response.status(201).json({ session: session.summary })
   })
 
+  app.patch('/api/sessions/:id', async (request, response) => {
+    const patch = request.body as { title?: unknown; archived?: unknown } | null
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)
+      || Object.keys(patch).some((key) => key !== 'title' && key !== 'archived')
+      || (patch.title === undefined && patch.archived === undefined)
+      || (patch.title !== undefined && typeof patch.title !== 'string')
+      || (patch.archived !== undefined && typeof patch.archived !== 'boolean')) {
+      throw statusError('Invalid session update: supply title or archived', 400)
+    }
+    try {
+      const session = await store.updateMetadata(request.params.id, {
+        ...(typeof patch.title === 'string' ? { title: patch.title } : {}),
+        ...(typeof patch.archived === 'boolean' ? { archived: patch.archived } : {}),
+      })
+      response.json({ session })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw statusError('Session not found', 404)
+      throw error
+    }
+  })
+
   app.post('/nextjs-api/stream/create-chat', async (request, response) => {
     const input = await parseArenaCreateChatTransport(request.body, { agentCasRoot, localUserId })
     const enabledConnectorSlugs = parseLocalConnectorHeader(request.get('x-anera-enabled-connectors'))

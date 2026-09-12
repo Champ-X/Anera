@@ -1,3 +1,4 @@
+import { RichText, InlineImage, imageHref, readImagePath } from './RichText'
 import { ModelSelector } from './ModelSelector'
 import {
   Archive,
@@ -68,6 +69,7 @@ import type {
   RunStatus,
   SessionEvent,
   SessionSnapshot,
+  SessionMetadataPatch,
   SessionSummary,
   SessionTokenLimitState,
   TaskCompletionFeedbackValue,
@@ -77,6 +79,8 @@ import type {
 } from '../shared/types'
 import { AGENT_LEADERBOARD_PATH, AgentLeaderboard, isAgentLeaderboardPath } from './AgentLeaderboard'
 import { api } from './api'
+import { HistorySessionRow } from './HistorySessionRow'
+import { mergeSessionMetadata, updateHistorySession } from './history-sessions'
 import { canOpenWebsitePreview, shouldCloseWebsitePreview } from './preview-lifecycle'
 import {
   SHOWCASE_NAVIGATION_EVENT,
@@ -650,6 +654,8 @@ export function App() {
     typeof window !== 'undefined' && isAgentLeaderboardPath(window.location.pathname) ? 'leaderboard' : 'agent'
   ))
   const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const [archivedNotice, setArchivedNotice] = useState<SessionSummary>()
+  const [restoringSessionId, setRestoringSessionId] = useState<string>()
   const [activeId, setActiveId] = useState<string>()
   const [snapshot, setSnapshot] = useState<SessionSnapshot>()
   const [loading, setLoading] = useState(true)
@@ -860,7 +866,7 @@ export function App() {
 
   const refreshSessions = useCallback(async () => {
     const next = await api.listSessions()
-    setSessions(next)
+    setSessions((current) => next.map((session) => mergeSessionMetadata(current.find((item) => item.id === session.id), session)))
     return next
   }, [])
 
@@ -868,12 +874,14 @@ export function App() {
     const next = await api.snapshot(id)
     if (activeIdRef.current === id) {
       resetWorkspaceInventory(next)
-      setSnapshot((current) => reconcileSnapshot(allowRewind ? undefined : current, next))
+      setSnapshot((current) => reconcileSnapshot(allowRewind ? undefined : current, {
+        ...next, session: mergeSessionMetadata(current?.session.id === id ? current.session : undefined, next.session),
+      }))
       if (shouldAutoOpenWorkspace(id, next, manuallyClosedWorkspaceRef.current, previewSessionRef.current)) {
         setWorkspaceVisibility(true)
       }
     }
-    setSessions((current) => [next.session, ...current.filter((session) => session.id !== next.session.id)])
+    setSessions((current) => updateHistorySession(current, next.session))
     return next
   }, [resetWorkspaceInventory, setWorkspaceVisibility])
 
@@ -1010,6 +1018,28 @@ export function App() {
     }
     if (STATIC_SHOWCASE) window.dispatchEvent(new Event(SHOWCASE_NAVIGATION_EVENT))
   }, [activateDraft])
+
+  const updateSessionMetadata = useCallback(async (id: string, patch: SessionMetadataPatch) => {
+    const updated = await api.updateSession(id, patch)
+    setSessions((current) => updateHistorySession(current, updated))
+    setSnapshot((current) => current?.session.id === id ? {
+      ...current,
+      session: { ...current.session, title: updated.title, archivedAt: updated.archivedAt, metadataVersion: updated.metadataVersion },
+    } : current)
+    if (patch.archived === true) {
+      setArchivedNotice(updated)
+      if (activeIdRef.current === id) navigateToDraft(false, false, true)
+    } else if (patch.archived === false) {
+      setArchivedNotice((current) => current?.id === id ? undefined : current)
+    }
+  }, [navigateToDraft])
+
+  const restoreSession = useCallback(async (id: string) => {
+    setRestoringSessionId(id)
+    try { await updateSessionMetadata(id, { archived: false }) }
+    catch (reason) { setError(messageOf(reason)) }
+    finally { setRestoringSessionId(undefined) }
+  }, [updateSessionMetadata])
 
   const navigateToLeaderboard = useCallback((replaceHistory = false) => {
     activeIdRef.current = undefined
@@ -1693,18 +1723,18 @@ export function App() {
           <span className="brand-name">Anera</span>
           <button className="mobile-close" aria-label="Close conversations" onClick={() => setLeftOpen(false)}><X size={17} /></button>
         </div>
-        <button
-          className="new-chat"
-          disabled={STATIC_SHOWCASE}
-          title={STATIC_SHOWCASE ? 'New tasks are disabled in this static replay' : undefined}
-          onClick={() => navigateToDraft(false, true, true)}
-        ><Plus size={16} /> New Chat</button>
         <nav className="rail-links" aria-label="Primary">
+          <button
+            className="new-chat"
+            disabled={STATIC_SHOWCASE}
+            title={STATIC_SHOWCASE ? 'New tasks are disabled in this static replay' : undefined}
+            onClick={() => navigateToDraft(false, true, true)}
+          ><Plus size={16} /> New Chat</button>
           <button
             className={appRoute === 'leaderboard' ? 'active' : ''}
             aria-current={appRoute === 'leaderboard' ? 'page' : undefined}
             onClick={() => navigateToLeaderboard()}
-          ><Sparkles size={15} /> Leaderboard</button>
+          ><Sparkles size={16} /> Leaderboard</button>
           <button
             className={searchOpen ? 'active' : ''}
             aria-current={searchOpen ? 'page' : undefined}
@@ -1712,29 +1742,34 @@ export function App() {
             aria-expanded={searchOpen}
             title="Search conversations (⌘K)"
             onClick={() => navigateToSearch()}
-          ><Search size={15} /> Search</button>
+          ><Search size={16} /> Search</button>
         </nav>
         <div className="history-list">
           {groupHistorySessions(sessions).map((group) => (
             <section className="history-group" key={group.label}>
               <div className="history-label">{group.label}</div>
               {group.sessions.map((session) => (
-                <button
+                <HistorySessionRow
                   key={session.id}
-                  className={appRoute === 'agent' && session.id === activeId ? 'active' : ''}
-                  onClick={() => navigateToSession(session.id)}
-                >
-                  <Sparkles className="history-agent-icon" size={11} aria-hidden="true" />
-                  <span>{session.title}</span>
-                  {session.productMode === 'coding' && <Code2 className="history-code" size={11} aria-label="Coding session" />}
-                  {session.status === 'running' && <span className="live-dot" />}
-                </button>
+                  session={session}
+                  active={appRoute === 'agent' && session.id === activeId}
+                  readOnly={STATIC_SHOWCASE}
+                  onSelect={navigateToSession}
+                  onUpdate={updateSessionMetadata}
+                />
               ))}
             </section>
           ))}
         </div>
         <div className="rail-foot"><span className="avatar">A</span><span>Local workspace</span><ChevronRight size={14} /></div>
       </aside>
+
+      {archivedNotice && <div className="history-notice" role="status">
+        <Archive size={15} aria-hidden="true" />
+        <span>Conversation archived</span>
+        <button disabled={Boolean(restoringSessionId)} onClick={() => void restoreSession(archivedNotice.id)}>Undo</button>
+        <button aria-label="Dismiss archive notice" onClick={() => setArchivedNotice(undefined)}><X size={14} /></button>
+      </div>}
 
       {searchOpen && (
         <ConversationSearch
@@ -1752,6 +1787,10 @@ export function App() {
         <header className="stage-header">
           <button className="mode-picker"><Sparkles size={14} /> Agent Mode <ChevronDown size={14} /></button>
           <div className="stage-actions">
+            {snapshot?.session.archivedAt && <span className="archived-session-controls">
+              <Archive size={13} />Archived
+              {!STATIC_SHOWCASE && <button disabled={Boolean(restoringSessionId)} onClick={() => void restoreSession(snapshot.session.id)}>Restore</button>}
+            </span>}
             {snapshot?.repository && <span className="header-repository"><Github size={12} />{snapshot.repository.fullName}<GitBranch size={11} />{snapshot.repository.baseBranch}</span>}
             <span className="model-label">{snapshot?.session.model || 'DeepSeek'}</span>
             {!workspaceVisible && <button
@@ -2418,6 +2457,7 @@ function ConversationSearch(props: {
               <span className="conversation-search-result-meta">
                 {session.productMode === 'coding' && <Code2 size={12} aria-label="Coding session" />}
                 {session.status === 'running' && <i>Running</i>}
+                {session.archivedAt && <i className="archived-label">Archived</i>}
                 <time dateTime={session.updatedAt}>{formatConversationSearchDate(session.updatedAt)}</time>
               </span>
             </button>
@@ -2447,6 +2487,7 @@ function groupHistorySessions(sessions: SessionSummary[]): Array<{ label: string
   const yesterday = today.getTime() - 24 * 60 * 60 * 1_000
   const groups: Array<{ label: string; sessions: SessionSummary[] }> = []
   for (const session of sessions) {
+    if (session.archivedAt) continue
     const time = Date.parse(session.updatedAt)
     const label = time >= today.getTime() ? 'Today' : time >= yesterday ? 'Yesterday' : 'Earlier'
     let group = groups.find((candidate) => candidate.label === label)
@@ -2965,6 +3006,8 @@ export function Composer(props: {
               props.onConnections({ left: bounds.left, top: bounds.top })
             }}
           >{props.connectionsEnabled ? <Github size={14} /> : <Plug size={14} />}<ChevronDown className={props.connectionsOpen ? 'open' : ''} size={11} /></button>
+          <ModelSelector models={props.models} value={modelSelection} unavailable={props.modelListUnavailable}
+            disabled={Boolean(editorLocked || props.submitDisabled)} onChange={setModelSelection} />
           <span className="composer-spacer" />
           {props.resumable && !props.running && <button className="resume-button" disabled={props.readOnly || props.submitDisabled || modelPending} onClick={() => void props.onResume(modelSelection)}><RotateCcw size={13} /> Continue</button>}
           <CreditGaugeControl balance={props.creditBalance} isFreeSession={props.isFreeSession} open={creditOpen} onOpenChange={setCreditOpen} />
@@ -2977,8 +3020,6 @@ export function Composer(props: {
                 aria-label="Send message"
               ><ArrowUp size={17} /></button>}
         </div>
-        <ModelSelector models={props.models} value={modelSelection} unavailable={props.modelListUnavailable}
-          disabled={Boolean(editorLocked || props.submitDisabled)} onChange={setModelSelection} />
       </div>
       {props.repositoryControl}
     </div>
@@ -3176,12 +3217,12 @@ function Timeline({ item, sessionId, onPreview, onApproval, onHitl, onGiveFeedba
   if (item.kind === 'activity') return <AssistantActivityRow item={item} />
   if (item.kind === 'thought') return <ThoughtRow item={item} />
   if (item.kind === 'progress') return <div className="assistant-progress markdown" aria-busy={item.streaming}>
-    <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
+    <RichText sessionId={sessionId} resolveLink={markdownHref}>{item.content}</RichText>
   </div>
   if (item.kind === 'plan') return <PlanCard item={item} />
-  if (item.kind === 'exploration') return <ExplorationGroup item={item} />
-  if (item.kind === 'tool-group') return <ArenaToolGroup item={item} />
-  if (item.kind === 'tool') return <ToolRow item={item} />
+  if (item.kind === 'exploration') return <><ExplorationGroup item={item} /><ToolImages tools={item.tools} sessionId={sessionId} /></>
+  if (item.kind === 'tool-group') return <><ArenaToolGroup item={item} /><ToolImages tools={item.tools} sessionId={sessionId} /></>
+  if (item.kind === 'tool') return <><ToolRow item={item} /><ToolImages tools={[item]} sessionId={sessionId} /></>
   if (item.kind === 'tool-draft') return <StreamingToolCallRow item={item} />
   if (item.kind === 'artifact') return <ArtifactCard artifact={item.artifact} onPreview={() => onPreview(item.artifact)} />
   if (item.kind === 'approval') return <ApprovalCard item={item} onDecision={onApproval} />
@@ -3190,18 +3231,16 @@ function Timeline({ item, sessionId, onPreview, onApproval, onHitl, onGiveFeedba
   return (
     <section className="final-answer" data-assistant-response-id={item.messageEventId}>
       {item.streaming && <div className="final-streaming" aria-label="Final answer streaming"><LoaderCircle className="spin" size={13} /></div>}
-      <div className="markdown"><ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ children, href, title }) => {
-            const target = markdownHref(sessionId, href)
-            return <a href={target} title={title} target={target.startsWith('#') ? undefined : '_blank'} rel={target.startsWith('#') ? undefined : 'noreferrer'}>{children}</a>
-          },
-        }}
-      >{item.content}</ReactMarkdown></div>
+      <div className="markdown"><RichText sessionId={sessionId} resolveLink={markdownHref}>{item.content}</RichText></div>
       {!item.streaming && item.messageEventId && <FinalActions content={item.content} onGiveFeedback={onGiveFeedback} />}
     </section>
   )
+}
+
+function ToolImages({ tools, sessionId }: { tools: ToolTimelineItem[]; sessionId: string }) {
+  const paths = [...new Set(tools.map(readImagePath).filter((path): path is string => Boolean(path)))]
+  if (!paths.length) return null
+  return <div className="tool-inline-images markdown">{paths.map((path) => <InlineImage key={path} src={imageHref(sessionId, path)} alt={path.split('/').at(-1)} />)}</div>
 }
 
 function FinalActions({ content, onGiveFeedback }: { content: string; onGiveFeedback?: () => void }) {
@@ -3543,15 +3582,7 @@ function ArtifactTextPreview({ source, markdown = false, sessionId }: {
     return <div className="preview-source-state error"><Info size={17} /> {source.error}</div>
   }
   if (!markdown) return <pre className="artifact-text-preview"><code>{source.content}</code></pre>
-  return <div className="artifact-markdown-preview markdown"><ReactMarkdown
-    remarkPlugins={[remarkGfm]}
-    components={{
-      a: ({ children, href, title }) => {
-        const resolved = markdownHref(sessionId, href)
-        return <a href={resolved} title={title} target={resolved.startsWith('#') ? undefined : '_blank'} rel={resolved.startsWith('#') ? undefined : 'noreferrer'}>{children}</a>
-      },
-    }}
-  >{source.content}</ReactMarkdown></div>
+  return <div className="artifact-markdown-preview markdown"><RichText sessionId={sessionId} resolveLink={markdownHref}>{source.content}</RichText></div>
 }
 
 function ArtifactDownloadPreview({ target }: { target: PreviewTarget }) {
