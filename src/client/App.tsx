@@ -52,6 +52,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import aneraLogoUrl from '../../logo.png'
+import { Brand, BrandIcon } from './Brand'
 import { AGENT_UPLOAD_ACCEPT_ATTR, selectAgentUploads } from '../shared/agent-upload-policy'
 import type {
   AgentModelOption,
@@ -1719,8 +1720,7 @@ export function App() {
       <button className="mobile-rail-button" aria-label="Open conversations" onClick={() => setLeftOpen(true)}><Menu size={18} /></button>
       <aside className={`left-rail ${leftOpen ? 'is-open' : ''}`}>
         <div className="brand-row">
-          <img className="brand-logo" src={aneraLogoUrl} alt="" aria-hidden="true" />
-          <span className="brand-name">Anera</span>
+          <Brand />
           <button className="mobile-close" aria-label="Close conversations" onClick={() => setLeftOpen(false)}><X size={17} /></button>
         </div>
         <nav className="rail-links" aria-label="Primary">
@@ -1761,7 +1761,7 @@ export function App() {
             </section>
           ))}
         </div>
-        <div className="rail-foot"><span className="avatar">A</span><span>Local workspace</span><ChevronRight size={14} /></div>
+        <div className="rail-foot"><span className="workspace-logo"><BrandIcon /></span><span>Champ Space</span><ChevronRight size={14} /></div>
       </aside>
 
       {archivedNotice && <div className="history-notice" role="status">

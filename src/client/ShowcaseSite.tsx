@@ -9,7 +9,7 @@ import {
   ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
-import aneraLogoUrl from '../../logo.png'
+import { Brand } from './Brand'
 import { sessionPath } from './App'
 import { showcaseCatalog } from './showcase-catalog'
 import './showcase.css'
@@ -41,8 +41,7 @@ function setPageMetadata(title: string, description: string): void {
 
 function BrandLink() {
   return <a className="showcase-brand" href="/" aria-label="Anera project home">
-    <img src={aneraLogoUrl} alt="" aria-hidden="true" />
-    <span>Anera</span>
+    <Brand />
   </a>
 }
 

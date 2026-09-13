@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
+import { Brand } from './Brand'
 import { STATIC_SHOWCASE, normalizeShowcaseRoute, showcasePageForPath } from './showcase-mode'
 import './styles.css'
 
@@ -22,7 +23,7 @@ if (STATIC_SHOWCASE) normalizeShowcaseRoute()
 
 function ShowcaseLoading() {
   return <div role="status" aria-live="polite" style={{ minHeight: '100%', display: 'grid', placeItems: 'center', color: '#14212a', background: '#eef3f5', fontFamily: 'Avenir Next, PingFang SC, sans-serif' }}>
-    <div style={{ display: 'grid', gap: 10, textAlign: 'center' }}><strong style={{ fontFamily: 'Didot, Songti SC, serif', fontSize: 32, letterSpacing: '-0.04em' }}>Anera</strong><span style={{ color: '#62717a', fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase' }}>Loading evidence surface</span></div>
+    <div style={{ display: 'grid', justifyItems: 'center', gap: 10, textAlign: 'center' }}><Brand /><span style={{ color: '#62717a', fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase' }}>Loading evidence surface</span></div>
   </div>
 }
 

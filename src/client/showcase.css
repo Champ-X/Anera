@@ -39,9 +39,7 @@
   border-bottom: 1px solid var(--showcase-line);
 }
 
-.showcase-brand { display: inline-flex; align-items: center; gap: 10px; }
-.showcase-brand img { width: 28px; height: 28px; object-fit: contain; }
-.showcase-brand span { font: 600 25px/1 var(--showcase-display); letter-spacing: -.045em; }
+.showcase-brand { display: inline-flex; align-items: center; --brand-wordmark-width: 100px; }
 .showcase-nav nav { display: flex; align-items: center; gap: 26px; font-size: 12px; font-weight: 600; }
 .showcase-nav nav a { display: inline-flex; align-items: center; gap: 6px; padding: 8px 0; }
 .showcase-nav nav a:hover { color: var(--showcase-cobalt); }
@@ -126,7 +124,6 @@
 .cta-actions a { display: grid; place-items: center; min-width: 112px; height: 44px; border: 1px solid var(--showcase-ink); font-size: 12px; font-weight: 700; }
 .cta-actions a:first-child { background: var(--showcase-ink); color: white; }
 .showcase-footer { width: min(1440px, calc(100% - 64px)); min-height: 100px; display: flex; align-items: center; justify-content: space-between; margin: 0 auto; color: var(--showcase-muted); font-size: 10px; }
-.showcase-footer .showcase-brand span { color: var(--showcase-ink); }
 .showcase-footer > a { display: inline-flex; align-items: center; gap: 6px; color: var(--showcase-ink); font-weight: 700; }
 
 /* Report */

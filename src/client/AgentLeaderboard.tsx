@@ -8,7 +8,7 @@ import {
   Trophy,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import aneraLogoUrl from '../../logo.png'
+import { Brand } from './Brand'
 
 export const AGENT_LEADERBOARD_PATH = '/leaderboard/agent'
 
@@ -127,7 +127,7 @@ export function AgentLeaderboard({ onTryAgent }: { onTryAgent: () => void }) {
   return (
     <section className="agent-leaderboard-page" aria-labelledby="agent-leaderboard-title">
       <header className="leaderboard-product-header">
-        <div className="leaderboard-product-brand"><img src={aneraLogoUrl} alt="" aria-hidden="true" /> Anera</div>
+        <div className="leaderboard-product-brand"><Brand /></div>
         <nav aria-label="Anera products">
           {['Overview', 'Agent', 'Chat', 'Code', 'Image', 'Video'].map((product) => (
             <button key={product} className={product === 'Agent' ? 'active' : ''} aria-current={product === 'Agent' ? 'page' : undefined}>{product}</button>

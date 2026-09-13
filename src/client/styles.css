@@ -42,8 +42,6 @@ button { color: inherit; }
 /* Keep the rail chrome stable; only the history list should shrink and scroll. */
 .brand-row, .rail-links, .rail-foot { flex-shrink: 0; }
 .brand-row { height: 50px; display: flex; align-items: center; gap: 7px; padding: 0 7px 8px; color: #363431; }
-.brand-logo { width: 33px; height: 33px; flex: none; object-fit: contain; }
-.brand-name { font-family: Georgia, "Times New Roman", serif; font-size: 30px; line-height: 1; font-weight: 600; letter-spacing: -.045em; }
 .rail-links { display: grid; gap: 2px; padding-bottom: 14px; }
 .rail-links button { width: 100%; height: 36px; display: flex; align-items: center; gap: 9px; border: 0; padding: 0 6px; background: transparent; color: #45443f; font-size: 14px; font-weight: 450; border-radius: 6px; cursor: pointer; }
 .rail-links button > svg { flex: none; }
@@ -94,7 +92,7 @@ button { color: inherit; }
 .archived-session-controls button { color: var(--green); padding: 4px; font-size: 11px; }
 .conversation-search-result-meta .archived-label { background: var(--soft); color: var(--muted); }
 .rail-foot { height: 42px; display: flex; align-items: center; gap: 9px; margin-top: auto; padding: 6px 8px 0; border-top: 1px solid var(--line); color: #55534e; font-size: 12px; }
-.rail-foot .avatar { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 50%; background: #272723; color: white; font-size: 10px; }
+.rail-foot .workspace-logo { width: 24px; height: 24px; display: grid; place-items: center; flex: none; --brand-icon-width: 24px; }
 .rail-foot span:nth-child(2) { flex: 1; }
 .mobile-close, .mobile-rail-button { display: none; }
 
@@ -766,8 +764,7 @@ button { color: inherit; }
 .app-shell.leaderboard-route .main-stage { display: block; background: #fff; }
 .agent-leaderboard-page { width: 100%; height: 100%; min-width: 0; overflow: auto; background: #fff; color: #171715; scrollbar-width: thin; }
 .leaderboard-product-header { position: sticky; z-index: 20; top: 0; height: 58px; display: grid; grid-template-columns: 210px minmax(0, 1fr) 34px; align-items: center; gap: 18px; padding: 0 30px; border-bottom: 1px solid #e8e7e2; background: rgb(255 255 255 / 94%); backdrop-filter: blur(14px); }
-.leaderboard-product-brand { display: flex; align-items: center; gap: 7px; font: 600 18px/1 Georgia, "Times New Roman", serif; letter-spacing: -.025em; }
-.leaderboard-product-brand img { width: 20px; height: 20px; object-fit: contain; }
+.leaderboard-product-brand { display: flex; align-items: center; --brand-wordmark-width: 85px; }
 .leaderboard-product-header nav { height: 100%; display: flex; align-items: center; gap: 22px; }
 .leaderboard-product-header nav button, .leaderboard-header-menu { height: 100%; border: 0; padding: 0; background: transparent; color: #77746e; font-size: 12px; cursor: pointer; }
 .leaderboard-product-header nav button { position: relative; }
