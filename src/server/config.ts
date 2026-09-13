@@ -55,6 +55,14 @@ export function resolveAgentTokenLimit(value: string): number {
   return limit
 }
 
+/** Request admission is opt-in; zero preserves metering without a count stop. */
+export function resolveAgentRequestLimit(value: string): number {
+  if (!value.trim()) return 0
+  const limit = Number(value)
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new Error('ANERA_MAX_AGENT_MODEL_REQUESTS_PER_TURN must be a non-negative safe integer (0 disables the limit)')
+  return limit
+}
+
 export function resolveTavilyApiKey(read: (name: string) => string): string {
   return read('TAVILY_API_KEY') || read('TAVILY_API_KRY')
 }
@@ -231,10 +239,10 @@ export const config = {
   visionModel: env('DEEPSEEK_VISION_MODEL', 'deepseek-v4-flash-vision-exp'),
   maxToolCallsPerStep: positiveInt('ANERA_MAX_TOOL_CALLS_PER_STEP', 16),
   maxParallelToolCalls: positiveInt('ANERA_MAX_PARALLEL_TOOL_CALLS', 6),
-  // Per user/operator turn, recovered from durable settlements. The request
-  // guard remains bounded; cumulative token stopping is opt-in (0 = off).
+  // Per user/operator turn, recovered from durable settlements. Request and
+  // cumulative token stopping are both opt-in (0 = off).
   // Metering always includes Agent and compaction, including after restart.
-  maxAgentModelRequestsPerTurn: positiveInt('ANERA_MAX_AGENT_MODEL_REQUESTS_PER_TURN', 96),
+  maxAgentModelRequestsPerTurn: resolveAgentRequestLimit(env('ANERA_MAX_AGENT_MODEL_REQUESTS_PER_TURN')),
   maxAgentTotalTokensPerTurn: resolveAgentTokenLimit(env('ANERA_MAX_AGENT_TOTAL_TOKENS_PER_TURN')),
   // Visual runs legitimately span several source, render, and Vision passes.
   // Keep a harness escape hatch for genuinely orphaned work, but do not cut a

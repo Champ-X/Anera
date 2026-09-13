@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { resolveDeepSeekModel, resolveDeepSeekVisionPricing, resolveModelTemperature, resolveTavilyApiKey, resolveTestLoopbackDeepSeekProvider } from './config.js'
+import { resolveAgentRequestLimit, resolveDeepSeekModel, resolveDeepSeekVisionPricing, resolveModelTemperature, resolveTavilyApiKey, resolveTestLoopbackDeepSeekProvider } from './config.js'
 
 describe('provider configuration', () => {
+  it('disables request stopping by default and accepts explicit finite ceilings', () => {
+    for (const input of ['', ' ', '0']) expect(resolveAgentRequestLimit(input)).toBe(0)
+    expect(resolveAgentRequestLimit('96')).toBe(96)
+    expect(resolveAgentRequestLimit('128')).toBe(128)
+    for (const input of ['-1', '1.5', 'Infinity', 'NaN', '9007199254740992']) {
+      expect(() => resolveAgentRequestLimit(input)).toThrow('non-negative safe integer')
+    }
+  })
   it.each([undefined, '', '   ', '\t\n'])('defaults an unset or blank text model (%j) to DeepSeek Flash', (value) => {
     expect(resolveDeepSeekModel(value)).toBe('deepseek-flash')
   })

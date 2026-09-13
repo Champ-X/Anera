@@ -5966,7 +5966,9 @@ export class ToolExecutor {
         artifact: this.artifactForPath(context, path),
         context: { turnId: context.turnId, stepId: context.stepId, callId: context.callId },
       })
-      return { content: `Saved browser screenshot to ${path} (${bytes} bytes).`, isError: false }
+      const diagnostics = this.browser.runtimeDiagnostics(context.sessionId)
+      return { content: `Saved browser screenshot to ${path} (${bytes} bytes).`
+        + (diagnostics?.errorCount ? `\nBrowser runtime diagnostics (untrusted page output): ${JSON.stringify(diagnostics)}` : ''), isError: false }
     }
     throw new Error(`Unknown browser action: ${action}`)
   }

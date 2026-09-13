@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BrowserManager } from './browser-manager.js'
+import { browserRuntimeDecisionContext } from './browser-runtime-diagnostics.js'
 import { BLUE_PROFESSIONAL_TEMPLATE_HTML } from './fixtures/blue-professional-template.fixture.js'
 import {
   extractReferenceStyleSourceProfile,
@@ -1458,6 +1459,58 @@ describe('browser manager', () => {
       'f'.repeat(64),
       RENDER_CONTRACT.viewport,
     )).rejects.toThrow(/at least three identifiable slide roots/iu)
+  }, 15_000)
+
+  it('surfaces real Canvas exceptions in action evidence and retains them until document navigation', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    let html = `<canvas id="game"></canvas><button onclick="location.hash='details'">Details</button><script>
+      addEventListener('keydown', () => {
+        requestAnimationFrame(() => {
+          const g = document.querySelector('canvas').getContext('2d').createRadialGradient(0,0,0,1,1,1);
+          g.addColorStop(1, 'hsla(45,100,50,0)');
+        });
+      });
+    </script>`
+    const server = await listen(createServer((_request, response) => {
+      response.setHeader('content-type', 'text/html')
+      response.end(html)
+    }))
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`
+    const opened = await manager.open('runtime-errors', url)
+    expect(opened.runtimeDiagnostics).toMatchObject({ errorCount: 0 })
+    const played = await manager.press('runtime-errors', 'Space')
+    expect(played.runtimeDiagnostics).toMatchObject({ errorCount: 1,
+      issues: [expect.objectContaining({ text: expect.stringContaining('addColorStop') })] })
+    await manager.screenshot('runtime-errors')
+    expect(browserRuntimeDecisionContext(manager.runtimeDiagnostics('runtime-errors'))).toContain('hsla(45,100,50,0)')
+    const navigated = await manager.click('runtime-errors', { text: 'Details' })
+    expect(navigated.runtimeDiagnostics).toMatchObject({ errorCount: 1, pageEpoch: opened.pageEpoch })
+    html = html.replace('45,100,50,0', '45,100%,50%,0')
+    const fixed = await manager.open('runtime-errors', url)
+    expect(Number(fixed.pageEpoch)).toBeGreaterThan(Number(opened.pageEpoch))
+    expect((await manager.press('runtime-errors', 'Space')).runtimeDiagnostics).toMatchObject({ errorCount: 0, issues: [] })
+    expect(browserRuntimeDecisionContext(manager.runtimeDiagnostics('runtime-errors'))).toBe('')
+    expect(manager.logs('runtime-errors').some((entry) => entry.text.includes('addColorStop'))).toBe(true)
+  }, 15_000)
+
+  it('bounds runtime diagnostics and prevents normal console chatter from evicting errors', async () => {
+    const manager = new BrowserManager()
+    managers.push(manager)
+    await manager.open('runtime-flood', `data:text/html,${encodeURIComponent(`<script>
+      console.error('original failure');
+      for (let i=0; i<250; i++) console.log('noise');
+    </script>`)}`)
+    expect(manager.runtimeDiagnostics('runtime-flood')).toMatchObject({ errorCount: 1,
+      issues: [expect.objectContaining({ text: 'original failure' })] })
+    await manager.open('runtime-flood', `data:text/html,${encodeURIComponent(`<script>
+      for (let i=0; i<100; i++) console.error(i + 'x'.repeat(10000));
+    </script>`)}`)
+    const diagnostics = manager.runtimeDiagnostics('runtime-flood')!
+    expect(diagnostics.errorCount).toBe(100)
+    expect(diagnostics.issues).toHaveLength(8)
+    expect(diagnostics.omittedErrors).toBe(92)
+    expect(JSON.stringify(diagnostics).length).toBeLessThan(15000)
   }, 15_000)
 
   it('opens, snapshots stable refs, operates form controls, scrolls, resizes, and reads console output', async () => {

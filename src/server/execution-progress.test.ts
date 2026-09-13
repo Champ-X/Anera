@@ -12,6 +12,39 @@ function event(name: string, args: Record<string, unknown>, result: unknown = { 
 const read = (path: string, result?: unknown) => event('read_file', { path }, result)
 
 describe('task-neutral execution observation', () => {
+  it('retains repeated executed failures across edits and restart without claiming identical output', () => {
+    const fail = (stdout: string) => event('bash', { command: 'node tests/play.js', cwd: '.' },
+      { status: 'completed', exit_code: 1, stdout }, { isError: true })
+    const events = [fail('2 failures'), event('edit_file', { path: 'tests/play.js' }),
+      read('game.html'), fail('1 failure'), event('edit_file', { path: 'game.html' })]
+    const monitor = new ExecutionProgressMonitor(events, 'turn')
+    const third = fail('different failure')
+    const cycle = monitor.observe([third])!
+    expect(cycle).toMatchObject({ kind: 'repeated_execution_failure', occurrences: 3 })
+    expect(observationCycleRecovery(cycle)).toContain('does not imply identical output or absence of progress')
+    monitor.acknowledge(cycle.fingerprint)
+    expect(monitor.observe([fail('still failed')])).toBeUndefined()
+    const receipt: SessionEvent = { ...third, seq: third.seq + 1, type: 'model.tool_call.repair',
+      data: { reason: 'repeated_execution_failure', ...cycle } }
+    const restored = new ExecutionProgressMonitor([...events, third, receipt], 'turn')
+    expect(restored.observe([fail('still failed after restart')])).toBeUndefined()
+    monitor.observe([event('bash', { command: 'node tests/play.js', cwd: '.' }, { status: 'completed', exit_code: 0 })])
+    expect(monitor.observe([fail('new failure')])).toBeUndefined()
+    expect(monitor.observe([fail('new failure')])).toBeUndefined()
+    expect(monitor.observe([fail('new failure')])).toMatchObject({ occurrences: 3 })
+  })
+
+  it('does not count unknown, blocked, cancelled or pending command outcomes as repeated executions', () => {
+    const monitor = new ExecutionProgressMonitor()
+    for (let i = 0; i < 6; i += 1) {
+      for (const result of [{ status: 'running', exit_code: 1 }, { status: 'shell_error', exit_code: null }]) {
+        expect(monitor.observe([event('bash', { command: 'node tests/play.js' }, result)])).toBeUndefined()
+      }
+      for (const data of [{ notExecuted: true }, { cancelled: true }]) {
+        expect(monitor.observe([event('bash', { command: 'node tests/play.js' }, { status: 'completed', exit_code: 1 }, data)])).toBeUndefined()
+      }
+    }
+  })
   it.each([2, 3, 4])('detects a %i-step cycle from terminal evidence, independently of provider IDs', (period) => {
     const monitor = new ExecutionProgressMonitor()
     for (let i = 0; i < period * 3 - 1; i += 1) expect(monitor.observe([read(String(i % period))])).toBeUndefined()

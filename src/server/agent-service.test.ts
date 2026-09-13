@@ -11752,7 +11752,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
     })
 
     it.each([
-      ['maxAgentModelRequestsPerTurn', 0],
+      ['maxAgentModelRequestsPerTurn', -1],
       ['maxAgentModelRequestsPerTurn', 1.5],
       ['maxAgentTotalTokensPerTurn', -1],
       ['maxAgentTotalTokensPerTurn', Number.POSITIVE_INFINITY],
@@ -11760,6 +11760,48 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       const store = new SessionStore(resolve(tmpdir(), 'anera-agent-budget-option-validation'), 'test-model')
       expect(() => new AgentService(store, { [name]: value })).toThrow(`${name} must be a positive integer`)
     })
+
+    it('continues beyond 96 requests with stopping disabled while durably metering every dispatch', async () => {
+      const root = await mkdtemp(resolve(tmpdir(), 'anera-unlimited-request-turn-'))
+      const store = new SessionStore(root, 'test-model')
+      await store.initialize()
+      const session = await store.create()
+      await writeFile(resolve(store.workspaceDir(session.summary.id), 'dataset.txt'),
+        Array.from({ length: 110 }, (_, index) => `record ${index + 1}`).join('\n'))
+      let calls = 0
+      const stream = vi.fn(async (options: { beforeRequest: () => Promise<void>; maxModelRequests?: number; onContent: (text: string) => void }) => {
+        expect(options.maxModelRequests).toBeUndefined()
+        await options.beforeRequest()
+        calls += 1
+        const done = calls === 99
+        if (done) options.onContent('Finished reading the requested records.')
+        return { content: done ? 'Finished reading the requested records.' : '', reasoningContent: '',
+          toolCalls: done ? [] : [{ id: `call_row_${calls}`, type: 'function' as const,
+            function: { name: 'read_file', arguments: JSON.stringify({ path: 'dataset.txt', offset: calls, limit: 1 }) } }],
+          finishReason: done ? 'stop' : 'tool_calls',
+          usage: { promptTokens: 9, completionTokens: 3, totalTokens: 12, cachedPromptTokens: 0 },
+          modelCallCount: 1, modelRequestCount: 1 }
+      })
+      const agent = new AgentService(store, { client: { stream } as never,
+        maxAgentModelRequestsPerTurn: 0, maxAgentTotalTokensPerTurn: 0, runTimeoutMs: 30_000 })
+      try {
+        const { turnId } = await agent.submit(session.summary.id, { content: 'Read the first 98 numbered records from dataset.txt and report when done.' })
+        await vi.waitFor(async () => {
+          expect((await store.get(session.summary.id)).summary.status).toBe('completed')
+        }, { timeout: 25_000, interval: 25 })
+        const restored = new SessionStore(root, 'test-model')
+        await restored.initialize()
+        const state = await restored.get(session.summary.id)
+        expect(calls).toBe(99)
+        expect(state.agentModelRequestReservations?.[turnId].reservedRequests).toBe(99)
+        expect(durableAgentTurnModelUsage(state.usageSettlements, turnId, state.agentModelRequestReservations))
+          .toEqual({ modelRequests: 99, totalTokens: 1188 })
+        expect((await restored.events(session.summary.id)).filter((event) => event.type === 'error')).toEqual([])
+      } finally {
+        await agent.shutdown()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 30_000)
 
     it('enforces the durable request budget after restart and gives an explicit resume a new turn budget', async () => {
       const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-request-budget-restart-'))

@@ -4,6 +4,7 @@ import type { Browser, BrowserContext, ConsoleMessage, Page } from 'playwright-c
 import { chromium } from 'playwright-core'
 import { findBrowserExecutable } from './browser-executable.js'
 import { config } from './config.js'
+import type { BrowserRuntimeDiagnostics } from './browser-runtime-diagnostics.js'
 import { REFERENCE_FONT_MAX_FILES, REFERENCE_RENDER_FONT_CSS_MAX_BYTES } from './reference-fonts.js'
 import { assertReferenceTemplateDependency, REFERENCE_TEMPLATE_MAX_DEPENDENCIES, type ReferenceTemplateDependency, type ReferenceTemplateTextParent } from './reference-template.js'
 import { normalizeReferenceLanguageVariant, REFERENCE_LANGUAGE_ROLES, type ReferenceLanguageVariant } from './reference-language.js'
@@ -34,6 +35,9 @@ interface BrowserSession {
   logs: BrowserLog[]
   allowedOrigin: string
   pageEpoch: number
+  runtimeErrors: BrowserLog[]
+  runtimeErrorCount: number
+  pendingDocumentNavigation: boolean
 }
 
 interface BrowserLog {
@@ -932,10 +936,10 @@ export class BrowserManager {
     if (current?.allowedOrigin && current.allowedOrigin !== allowedOrigin) await this.close(sessionId)
     return await this.runAbortable(sessionId, signal, async (session) => {
       session.allowedOrigin = allowedOrigin
+      session.pendingDocumentNavigation = true
       await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 })
       await session.page.waitForTimeout(150)
       this.lastOpenedUrls.set(sessionId, url)
-      this.establishPageEpoch(session)
       return await this.describe(session)
     }, { rehydrate: false })
   }
@@ -1215,6 +1219,28 @@ export class BrowserManager {
     return [...(this.sessions.get(sessionId)?.logs ?? [])]
   }
 
+  runtimeDiagnostics(sessionId: string): BrowserRuntimeDiagnostics | undefined {
+    const session = this.sessions.get(sessionId)
+    return session?.pageEpoch ? this.describeRuntime(session) : undefined
+  }
+
+  private describeRuntime(session: BrowserSession): BrowserRuntimeDiagnostics {
+    const grouped = new Map<string, BrowserRuntimeDiagnostics['issues'][number]>()
+    // Keep errors separately from console chatter so ordinary logs cannot
+    // evict the exception that stopped the app. Bound both bytes and entries.
+    for (const entry of session.runtimeErrors) {
+      const key = `${entry.level}:${entry.text}`
+      const previous = grouped.get(key)
+      grouped.delete(key)
+      grouped.set(key, { ...entry, occurrences: (previous?.occurrences ?? 0) + 1,
+        textTruncated: entry.text.length > 1000, text: entry.text.slice(0, 1000) })
+    }
+    const issues = [...grouped.values()].slice(-8)
+    return { pageEpoch: session.pageEpoch, url: session.page.url(),
+      errorCount: session.runtimeErrorCount,
+      omittedErrors: session.runtimeErrorCount - issues.reduce((count, issue) => count + issue.occurrences, 0), issues }
+  }
+
   diagnostics(): { browserInstances: number; sessionContexts: number; pendingSessionContexts: number } {
     return {
       browserInstances: this.browser?.isConnected() ? 1 : 0,
@@ -1295,17 +1321,34 @@ export class BrowserManager {
     })
     const page = await context.newPage()
     const logs: BrowserLog[] = []
-    const session: BrowserSession = { browser, context, page, logs, allowedOrigin: '', pageEpoch: 0 }
+    const session: BrowserSession = { browser, context, page, logs, allowedOrigin: '', pageEpoch: 0,
+      runtimeErrors: [], runtimeErrorCount: 0, pendingDocumentNavigation: false }
     const appendLog = (entry: BrowserLog) => {
       logs.push(entry)
       if (logs.length > 200) logs.splice(0, logs.length - 200)
+      if (['error', 'pageerror', 'requestfailed', 'networkblocked'].includes(entry.level)) {
+        session.runtimeErrorCount += 1
+        session.runtimeErrors.push({ ...entry, text: entry.text.slice(0, 4000) })
+        if (session.runtimeErrors.length > 50) session.runtimeErrors.shift()
+      }
     }
+    page.on('request', (request) => {
+      if (request.isNavigationRequest() && request.frame() === page.mainFrame()) session.pendingDocumentNavigation = true
+    })
+    page.on('framenavigated', (frame) => {
+      if (frame !== page.mainFrame() || !session.pendingDocumentNavigation) return
+      session.pendingDocumentNavigation = false
+      session.runtimeErrors = []
+      session.runtimeErrorCount = 0
+      this.establishPageEpoch(session)
+    })
     const capture = (message: ConsoleMessage) => {
       appendLog({ level: message.type(), text: message.text(), at: new Date().toISOString() })
     }
     page.on('console', capture)
     page.on('pageerror', (error) => capture({ type: () => 'error', text: () => error.message } as ConsoleMessage))
     page.on('requestfailed', (request) => {
+      if (request.isNavigationRequest() && request.frame() === page.mainFrame()) session.pendingDocumentNavigation = false
       appendLog({ level: 'requestfailed', text: `${request.method()} ${request.url()}: ${request.failure()?.errorText || 'failed'}`, at: new Date().toISOString() })
     })
     await context.route('**/*', async (route) => {
@@ -1396,9 +1439,9 @@ export class BrowserManager {
     const url = this.lastOpenedUrls.get(sessionId)
     if (!url) return
     session.allowedOrigin = previewOrigin(url)
+    session.pendingDocumentNavigation = true
     await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 })
     await session.page.waitForTimeout(150)
-    this.establishPageEpoch(session)
     // Reassign deterministic refs before a resumed turn tries to reuse the
     // latest snapshot's eN target after its prior Context was released.
     await this.describe(session)
@@ -1445,6 +1488,7 @@ export class BrowserManager {
       stateDigest,
       text: visibleText.slice(0, 20_000),
       interactive,
+      runtimeDiagnostics: this.describeRuntime(session),
     }
   }
 }

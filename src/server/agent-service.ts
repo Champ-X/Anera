@@ -12,6 +12,7 @@ import {
   type ToolCallRecord,
 } from '../shared/types.js'
 import { BrowserManager } from './browser-manager.js'
+import { browserRuntimeDecisionContext } from './browser-runtime-diagnostics.js'
 import { EXECUTION_EVIDENCE_POLICY } from './execution-policy.js'
 import { attachmentCoverageAssessment, attachmentEvidenceStatus } from './file-evidence.js'
 import { activeTaskEvidenceEvents, verificationDecisionContext } from './verification-context.js'
@@ -443,6 +444,7 @@ export function systemPromptForTools(
     instructions.push(...documentAuthoringPolicy(options.documentFormats ?? []))
   }
   if (names.has('browser')) {
+    instructions.push('- Diagnose browser behavior in the actual runtime first: action snapshots include runtimeDiagnostics, and asynchronous runtime errors are also supplied at the next decision. Inspect these before inventing timing explanations or a simulated DOM/Canvas harness. Custom checks should cover a concrete missing requirement; distinguish failures in the checker from failures in the deliverable. After a fix, repeat only invalidated checks, and finish once the requested behavior and delivery requirements are verified.')
     instructions.push(options.includeHarnessConvergence
       ? '- Use browser open/snapshot and stable element refs with click/fill/select/check/press, plus scroll/viewport/console as needed, to verify requested states and interactions. Pass width and height to open when the acceptance viewport is known. Respect the requested layout and scrolling behavior; a fixed viewport must not silently become a rule forbidding scrolling on unrelated pages. Verify dependent interactions in the state produced by earlier actions, not only isolated happy paths. Every action result already includes a fresh snapshot. Use snapshots for exact rendered text and control state; capture and inspect screenshots for unresolved visual requirements at the relevant viewport/state. Reuse evidence only while that viewport, state and artifact remain applicable. Do not impose a one-screenshot ceiling across different required states, and do not repeat equivalent captures without a missing check or relevant change. Browser screenshots capture the current viewport, and screenshot_path is always a workspace-relative path; never pass /home/user, ~, or another absolute path. Source reads, console inspection and restoring a prior state should answer a concrete diagnostic or acceptance question, not be a ritual after every successful action.'
       : '- Use browser open/snapshot and stable element refs with click/fill/select/check/press, plus scroll/viewport/console as needed, to test the published Website and requested interactions. Save a screenshot when visual evidence is useful; snapshots already verify deterministic text and controls.')
@@ -1165,7 +1167,7 @@ export interface AgentServiceOptions {
   toolTimeoutMs?: number
   maxToolCallsPerStep?: number
   maxParallelToolCalls?: number
-  /** Physical Agent + context-compaction provider requests admitted for one turn. */
+  /** Optional physical Agent + compaction request ceiling; 0 disables stopping. */
   maxAgentModelRequestsPerTurn?: number
   /** Provider-reported Agent + context-compaction tokens admitted for one turn. */
   maxAgentTotalTokensPerTurn?: number
@@ -1454,8 +1456,8 @@ export class AgentService {
     if (!Number.isInteger(this.maxParallelToolCalls) || this.maxParallelToolCalls <= 0) {
       throw new Error('maxParallelToolCalls must be a positive integer')
     }
-    if (!Number.isInteger(this.maxAgentModelRequestsPerTurn) || this.maxAgentModelRequestsPerTurn <= 0) {
-      throw new Error('maxAgentModelRequestsPerTurn must be a positive integer')
+    if (!Number.isSafeInteger(this.maxAgentModelRequestsPerTurn) || this.maxAgentModelRequestsPerTurn < 0) {
+      throw new Error('maxAgentModelRequestsPerTurn must be a positive integer or 0 to disable the limit')
     }
     if (!Number.isSafeInteger(this.maxAgentTotalTokensPerTurn) || this.maxAgentTotalTokensPerTurn < 0) {
       throw new Error('maxAgentTotalTokensPerTurn must be a positive integer or 0 to disable the limit')
@@ -3069,6 +3071,7 @@ export class AgentService {
           sourceReviewContext,
           deliveryContext,
           this.store.redactTextForDisplay(sessionId, verificationContext),
+          this.store.redactTextForDisplay(sessionId, browserRuntimeDecisionContext(this.browser.runtimeDiagnostics(sessionId))),
         ]
           .filter(Boolean)
           .join('\n\n')
@@ -4685,10 +4688,10 @@ export class AgentService {
         const observationCycle = executionProgress.observe([...terminalToolEvents.values()])
         if (observationCycle && !['recover_phase', 'fail'].includes(visualNoProgressTransition?.action ?? '')) {
           await this.store.update(sessionId, (next) => {
-            next.messages.push({ role: 'user', content: `${MODEL_OUTPUT_RECOVERY_PREFIX} ${observationCycleRecovery(observationCycle)}` })
+            next.messages.push({ role: 'user', content: `${MODEL_OUTPUT_RECOVERY_PREFIX} ${this.store.redactTextForDisplay(sessionId, observationCycleRecovery(observationCycle))}` })
           })
           await this.store.append(sessionId, 'model.tool_call.repair', {
-            reason: 'unchanged_observation_cycle',
+            reason: observationCycle.kind ?? 'unchanged_observation_cycle',
             ...observationCycle,
             succeeded: false,
           }, { turnId, stepId })
@@ -5677,7 +5680,7 @@ export class AgentService {
       ),
       totalTokens: settled.totalTokens + pendingUsage.totalTokens,
     }
-    if (used.modelRequests >= this.maxAgentModelRequestsPerTurn) {
+    if (this.maxAgentModelRequestsPerTurn > 0 && used.modelRequests >= this.maxAgentModelRequestsPerTurn) {
       throw new AgentTurnBudgetExceededError(
         'model_request_budget',
         'model_requests',
@@ -5715,7 +5718,7 @@ export class AgentService {
         turnId,
       )
       const usedRequests = Math.max(settled.modelRequests, reservedRequests)
-      if (usedRequests >= this.maxAgentModelRequestsPerTurn) {
+      if (this.maxAgentModelRequestsPerTurn > 0 && usedRequests >= this.maxAgentModelRequestsPerTurn) {
         throw new AgentTurnBudgetExceededError(
           'model_request_budget',
           'model_requests',
@@ -5768,7 +5771,7 @@ export class AgentService {
         beforeRequest: async () => {
           await this.reserveAgentTurnModelRequest(sessionId, turnId, stepId, source)
         },
-        maxModelRequests: this.maxAgentModelRequestsPerTurn - used.modelRequests,
+        ...(this.maxAgentModelRequestsPerTurn > 0 ? { maxModelRequests: this.maxAgentModelRequestsPerTurn - used.modelRequests } : {}),
         ...(this.maxAgentTotalTokensPerTurn > 0 ? { maxTotalTokens: this.maxAgentTotalTokensPerTurn - used.totalTokens } : {}),
       })
       const active = this.active.get(sessionId)
