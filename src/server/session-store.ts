@@ -22,6 +22,7 @@ import type {
   WebsiteState,
 } from '../shared/types.js'
 import { isWorkspaceSnapshotExcludedPath } from '../shared/workspace-snapshot-policy.js'
+import { modelToolFrameIsClosed, parseSteeringInput, publicSteeringMessage, steeringError, steeringModelMessage, SteeringPendingError, type DurableSteeringMessage } from './steering.js'
 import { arenaToolErrorResult } from './arena-tool-result.js'
 import { createWorkspaceArtifact } from './artifact.js'
 import {
@@ -56,6 +57,8 @@ import {
 } from './reference-fonts.js'
 
 export interface StoredSession {
+  /** Durable receipt/apply journal; messages join model context only at a closed tool boundary. */
+  steering?: DurableSteeringMessage[]
   /** Private, source-bound review feedback; survives context compaction/resume. */
   activeArtifactReviewRepair?: import('./visual-artifact-review.js').ArtifactReviewRepair
   activeArtifactContentReviewReceipt?: import('./visual-artifact-review.js').ArtifactContentReviewReceipt
@@ -575,6 +578,7 @@ export interface DurableTerminalEvent {
     | 'workspace.persistence.updated'
     | 'workspace.persistence.completed'
     | 'assistant.final'
+    | 'task.verification.completed'
     | 'turn.completed'
     | 'run.status'
     | 'review.requested'
@@ -1906,6 +1910,130 @@ export class SessionStore {
     })
   }
 
+  async receiveSteering(id: string, input: unknown): Promise<import('../shared/steering.js').SteeringMessage> {
+    const request = parseSteeringInput(input)
+    return await this.enqueue(id, async () => {
+      const state = await this.get(id)
+      const prior = state.steering?.find((item) => item.clientMessageId === request.clientMessageId)
+      if (prior) {
+        if (prior.content !== request.content) throw steeringError('clientMessageId was already used for a different instruction', 'steering_id_conflict')
+        // An application batch commits all instructions before publishing its
+        // events. Retrying a later receipt must not publish its correction
+        // ahead of an earlier applied instruction whose publication failed.
+        for (const item of state.steering ?? []) {
+          await this.publishSteeringUnqueued(id, item)
+          if (item.id === prior.id) break
+        }
+        return this.redactForDisplay(id, publicSteeringMessage(prior))
+      }
+      if (state.pendingTerminal || !['queued', 'running', 'awaiting_approval', 'awaiting_user', 'cancelling'].includes(state.summary.status)) {
+        throw steeringError('This task is no longer accepting running instructions. Send a normal follow-up message.', 'steering_session_not_active')
+      }
+      this.registerSensitiveValues(id, findSensitiveValues(request.content))
+      const events = await this.readStoredEvents(id)
+      const receivedTurnId = state.pendingStart?.turnId ?? [...events].reverse().find((event) => event.type === 'turn.started' || event.type === 'run.resumed')?.turnId
+      const message: DurableSteeringMessage = {
+        ...request, id: createId('steer'), sequence: (state.steering?.at(-1)?.sequence ?? 0) + 1,
+        status: 'received', receivedAt: new Date().toISOString(), receivedTurnId,
+        receivedEventId: createId('evt'), appliedEventId: createId('evt'), timezone: state.timezone,
+      }
+      state.steering = [...(state.steering ?? []), message]
+      state.summary.updatedAt = message.receivedAt
+      // Commit before publishing. Retry and restart use the allocated event id.
+      await this.writeState(id, state)
+      await this.publishSteeringUnqueued(id, message)
+      return this.redactForDisplay(id, publicSteeringMessage(message))
+    })
+  }
+
+  async hasPendingSteering(id: string): Promise<boolean> {
+    return (await this.get(id)).steering?.some((item) => item.status === 'received') ?? false
+  }
+
+  /** A restore archives pending instructions without claiming they were executed. */
+  async archivePendingSteering(id: string, restoreId: string): Promise<void> {
+    await this.enqueue(id, async () => {
+      const state = await this.get(id)
+      const pending = (state.steering ?? []).filter((item) => item.status === 'received')
+      const archivedAt = new Date().toISOString()
+      for (const item of pending) {
+        item.status = 'archived'
+        item.archivedAt = archivedAt
+        item.archiveReason = 'workspace_restored'
+        item.restoreId = restoreId
+        item.archivedEventId = createId('evt')
+      }
+      if (pending.length) {
+        state.summary.updatedAt = archivedAt
+        await this.writeState(id, state)
+      }
+      // Reconcile the receipt journal before the restore boundary, including
+      // a previous apply/archive whose event publication was interrupted.
+      for (const item of state.steering ?? []) await this.publishSteeringUnqueued(id, item)
+    })
+  }
+
+  /** Linearize tool admission against steering receipt in the same session queue. */
+  async recordSteerableToolStart(id: string, call: ToolCallRecord, callIndex: number,
+    context: Pick<SessionEvent, 'turnId' | 'stepId' | 'callId'>): Promise<boolean> {
+    return await this.enqueue(id, async () => {
+      const pending = (await this.get(id)).steering?.some((item) => item.status === 'received') ?? false
+      await this.appendUnqueued(id, 'tool.started', { call, callIndex, ...(pending ? { notExecuted: true } : {}) }, context)
+      return !pending
+    })
+  }
+
+  async applyPendingSteering(id: string, turnId: string, stepId: string): Promise<import('../shared/steering.js').SteeringMessage[]> {
+    return await this.enqueue(id, async () => {
+      const state = await this.get(id)
+      if (state.pendingTerminal || state.summary.status !== 'running') return []
+      // State commits precede event publication. An in-process Resume must
+      // repair that gap too; otherwise the model sees an instruction that the
+      // durable requirement/evidence projection silently omits.
+      for (const item of state.steering ?? []) await this.publishSteeringUnqueued(id, item)
+      const pending = (state.steering ?? []).filter((item) => item.status === 'received')
+      if (!pending.length) return []
+      if (!modelToolFrameIsClosed(state.messages)) throw new Error('Cannot apply user steering before the active tool result frame is closed')
+      const appliedAt = new Date().toISOString()
+      for (const item of pending) {
+        item.status = 'applied'
+        item.appliedAt = appliedAt
+        item.appliedTurnId = turnId
+        item.appliedStepId = stepId
+        state.messages.push(steeringModelMessage(item))
+      }
+      // Changed requirements invalidate semantic verdicts, not raw evidence or completed work.
+      delete state.activeArtifactContentReviewReceipt
+      delete state.activeArtifactReviewRepair
+      delete state.activeTaskExactFinalRequest
+      state.summary.updatedAt = appliedAt
+      await this.writeState(id, state)
+      for (const item of pending) await this.publishSteeringUnqueued(id, item)
+      return this.redactForDisplay(id, pending.map(publicSteeringMessage))
+    })
+  }
+
+  private async publishSteeringUnqueued(id: string, item: DurableSteeringMessage): Promise<void> {
+    const message = publicSteeringMessage(item)
+    // Only missing journal entries need publication. This runs at every safe
+    // decision boundary; replaying appendUnqueued for each existing receipt
+    // would reread and hydrate the entire log for every historical instruction.
+    const eventTypes = await this.ensureEventTypeIndex(id)
+    const { appliedAt: _appliedAt, appliedTurnId: _appliedTurn, archivedAt: _archivedAt,
+      archiveReason: _reason, restoreId: _restore, ...received } = message
+    if (eventTypes.get(item.receivedEventId) !== 'user.steering.received') await this.appendUnqueued(id, 'user.steering.received', {
+      ...received, status: 'received',
+      requestReceivedAt: item.receivedAt, timezone: item.timezone,
+    }, { turnId: item.receivedTurnId, eventId: item.receivedEventId })
+    if (item.status === 'applied' && eventTypes.get(item.appliedEventId) !== 'user.steering.applied') await this.appendUnqueued(id, 'user.steering.applied', {
+      ...message, requestReceivedAt: item.receivedAt, timezone: item.timezone,
+      ...(item.appliedBeforeTurnStart ? { appliedBeforeTurnStart: true } : {}),
+    }, { turnId: item.appliedTurnId, stepId: item.appliedStepId, eventId: item.appliedEventId })
+    if (item.status === 'archived' && (!item.archivedEventId || eventTypes.get(item.archivedEventId) !== 'user.steering.archived')) await this.appendUnqueued(id, 'user.steering.archived', {
+      ...message,
+    }, { turnId: item.receivedTurnId, eventId: item.archivedEventId })
+  }
+
   async stageHitl(id: string, pending: DurablePendingHitl): Promise<void> {
     await this.update(id, (state) => {
       if (state.pendingHitl?.[pending.id]) throw new Error(`HITL request ${pending.id} already exists`)
@@ -2345,12 +2473,47 @@ export class SessionStore {
     pending: DurablePendingStart,
     mutate: (state: StoredSession) => void,
   ): Promise<StoredSession> {
-    return await this.update(id, (state) => {
+    const applied: DurableSteeringMessage[] = []
+    const started = await this.enqueue(id, async () => {
+      const state = await this.get(id)
       if (state.pendingStart) throw new Error(`Turn ${state.pendingStart.turnId} is already pending dispatch`)
+      // A resumed run reconstructs its task scope before its first decision.
+      // Repair prior committed instructions before that reconstruction, not
+      // only later inside applyPendingSteering.
+      for (const item of state.steering ?? []) await this.publishSteeringUnqueued(id, item)
+      // A normal follow-up after cancellation is newer than queued corrections.
+      // Apply those first so their order cannot override the later user message.
+      const previousMessageCount = state.messages.length
+      if (pending.kind === 'submit') {
+        const queued = (state.steering ?? []).filter((item) => item.status === 'received')
+        if (queued.length && !modelToolFrameIsClosed(state.messages)) {
+          throw steeringError('The interrupted tool frame must be reconciled with Resume before adding another message.', 'steering_resume_required')
+        }
+        for (const item of queued) {
+          item.status = 'applied'
+          item.appliedAt = pending.createdAt
+          item.appliedTurnId = pending.turnId
+          item.appliedBeforeTurnStart = true
+          state.messages.push(steeringModelMessage(item))
+          applied.push(item)
+        }
+      }
       mutate(state)
+      if (applied.length > 0) {
+        state.turnMessageStarts ??= {}
+        state.turnMessageStarts[pending.turnId] = previousMessageCount
+        delete state.activeArtifactContentReviewReceipt
+        delete state.activeArtifactReviewRepair
+      }
       state.pendingStart = pending
       transitionRunStatus(state, 'queued')
+      delete state.summary.limits
+      state.summary.updatedAt = new Date().toISOString()
+      await this.writeState(id, state)
+      return state
     })
+    for (const item of applied) await this.enqueue(id, () => this.publishSteeringUnqueued(id, item))
+    return started
   }
 
   async commitRunStart(id: string, turnId: string): Promise<void> {
@@ -2371,6 +2534,7 @@ export class SessionStore {
     return await this.update(id, (state) => {
       if (state.pendingStart) throw new Error(`Turn ${state.pendingStart.turnId} has not finished dispatching`)
       if (state.pendingTerminal) throw new Error(`Turn ${state.pendingTerminal.turnId} already has a pending terminal outcome`)
+      if (pending.status === 'completed' && state.steering?.some((item) => item.status === 'received')) throw new SteeringPendingError()
       mutate(state)
       state.pendingTerminal = pending
     })
@@ -2932,7 +3096,9 @@ export class SessionStore {
       try {
         const state = await this.get(id)
         this.registerSensitiveValues(id, findSensitiveValues(JSON.stringify(state.messages)))
+        this.registerSensitiveValues(id, findSensitiveValues(JSON.stringify(state.steering ?? [])))
         await this.repairEventLog(id)
+        for (const item of state.steering ?? []) await this.publishSteeringUnqueued(id, item)
         await this.recoverSession(id)
       } catch {
         // A corrupt session remains isolated and is omitted by list(); other sessions still recover.

@@ -109,7 +109,8 @@ describe('AgentService upstream evidence repair', () => {
       return { ...result(''), finishReason: 'tool_calls', toolCalls: batch.map((entry) => ({ id: entry.id, type: 'function',
         function: { name: entry.name, arguments: JSON.stringify(entry.arguments) } })) }
     }
-    const agent = new AgentService(store, { client: { stream } as never,
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never,
       tools: { execute: async (call: ToolCallRecord) => {
         executed.push(call.id)
         let payload: Record<string, unknown>

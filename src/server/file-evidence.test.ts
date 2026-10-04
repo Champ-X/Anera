@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { SessionEvent } from '../shared/types.js'
-import { ATTACHMENT_VERIFIER, attachmentEvidenceFreshnessGap, withFileEvidenceSnapshot } from './file-evidence.js'
+import { ATTACHMENT_VERIFIER, attachmentCoverageAssessment, attachmentEvidenceFreshnessGap, attachmentEvidenceStatus, withFileEvidenceSnapshot } from './file-evidence.js'
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
 function extracted(text: string, args: Record<string, unknown> = {}, data: Record<string, unknown> = {}): SessionEvent {
@@ -52,6 +52,37 @@ describe('version-bound file evidence', () => {
     const command = extracted('old')
     command.data.call = { name: 'bash', arguments: { command: 'inspect-other-file' } }
     expect(gap([extracted('current'), command])).toBeUndefined()
+  })
+
+  it('forgets both old successful and failed parser evidence after workspace restore', () => {
+    const restore: SessionEvent = { id: 'restore', seq: 3, sessionId: 'session', type: 'workspace.version.restored', at: '', data: { restoreId: 'wsr_aaaaaaaaaaaaaaaaaaaa' } }
+    const failure = { ...extracted('current'), type: 'tool.failed' as const }
+    for (const previous of [extracted('current'), failure]) {
+      const events = [previous, restore]
+      expect(attachmentEvidenceStatus(events, 'report.pdf', hash('current'), 7)).toEqual({ status: 'unobserved' })
+      expect(gap(events)).toBeUndefined()
+      expect(attachmentEvidenceStatus([...events, extracted('current')], 'report.pdf', hash('current'), 7)).toEqual({ status: 'current' })
+    }
+    expect(gap([extracted('current'), restore, failure])).toContain('did not complete')
+  })
+
+  it('does not combine pre-restore coverage with new pages of identical restored bytes', () => {
+    const page = (start: number): SessionEvent => {
+      const event = extracted('current', { page_start: start })
+      event.data.fileEvidence = { ...event.data.fileEvidence as object,
+        coverage: { unit: 'page', totalUnits: 2, from: [start - 1, 0], to: [start, 0] } }
+      event.data.result = `Restored byte content, page ${start}`
+      return event
+    }
+    const restore: SessionEvent = { id: 'restore', seq: 3, sessionId: 'session', type: 'workspace.version.restored', at: '', data: { restoreId: 'wsr_aaaaaaaaaaaaaaaaaaaa' } }
+    expect(attachmentCoverageAssessment([page(1), page(2)], 'report.pdf', hash('current')).coverage.status).toBe('complete')
+    const beforeOnly = attachmentCoverageAssessment([page(1), page(2), restore], 'report.pdf', hash('current'))
+    expect(beforeOnly.coverage.status).not.toBe('complete')
+    expect(beforeOnly.extraction).toBeUndefined()
+    const afterTail = attachmentCoverageAssessment([page(1), page(2), restore, page(2)], 'report.pdf', hash('current'))
+    expect(afterTail.coverage.status).not.toBe('complete')
+    expect(afterTail.extraction).toBeUndefined()
+    expect(attachmentCoverageAssessment([page(1), restore, page(1), page(2)], 'report.pdf', hash('current')).coverage.status).toBe('complete')
   })
 
   it('inspects an immutable snapshot even if the workspace source changes during parsing, and cleans up', async () => {

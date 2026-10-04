@@ -53,7 +53,8 @@ describe('phase-local context in the real agent request builder', () => {
         text: call.arguments.action === 'press' ? 'Steps 2/2' : 'Workflow 1/2' }) }
       return { isError: false, content: JSON.stringify({ status: 'success', path: 'deck.html', url: 'http://127.0.0.1:8000/deck.html' }) }
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: '制作一个中文 HTML Slides，主题是日常工作流程。' })
       for (let attempt = 0; attempt < 600 && agent.isRunning(session.summary.id); attempt += 1) await new Promise((done) => setTimeout(done, 5))
@@ -93,7 +94,8 @@ describe('phase-local context in the real agent request builder', () => {
       await writeFile(resolve(store.workspaceDir(session.summary.id), 'deck.html'), html)
       return { isError: false, content: JSON.stringify({ status: 'success', path: 'deck.html' }) }
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: '制作一个中文 HTML Slides，主题是日常工作流程。' })
       for (let attempt = 0; attempt < 500 && agent.isRunning(session.summary.id); attempt += 1) {

@@ -17,6 +17,13 @@ export type EventType =
   | 'turn.started'
   | 'turn.completed'
   | 'turn.undone'
+  | 'user.steering.received'
+  | 'user.steering.applied'
+  | 'user.steering.archived'
+  | 'task.verification.completed'
+  | 'workspace.version.created'
+  | 'workspace.version.restored'
+  | 'workspace.version.failed'
   | 'run.status'
   | 'run.resumed'
   | 'assistant.started'
@@ -439,6 +446,7 @@ export interface PlanState {
 }
 
 export interface SessionSnapshot {
+  steering?: import('./steering.js').SteeringMessage[]
   session: SessionSummary
   events: SessionEvent[]
   plan: PlanState | null

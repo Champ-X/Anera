@@ -258,7 +258,8 @@ describe('visual workflow checkpoint anchors', () => {
           offset: 1, hasMore: true, nextOffset: 404, truncated: true }
         : { status: 'success', hash: 'fixed' }), isError: false,
     }))
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never })
     try {
       await agent.resume(session.summary.id)
       await vi.waitFor(() => expect(agent.isRunning(session.summary.id)).toBe(false), { timeout: 5_000, interval: 20 })

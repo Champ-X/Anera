@@ -23,6 +23,7 @@ import { SessionStore } from './session-store.js'
 import { createResearchBrief } from './research-brief.js'
 import { researchPageReadFromResult } from './research-evidence.js'
 import { researchHtmlClaimGap } from './research-claim-integrity.js'
+import { taskPlanBindingFixture } from './test-support/task-plan-fixture.js'
 import type { ToolCallRecord } from '../shared/types.js'
 
 // Exact public source snapshots. Their full SHA-256 identities are checked by
@@ -100,6 +101,7 @@ async function fixture(request = 'Use only the supplied template and synthetic s
     return response
   })
   const created = await createApp({ dataRoot: root, model: 'test-model', agent: {
+    verificationMode: 'legacy', // Replays historical source-bound repair phases; product defaults to adaptive.
     client: { stream: async () => { throw new Error('No model is permitted in this integration fixture') } },
     toolExecutorDependencies: { fetch: fetchMock as typeof fetch },
   } })
@@ -109,8 +111,8 @@ async function fixture(request = 'Use only the supplied template and synthetic s
   const id = session.summary.id
   await created.store.update(id, (state) => { state.messages = [{ role: 'user', content: request }] })
   let sequence = 0
-  const append = async (call: ToolCallRecord, result: { content: string; isError: boolean }) => {
-    await created.store.append(id, result.isError ? 'tool.failed' : 'tool.completed', { call, result: result.content, isError: result.isError })
+  const append = async (call: ToolCallRecord, result: { content: string; isError: boolean }, metadata: Record<string, unknown> = {}) => {
+    await created.store.append(id, result.isError ? 'tool.failed' : 'tool.completed', { call, result: result.content, isError: result.isError, ...metadata })
     await created.store.update(id, (state) => { state.messages.push(
       { role: 'assistant', content: null, tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] },
       { role: 'tool', tool_call_id: call.id, content: result.content, tool_result_status: result.isError ? 'failed' : 'succeeded' },
@@ -119,10 +121,10 @@ async function fixture(request = 'Use only the supplied template and synthetic s
   await append({ id: 'source', name: 'fetch_page', arguments: { url: PINK_SCRIPT_SOURCE_URL, format: 'raw', chunkIndex: 0 } }, {
     content: JSON.stringify({ status: 'success', url: PINK_SCRIPT_SOURCE_URL, content: source, hasMore: false, chunkIndex: 0 }), isError: false,
   })
-  const execute = async (name: string, arguments_: Record<string, unknown>) => {
+  const execute = async (name: string, arguments_: Record<string, unknown>, metadata: Record<string, unknown> = {}) => {
     const call = { id: `language-${++sequence}`, name, arguments: arguments_ }
     const result = await created.agent['tools'].execute(call, { sessionId: id, turnId: 'language', stepId: call.id, callId: call.id, signal: new AbortController().signal })
-    await append(call, result)
+    await append(call, result, metadata)
     return result
   }
   const record = await execute('record_reference_style', { ...args, language: 'zh-CN' })
@@ -221,7 +223,7 @@ describe('documented language integration', () => {
     await vi.waitFor(() => { expect(f.agent.isRunning(f.id)).toBe(false) }, { timeout: 10_000, interval: 20 })
     const errors = (await f.store.events(f.id)).filter((event) => event.type === 'error').map((event) => event.data.message)
     if (failure === 'quantity qualification') {
-      expect(surfaces.slice(0, 2), JSON.stringify(errors)).toEqual([['read_file'], ['edit_file', 'read_file']])
+      expect(surfaces.slice(0, 2), JSON.stringify(errors)).toEqual([['read_file', 'read_context'], ['edit_file', 'read_file', 'read_context']])
       expect(reads).toEqual([{ path: 'sample.html', view: 'reference_text' }])
       expect(edits.map((result) => result.isError), JSON.stringify(edits)).toEqual([false])
       expect(commit).toHaveBeenCalledTimes(1)
@@ -234,7 +236,7 @@ describe('documented language integration', () => {
       expect(verified.isError, verified.content).toBe(false)
       expect(JSON.parse(verified.content).fidelity).toBe('pass')
     } else {
-      expect(surfaces[0], JSON.stringify(errors)).toEqual(failure === 'citation' ? ['read_file'] : ['fetch_page', 'web_search'])
+      expect(surfaces[0], JSON.stringify(errors)).toEqual(failure === 'citation' ? ['read_file', 'read_context'] : ['fetch_page', 'web_search', 'read_context'])
       if (failure === 'citation') expect(prompts[0]).toContain('"offset":1,"limit":5000')
       expect(prompts[0]).not.toContain('"view":"reference_text"')
       expect(commit).not.toHaveBeenCalled()
@@ -270,11 +272,14 @@ describe('documented language integration', () => {
     await f.append({ id: 'fixture-news', name: 'fetch_page', arguments: { url } }, {
       content: JSON.stringify({ status: 'success', url, content }), isError: false,
     })
+    // This replay begins after plan review. Seed the same private task binding
+    // that AgentService records; model-visible brief metadata is not provenance.
+    const briefTaskBinding = await taskPlanBindingFixture(f.store, f.id, brief.sha256)
     await f.store.update(f.id, (state) => {
       state.summary.status = 'failed'
-      state.activeTaskResearchEvidence = { schemaVersion: 1, sourceUrls: [url], toolCallIds: ['fixture-news'], pageReads: [read], brief }
+      state.activeTaskResearchEvidence = { schemaVersion: 1, sourceUrls: [url], toolCallIds: ['fixture-news'], pageReads: [read], brief, briefTaskBinding }
     })
-    const recorded = await f.execute('record_research_brief', briefInput)
+    const recorded = await f.execute('record_research_brief', briefInput, { taskPlanBinding: briefTaskBinding })
     expect(recorded.isError, recorded.content).toBe(false)
     const corrected = slides()
     const citation = catalog.variants.find((variant) => variant.id === 'v2')!.slots.find((slot) => slot.linkable !== false && !slot.allowEmpty)!.id
@@ -308,7 +313,9 @@ describe('documented language integration', () => {
     await f.agent.resume(f.id)
     await vi.waitFor(async () => { expect(f.agent.isRunning(f.id)).toBe(false) }, { timeout: 10_000, interval: 20 })
     const errors = (await f.store.events(f.id)).filter((event) => event.type === 'error').map((event) => event.data.message)
-    expect(surfaces.slice(0, 3), JSON.stringify({ results, errors })).toEqual([['compose_reference_html'], ['compose_reference_html'], ['verify_reference_style']])
+    expect(surfaces.slice(0, 3), JSON.stringify({ results, errors })).toEqual([
+      ['compose_reference_html', 'read_context'], ['compose_reference_html', 'read_context'], ['verify_reference_style', 'read_context'],
+    ])
     expect(results.map((result) => result.isError), JSON.stringify(results)).toEqual([true, false])
     expect(write).toHaveBeenCalledTimes(1)
     expect(await readFile(f.path, 'utf8')).toContain(`href="${url}"`)
@@ -340,6 +347,7 @@ describe('documented language integration', () => {
     const surfaces: string[][] = []
     const phasePrompts: string[] = []
     const rawPages: Array<{ arguments: Record<string, unknown>; result: Record<string, unknown> }> = []
+    const contentReviewHashes: string[] = []
     let currentView: ReferenceTextView | undefined
     const issue = (id: string, name: string, arguments_: Record<string, unknown>) => ({
       content: '', reasoningContent: '', finishReason: 'tool_calls' as const,
@@ -347,6 +355,21 @@ describe('documented language integration', () => {
       usage: { promptTokens: 20, completionTokens: 3, totalTokens: 23, cachedPromptTokens: 0 }, modelCallCount: 1,
     })
     vi.spyOn(f.agent['client'], 'stream').mockImplementation(async (options) => {
+      await options.beforeRequest?.()
+      if (String(options.messages[0]?.content).startsWith('You are an artifact-content reviewer')) {
+        // A valid offline response advances the historical content-review
+        // contract. It is not evidence of model quality or rendered acceptance.
+        expect(options.tools).toEqual([])
+        expect(options.toolChoice).toBe('none')
+        expect(options.responseFormat).toEqual({ type: 'json_object' })
+        const context = JSON.parse(String(options.messages[1].content)).deliveryContext
+        const hash = createHash('sha256').update(await readFile(f.path)).digest('base64url')
+        expect(context.artifact.sha256).toBe(hash)
+        contentReviewHashes.push(hash)
+        return { content: JSON.stringify({ artifactIssues: [], taskFulfillment: { status: 'satisfied', issues: [] } }),
+          reasoningContent: '', finishReason: 'stop' as const, toolCalls: [],
+          usage: { promptTokens: 20, completionTokens: 3, totalTokens: 23, cachedPromptTokens: 0 }, modelCallCount: 1 }
+      }
       surfaces.push((options.tools ?? []).map((tool) => tool.function.name))
       phasePrompts.push(options.messages.map((message) => typeof message.content === 'string' ? message.content : '').join('\n'))
       if (failure === 'raw fallback' && surfaces.length >= 7) {
@@ -402,6 +425,15 @@ describe('documented language integration', () => {
         })
       }
       const result = await execute(call, context)
+      if (call.id === 'loop-edit-7' && failure === 'concurrent write') {
+        // The competing fixture author owns this comment. First verify the
+        // rejected CAS preserved its bytes, then let that author withdraw the
+        // temporary change before the ordinary reread/retry. An unjournaled
+        // external generation cannot truthfully inherit content-review identity.
+        expect(result.isError).toBe(true)
+        expect(await readFile(f.path)).toEqual(Buffer.concat([before!, Buffer.from('\n<!-- concurrent author change -->')]))
+        await writeFile(f.path, before!)
+      }
       if (call.id === 'loop-verify' && !result.isError) {
         before = await readFile(f.path)
         originalFontManifest = (await f.store.get(f.id)).activeReferenceStyleContract!.fontEvidence!.manifestSha256
@@ -431,11 +463,12 @@ describe('documented language integration', () => {
     const trace = loopMessages.map((message) => ({ id: message.tool_call_id, content: typeof message.content === 'string' ? message.content.slice(0, 200) : message.content }))
     if (failure === 'raw fallback') {
       expect(surfaces.slice(0, 7), JSON.stringify(trace)).toEqual([
-        ['compose_reference_html'], ['verify_reference_style'], ['start_process'], ['browser'], ['browser'], ['read_file'], ['edit_file', 'read_file'],
-      ])
+        ['compose_reference_html'], ['verify_reference_style'], ['start_process'], ['browser'], ['browser'],
+        ['read_file', 'read_reference_resource'], ['edit_file', 'read_file', 'read_reference_resource'],
+      ].map((names) => [...names, 'read_context']))
       expect(rawPages.length).toBeGreaterThan(1)
-      expect(surfaces.slice(7, -1)).toEqual(rawPages.slice(1).map(() => ['read_file']))
-      expect(surfaces.at(-1)).toEqual(['edit_file'])
+      expect(surfaces.slice(7, -1)).toEqual(rawPages.slice(1).map(() => ['read_file', 'read_reference_resource', 'read_context']))
+      expect(surfaces.at(-1)).toEqual(['edit_file', 'read_reference_resource', 'read_context'])
       expect(rawPages[0].arguments).toEqual({ path: 'sample.html', offset: 1, limit: 5_000 })
       for (let index = 1; index < rawPages.length; index += 1) {
         const previous = rawPages[index - 1].result
@@ -451,13 +484,15 @@ describe('documented language integration', () => {
       expect(actualEdits).toHaveLength(0)
       expect(before).toBeDefined()
       expect(await readFile(f.path)).toEqual(before)
+      expect(contentReviewHashes).toEqual([createHash('sha256').update(before!).digest('base64url')])
       return
     }
     if (failure === 'atomic batch') {
       expect(surfaces, JSON.stringify(trace)).toEqual([
-        ['compose_reference_html'], ['verify_reference_style'], ['start_process'], ['browser'], ['browser'], ['read_file'],
-        ['edit_file', 'read_file'], ['verify_reference_style'], ['browser'],
-      ])
+        ['compose_reference_html'], ['verify_reference_style'], ['start_process'], ['browser'], ['browser'], ['read_file', 'read_reference_resource'],
+        ['edit_file', 'read_file', 'read_reference_resource'], ['verify_reference_style'], ['browser'],
+      ].map((names) => [...names, 'read_context']))
+      expect(new Set(contentReviewHashes).size).toBe(2)
       expect(actualEdits.map((result) => result.isError)).toEqual([false])
       expect(rawPages).toHaveLength(0)
       expect(await readFile(f.path)).not.toEqual(before)
@@ -468,11 +503,14 @@ describe('documented language integration', () => {
       return
     }
     expect(surfaces, JSON.stringify(trace)).toEqual([
-      ['compose_reference_html'], ['verify_reference_style'], ['start_process'], ['browser'], ['browser'], ['read_file'], ['edit_file', 'read_file'],
-      ['read_file'], ['edit_file', 'read_file'], ['verify_reference_style'], ['browser'],
-    ])
+      ['compose_reference_html'], ['verify_reference_style'], ['start_process'], ['browser'], ['browser'],
+      ['read_file', 'read_reference_resource'], ['edit_file', 'read_file', 'read_reference_resource'],
+      ['read_file', 'read_reference_resource'], ['edit_file', 'read_file', 'read_reference_resource'], ['verify_reference_style'], ['browser'],
+    ].map((names) => [...names, 'read_context']))
+    expect(new Set(contentReviewHashes).size).toBe(2)
     for (const index of [5, 7]) {
-      expect(phasePrompts[index]).toContain('current complete source-bound text view, not full HTML')
+      expect(phasePrompts[index].includes('read the current source-bound text slots using exactly {"path":"sample.html","view":"reference_text"}')).toBe(true)
+      expect(phasePrompts[index].includes('This compact view replaces raw HTML for literal-text repair, not for CSS or structural edits')).toBe(true)
       expect(phasePrompts[index]).not.toContain('then continue the deterministic cursor until the terminal page')
     }
     for (const index of [6, 8]) {

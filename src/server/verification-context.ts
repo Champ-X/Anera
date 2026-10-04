@@ -11,6 +11,19 @@ const MAX_FILES = 6
 const MAX_IDENTITY_BYTES = 32 * 1024 * 1024
 const MAX_EXCERPT_CHARS = 1600
 
+/** The local restore checkpoint is an evidence boundary, not a business request. */
+export function isWorkspaceRestoreContext(content: string): boolean {
+  return /^\[Workspace restored: wsr_[a-z0-9]{20}\](?:\n|$)/u.test(content)
+}
+
+function sinceWorkspaceRestore(events: readonly SessionEvent[]): readonly SessionEvent[] {
+  let boundary = -1
+  for (let index = events.length - 1; index >= 0; index--) {
+    if (events[index].type === 'workspace.version.restored') { boundary = index; break }
+  }
+  return boundary < 0 ? events : events.slice(boundary)
+}
+
 export function activeTaskEvidenceEvents(
   events: readonly SessionEvent[], isContinuation: (content: string) => boolean,
 ): SessionEvent[] {
@@ -18,6 +31,9 @@ export function activeTaskEvidenceEvents(
     && Array.isArray(event.data.targetTurnIds) ? event.data.targetTurnIds : []))
   let active: SessionEvent[] = []
   for (const event of events) {
+    // Restoring files is independent of conversation undo. Even if a restore
+    // carries an undone turn id, it still changed the physical workspace.
+    if (event.type === 'workspace.version.restored') { active = [event]; continue }
     if (event.turnId && undone.has(event.turnId)) continue
     if (event.type === 'turn.started' && event.data.customFeedbackTurn !== true
       && typeof event.data.reviewedNodeId !== 'string'
@@ -37,8 +53,9 @@ export async function verificationDecisionContext(options: {
   workspace: string
   signal?: AbortSignal
 }): Promise<string> {
+  const currentEvents = sinceWorkspaceRestore(options.events)
   const paths = new Set<string>()
-  for (const event of options.events) {
+  for (const event of currentEvents) {
     const call = event.data.call as { name?: string; arguments?: Record<string, unknown> } | undefined
     if (!['tool.completed', 'tool.failed', 'tool.timed_out'].includes(event.type)
       || event.data.notExecuted === true || call?.name !== 'extract_attachment') continue
@@ -66,12 +83,12 @@ export async function verificationDecisionContext(options: {
         hash.update(chunk)
       }
       const sha256 = hash.digest('hex')
-      const identity = attachmentEvidenceStatus(options.events, path, sha256, bytes)
+      const identity = attachmentEvidenceStatus(currentEvents, path, sha256, bytes)
       if (identity.status !== 'current') {
         records.push({ path, freshness: identity.status, gap: identity.gap })
         continue
       }
-      const { coverage, unit, extraction } = attachmentCoverageAssessment(options.events, path, sha256)
+      const { coverage, unit, extraction } = attachmentCoverageAssessment(currentEvents, path, sha256)
       records.push({ path, freshness: 'current_at_decision', revision: sha256, bytes,
         observation: 'independent_attachment_extraction', coverage, unit,
         ...(coverage.status === 'incomplete' ? { continuation: {

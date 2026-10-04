@@ -240,7 +240,8 @@ describe('AgentService reference resource repair', () => {
           usage: { promptTokens: 20, completionTokens: 3, totalTokens: 23, cachedPromptTokens: 0 }, modelCallCount: 1 }
       })
       const forbiddenFetch = vi.fn(async () => { throw new Error('No network is permitted in this fixture') })
-      agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 5_000,
+      agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+        client: { stream } as never, runTimeoutMs: 5_000,
         vision: { inspect: vi.fn(async () => { throw new Error('No Vision is permitted in this fixture') }) },
         toolExecutorDependencies: { fetch: forbiddenFetch, imageApiKey: '' } })
       const execute = vi.spyOn(agent['tools'], 'execute')

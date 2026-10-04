@@ -24,7 +24,19 @@ const FORMAT_POLICY: Record<DocumentFormat, string> = {
   pptx: '- PPTX API guidance: PptxGenJS addTable accepts an array of row arrays; project object records through explicit ordered columns before rendering. addChart accepts an array of series objects with aligned labels and values, not a raw value array. Pie/doughnut categories belong in one series. Validate actual rendered data shape, requested slide order, content and notes through independent extraction. PptxGenJS is a writer, not a reliable reopen/parser API. Do not substitute a fixed category set, series values or slide count for the request.',
 }
 
-export function documentAuthoringPolicy(formats: readonly DocumentFormat[]): string[] {
+/** Runtime API references for adaptive work; choosing an API does not prescribe acceptance steps. */
+const ADAPTIVE_FORMAT_API: Record<DocumentFormat, string> = {
+  pdf: '- PDF API reference: use a real PDF writer for PDF bytes. When selectable text or vector content is requested, write those directly. With pdf-lib, embed fonts through PDFDocument and pass them to page renderers; PDFPage has no public page.doc.getFont API. Derive geometry from the requested page dimensions and font metrics.',
+  docx: '- DOCX API reference: docx supports HeadingLevel.TITLE, PageNumber.CURRENT, paragraph styles, numbering, page breaks and fields. Select the features needed for the user’s document and use public Header/Footer constructors. The writer is not a reopen/parser API; extract_attachment is available when an independent observation helps resolve a requirement.',
+  xlsx: '- XLSX API reference: ExcelJS formula expressions omit the destination cell and leading equals sign. Use cell.formula for the expression and cell.result for a cached value; cell.value can be a formula object. Use public worksheet/cell APIs rather than a nonexistent worksheet.getRange or assignment to wb.worksheets. Preserve the user’s requested formulas and references.',
+  pptx: '- PPTX API reference: PptxGenJS addTable accepts row arrays; project object records through the intended ordered columns. addChart accepts series objects with aligned labels and values. Pie/doughnut categories belong in one series. PptxGenJS is a writer; choose an appropriate observation method when a requested property needs verification.',
+}
+
+export function documentAuthoringPolicy(formats: readonly DocumentFormat[], options: { verificationMode?: 'adaptive' | 'legacy' } = {}): string[] {
   const selected = [...new Set(formats)].filter((format) => Object.hasOwn(FORMAT_POLICY, format))
+  if (options.verificationMode === 'adaptive') return selected.length ? [
+    '- Document library availability: openpyxl, python-docx and python-pptx are not preinstalled, and this runtime does not expose pip package-network access. Use available tools or install an appropriate npm library through install_npm_packages. Select verification methods and coverage from the user’s requirements and current evidence.',
+    ...selected.map((format) => ADAPTIVE_FORMAT_API[format]),
+  ] : []
   return selected.length ? [COMMON_DOCUMENT_POLICY, ...selected.map((format) => FORMAT_POLICY[format])] : []
 }

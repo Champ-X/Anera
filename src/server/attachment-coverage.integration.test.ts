@@ -54,7 +54,8 @@ describe('coverage-driven document presentation in the actual agent loop', () =>
         coverage: { unit, totalUnits: 2, from: [index, 0], to: [index + 1, 0] },
       } }
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: request })
       await vi.waitFor(() => expect(agent.isRunning(session.summary.id)).toBe(false), { timeout: 5_000, interval: 10 })

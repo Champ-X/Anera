@@ -194,6 +194,8 @@ export type ShellCommandBroker = (
 ) => Promise<ShellCommandBrokerDecision>
 
 export interface ToolExecutorDependencies {
+  /** Direct executors retain historical presentation gates unless explicitly configured. */
+  verificationMode?: 'adaptive' | 'legacy'
   fetch?: typeof fetch
   runCommand?: typeof runCommand
   validatePublicUrl?: typeof validatePublicUrl
@@ -2175,6 +2177,7 @@ export class ToolExecutor {
   private readonly imageModel: string
   private readonly imageBattleModels: readonly string[]
   private readonly toolTimeoutMs: number
+  private readonly verificationMode: 'adaptive' | 'legacy'
   private readonly websiteReadyTimeoutMs: number
   private readonly localAppBaseUrl: () => string
   private readonly requestHumanInput?: ToolExecutorDependencies['requestHumanInput']
@@ -2229,6 +2232,7 @@ export class ToolExecutor {
         .filter(Boolean),
     )]
     this.toolTimeoutMs = dependencies.toolTimeoutMs ?? config.toolTimeoutMs
+    this.verificationMode = dependencies.verificationMode ?? 'legacy'
     this.websiteReadyTimeoutMs = dependencies.websiteReadyTimeoutMs ?? 8_000
     const configuredLocalAppBaseUrl = dependencies.localAppBaseUrl
     this.localAppBaseUrl = typeof configuredLocalAppBaseUrl === 'function'
@@ -5213,9 +5217,11 @@ export class ToolExecutor {
     if (!info.isFile()) throw new Error('Path is not a file')
     const bytes = await readFile(target)
     const artifactHash = createHash('sha256').update(bytes).digest('base64url')
-    const freshnessGap = attachmentEvidenceFreshnessGap(await this.store.events(context.sessionId), path,
-      createHash('sha256').update(bytes).digest('hex'), bytes.length)
-    if (freshnessGap) throw new Error(freshnessGap)
+    if (this.verificationMode === 'legacy') {
+      const freshnessGap = attachmentEvidenceFreshnessGap(await this.store.events(context.sessionId), path,
+        createHash('sha256').update(bytes).digest('hex'), bytes.length)
+      if (freshnessGap) throw new Error(freshnessGap)
+    }
     const state = await this.store.get(context.sessionId)
     const artifact = state.artifacts.find((item) => item.path === path) ?? this.artifactForPath(context, path)
     if (!state.artifacts.some((item) => item.path === path)) {

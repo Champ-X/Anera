@@ -74,6 +74,15 @@ describe('request-local verification evidence', () => {
     const next = [extracted(), extracted('artifact.pdf', 'fresh', 'Fresh contents')]
     expect(parsed(await project(next, workspace)).observations[0]).toMatchObject({ freshness: 'current_at_decision', retainedExcerpt: 'Fresh contents' })
   })
+  it('does not revive a pre-restore extraction even when restored bytes have the same hash', async () => {
+    const old = extracted('artifact.pdf', 'bytes', 'Before the restore')
+    const restore = event('workspace.version.restored', { restoreId: 'wsr_aaaaaaaaaaaaaaaaaaaa' })
+    expect(await project([old, restore], workspace)).toBe('')
+    const fresh = extracted('artifact.pdf', 'bytes', 'After a fresh extraction')
+    const context = await project([old, restore, fresh], workspace)
+    expect(context).not.toContain('Before the restore')
+    expect(parsed(context).observations[0]).toMatchObject({ freshness: 'current_at_decision', retainedExcerpt: 'After a fresh extraction' })
+  })
   it('labels truncated excerpts independently of complete parser coverage', async () => {
     const context = await project([extracted('artifact.pdf', 'bytes', 'x'.repeat(50_000))], workspace)
     const record = parsed(context).observations[0]
@@ -125,5 +134,18 @@ describe('active task evidence scope', () => {
     const b = event('turn.started', { content: 'Task B' }, 'b')
     const undo = event('turn.undone', { targetTurnIds: ['b'] }, 'undo')
     expect(select([a, read, b, { ...extracted(), turnId: 'b' }, undo])).toEqual([a, read, undo])
+  })
+  it('keeps restore as a physical boundary across Continue and conversation undo', () => {
+    const original = event('turn.started', { content: 'Task A' }, 'a')
+    const old = { ...extracted(), turnId: 'a' }
+    const priorReceipt = event('task.verification.completed', { outcome: 'completed' }, 'a')
+    const restore = event('workspace.version.restored', { restoreId: 'wsr_aaaaaaaaaaaaaaaaaaaa' }, 'restored')
+    const continuation = event('turn.started', { content: 'Continue' }, 'b')
+    const fresh = { ...extracted(), turnId: 'b' }
+    const history = [original, old, priorReceipt, restore, continuation, fresh]
+    expect(select(history)).toEqual([restore, continuation, fresh])
+    const undo = event('turn.undone', { targetTurnIds: ['restored'] }, 'undo')
+    expect(select([...history, undo])).toEqual([restore, continuation, fresh, undo])
+    expect(history).toEqual([original, old, priorReceipt, restore, continuation, fresh])
   })
 })

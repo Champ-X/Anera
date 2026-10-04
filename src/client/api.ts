@@ -17,6 +17,12 @@ import type {
   WorkspaceInventoryPage,
 } from '../shared/types'
 import { STATIC_SHOWCASE } from './showcase-mode'
+import type { SteeringMessage } from '../shared/steering'
+import type { WorkspaceVersionDiff, WorkspaceVersionList, WorkspaceVersionRestoreResult, WorkspaceVersionSummary } from '../shared/workspace-versions'
+
+export class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) { super(message) }
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   if (STATIC_SHOWCASE) {
@@ -27,9 +33,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
     headers: { 'content-type': 'application/json', ...(options?.headers ?? {}) },
   })
-  const body = await response.json().catch(() => ({})) as { error?: string }
+  const body = await response.json().catch(() => ({})) as { error?: string; code?: string }
   const method = options?.method?.toUpperCase() || 'GET'
-  if (!response.ok) throw new Error(body.error || `${method} ${path} failed (${response.status})`)
+  if (!response.ok) throw new ApiRequestError(body.error || `${method} ${path} failed (${response.status})`, response.status, body.code)
   return body as T
 }
 
@@ -173,6 +179,25 @@ export const api = {
   },
   async snapshot(id: string): Promise<SessionSnapshot> {
     return await request<SessionSnapshot>(`/api/sessions/${id}`)
+  },
+  async steer(id: string, content: string, clientMessageId: string): Promise<SteeringMessage> {
+    return (await request<{ steering: SteeringMessage }>(`/api/sessions/${id}/steering`, {
+      method: 'POST', body: JSON.stringify({ content: content.trim(), clientMessageId }),
+    })).steering
+  },
+  async workspaceVersions(id: string): Promise<WorkspaceVersionList> {
+    return await request(`/api/sessions/${id}/workspace-versions`)
+  },
+  async saveWorkspaceVersion(id: string, label?: string): Promise<WorkspaceVersionSummary> {
+    return (await request<{ version: WorkspaceVersionSummary }>(`/api/sessions/${id}/workspace-versions`, {
+      method: 'POST', body: JSON.stringify({ label }),
+    })).version
+  },
+  async workspaceVersionDiff(id: string, versionId: string, against = 'current'): Promise<WorkspaceVersionDiff> {
+    return await request(`/api/sessions/${id}/workspace-versions/${encodeURIComponent(versionId)}/diff?${new URLSearchParams({ against })}`)
+  },
+  async restoreWorkspaceVersion(id: string, versionId: string): Promise<WorkspaceVersionRestoreResult> {
+    return await request(`/api/sessions/${id}/workspace-versions/${encodeURIComponent(versionId)}/restore`, { method: 'POST', body: '{}' })
   },
   async workspaceInventory(id: string, cursor?: string, limit?: number): Promise<WorkspaceInventoryPage> {
     const query = new URLSearchParams()

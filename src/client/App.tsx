@@ -9,6 +9,8 @@ import {
   ChevronDown,
   ChevronRight,
   CircleGauge,
+  CircleAlert,
+  CircleHelp,
   CircleStop,
   CloudUpload,
   Code2,
@@ -24,6 +26,7 @@ import {
   Github,
   Globe2,
   Heart,
+  History,
   Info,
   Image as ImageIcon,
   LoaderCircle,
@@ -79,7 +82,12 @@ import type {
   WorkspaceInventoryMetadata,
 } from '../shared/types'
 import { AGENT_LEADERBOARD_PATH, AgentLeaderboard, isAgentLeaderboardPath } from './AgentLeaderboard'
-import { api } from './api'
+import { api, ApiRequestError } from './api'
+import { mergeSteeringMessages, SteeringUpdates, visibleSteeringMessages } from './SteeringUpdates'
+import { WorkspaceVersionsDialog } from './WorkspaceVersionsDialog'
+import { MAX_STEERING_CONTENT_LENGTH, type SteeringMessage } from '../shared/steering'
+import type { TaskVerification } from '../shared/task-verification'
+import { TaskVerificationSummary, type TaskVerificationView } from './TaskVerificationSummary'
 import { HistorySessionRow } from './HistorySessionRow'
 import { mergeSessionMetadata, updateHistorySession } from './history-sessions'
 import { canOpenWebsitePreview, shouldCloseWebsitePreview } from './preview-lifecycle'
@@ -394,13 +402,14 @@ export type TimelineItem =
   | { kind: 'thought'; key: string; label: string; content: string; running: boolean; duration?: string }
   | { kind: 'progress'; key: string; content: string; streaming: boolean }
   | { kind: 'plan'; key: string; plan: PlanState }
+  | { kind: 'verification'; key: string; verification: TaskVerificationView; stale: boolean }
   | ToolGroupTimelineItem
   | ToolTimelineItem
   | ToolCallDraftTimelineItem
   | { kind: 'artifact'; key: string; artifact: ArtifactRecord }
   | { kind: 'approval'; key: string; approvalId: string; title: string; description: string; call: { name: string; arguments: Record<string, unknown> }; decision: 'pending' | 'approved' | 'denied' | 'expired' }
   | HitlTimelineItem
-  | { kind: 'final'; key: string; content: string; streaming: boolean; messageEventId?: string; feedback: PointwiseFeedbackValue | null }
+  | { kind: 'final'; key: string; content: string; streaming: boolean; messageEventId?: string; feedback: PointwiseFeedbackValue | null; verificationOutcome?: TaskVerification['outcome']; verificationStale?: boolean }
   | { kind: 'error'; key: string; content: string; cancelled: boolean }
 
 function hitlAnswerContent(item: HitlTimelineItem): string | undefined {
@@ -700,7 +709,11 @@ export function App() {
   const [undoOffer, setUndoOffer] = useState<(UndoTurnCandidate & { sessionId: string })>()
   const [optimisticUndo, setOptimisticUndo] = useState<(UndoTurnCandidate & { sessionId: string })>()
   const [savingReviewFeedback, setSavingReviewFeedback] = useState(false)
-  const [activeComposerOperation, setActiveComposerOperation] = useState<'submit' | 'undo' | null>(null)
+  const [activeComposerOperation, setActiveComposerOperation] = useState<'submit' | 'undo' | 'steering' | null>(null)
+  const steeringOperationRef = useRef<symbol | undefined>(undefined)
+  const [versionsSessionId, setVersionsSessionId] = useState<string>()
+  const [workspaceRestoreNotice, setWorkspaceRestoreNotice] = useState<string>()
+  useEffect(() => { setVersionsSessionId(undefined) }, [activeId])
   const [workspacePersistence, setWorkspacePersistence] = useState<WorkspacePersistenceView>()
   const [workspaceInventory, setWorkspaceInventory] = useState<WorkspaceInventoryView>()
   const [thankYouPhase, setThankYouPhase] = useState<'in' | 'out' | null>(null)
@@ -1379,6 +1392,7 @@ export function App() {
           // their preceding text when the browser throttles animation frames.
           eventFrame ??= window.requestAnimationFrame(flushEvents)
         } else flushEvents()
+        if (event.type === 'turn.started' || event.type === 'run.resumed') setWorkspaceRestoreNotice(undefined)
         const persistence = workspacePersistenceFromEvent(event)
         if (persistence) {
           clearWorkspacePersistenceTimer()
@@ -1408,7 +1422,14 @@ export function App() {
           })
         }
         if (event.type === 'usage.updated') void refreshCredits().catch(() => undefined)
-        if (['file.changed', 'artifact.created', 'process.started', 'process.updated', 'process.stopped', 'website.updated', 'deployment.updated', 'run.status', 'session.limit.reached', 'workspace.persistence.completed'].includes(event.type)) {
+        if (event.type === 'workspace.version.restored') {
+          closePreview()
+          setPreviewReloadKey((value) => value + 1)
+          setWorkspaceRestoreNotice(activeId)
+          setUndoOffer(undefined)
+          setOptimisticUndo(undefined)
+        }
+        if (['file.changed', 'artifact.created', 'process.started', 'process.updated', 'process.stopped', 'website.updated', 'deployment.updated', 'run.status', 'session.limit.reached', 'workspace.persistence.completed', 'workspace.version.restored'].includes(event.type)) {
           window.clearTimeout(refreshTimer.current)
           refreshTimer.current = window.setTimeout(() => {
             void refreshSnapshot(activeId).catch((reason) => setError(messageOf(reason)))
@@ -1427,7 +1448,7 @@ export function App() {
       window.clearTimeout(refreshTimer.current)
       clearWorkspacePersistenceTimer()
     }
-  }, [activeId, clearWorkspacePersistenceTimer, openPreview, refreshCredits, refreshSnapshot, resetWorkspaceInventory, setWorkspaceVisibility])
+  }, [activeId, clearWorkspacePersistenceTimer, closePreview, openPreview, refreshCredits, refreshSnapshot, resetWorkspaceInventory, setWorkspaceVisibility])
 
   useEffect(() => {
     if (!STATIC_SHOWCASE || !activeId) return
@@ -1489,12 +1510,22 @@ export function App() {
     return () => controller.abort()
   }, [previewNeedsText, previewMode, previewReloadKey, previewTarget])
 
-  const running = snapshot?.session.status === 'running' || snapshot?.session.status === 'cancelling' || snapshot?.session.status === 'awaiting_approval'
+  const running = snapshot?.session.status === 'queued' || snapshot?.session.status === 'running' || snapshot?.session.status === 'cancelling' || snapshot?.session.status === 'awaiting_approval'
+  const steeringEnabled = Boolean(snapshot?.session.id === activeId && snapshot && ['queued', 'running', 'awaiting_user', 'awaiting_approval', 'cancelling'].includes(snapshot.session.status))
   const tokenLimit = snapshot?.session.limits?.sessionTokens
   const resumable = snapshot ? !tokenLimit?.reached && ['cancelled', 'failed', 'timed_out', 'interrupted'].includes(snapshot.session.status) : false
   const optimisticUndoneTurnIds = useMemo(() => new Set(
     optimisticUndo && optimisticUndo.sessionId === activeId ? optimisticUndo.targetTurnIds : [],
   ), [activeId, optimisticUndo])
+  const steeringMessages = useMemo(() => {
+    const undone = new Set(optimisticUndoneTurnIds)
+    for (const event of snapshot?.events ?? []) {
+      if (event.type !== 'turn.undone') continue
+      const ids = (event.data as { targetTurnIds?: unknown }).targetTurnIds
+      if (Array.isArray(ids)) for (const id of ids) if (typeof id === 'string') undone.add(id)
+    }
+    return visibleSteeringMessages(snapshot?.steering ?? [], undone)
+  }, [optimisticUndoneTurnIds, snapshot])
   const timeline = useMemo(
     () => projectTimeline(snapshot, optimisticUndoneTurnIds),
     [optimisticUndoneTurnIds, snapshot],
@@ -1658,6 +1689,7 @@ export function App() {
 
   useEffect(() => {
     const pendingDraft = pendingComposerDraftRef.current
+    steeringOperationRef.current = undefined
     const pendingForActiveRoute = pendingDraft?.sessionId === (activeId ?? DRAFT_COMPOSER_SESSION_ID)
     setLatestAssistantResponseViewedId(undefined)
     setOptimisticTaskReview(undefined)
@@ -1868,6 +1900,9 @@ export function App() {
           ><ArrowDown size={14} aria-hidden="true" /></button>}
         </div>
 
+        {activeId && <SteeringUpdates messages={steeringMessages} paused={snapshot?.session.status === 'cancelling' || resumable} />}
+        {activeId && workspaceRestoreNotice === activeId && <div className="workspace-restore-notice" role="status">Workspace restored. Conversation history is unchanged; affected previews and checks need confirmation.<button type="button" aria-label="Dismiss restore notice" onClick={() => setWorkspaceRestoreNotice(undefined)}><X size={13} /></button></div>}
+
         {activeId && taskReviewVisible && taskReview && (
           <TaskReviewPanel
             messageEventId={taskReview.messageEventId}
@@ -1978,6 +2013,37 @@ export function App() {
             submitDisabled={Boolean(STATIC_SHOWCASE || (activeId && undoOffer?.sessionId === activeId) || activeComposerOperation)}
             onDraftStateChange={recordComposerDraft}
             running={Boolean(running)}
+            steeringEnabled={steeringEnabled}
+            steeringMessages={snapshot?.steering}
+            onSteer={async (content, clientMessageId) => {
+              if (!activeId) return
+              const operation = Symbol('steering')
+              steeringOperationRef.current = operation
+              const isCurrent = () => activeIdRef.current === activeId && steeringOperationRef.current === operation
+              setError(undefined)
+              setActiveComposerOperation('steering')
+              try {
+                const message = await api.steer(activeId, content, clientMessageId)
+                setSnapshot((current) => current?.session.id === activeId
+                  ? { ...current, steering: mergeSteeringMessages(current.steering ?? [], [message]) }
+                  : current)
+              } catch (reason) {
+                // The response can be lost after the server durably accepts a
+                // message. Recover that receipt before offering a retry.
+                const latest = await refreshSnapshot(activeId).catch(() => undefined)
+                if (latest?.steering?.some((message) => message.clientMessageId === clientMessageId)) return
+                if (!isCurrent()) throw reason
+                if (reason instanceof ApiRequestError && reason.code === 'steering_session_not_active') {
+                  setError('The task has finished. Your instructions are kept below; send them to start a follow-up.')
+                } else setError(messageOf(reason))
+                throw reason
+              } finally {
+                if (isCurrent()) {
+                  steeringOperationRef.current = undefined
+                  setActiveComposerOperation(null)
+                }
+              }
+            }}
             resumable={resumable}
             tokenLimit={tokenLimit}
             creditBalance={creditBalance}
@@ -2185,6 +2251,7 @@ export function App() {
           inventory={visibleWorkspaceInventory}
           persistence={workspacePersistence}
           writeDrafts={workspaceWriteDrafts}
+          onVersions={STATIC_SHOWCASE ? undefined : () => setVersionsSessionId(activeId)}
           onOpenFile={(entry) => openPreview(workspaceEntryPreviewTarget(activeId, entry))}
           onLoadMore={loadMoreWorkspaceInventory}
           onRefresh={refreshWorkspaceInventory}
@@ -2203,6 +2270,28 @@ export function App() {
           }}
         />
       )}
+
+      {versionsSessionId && versionsSessionId === activeId && <WorkspaceVersionsDialog
+        key={versionsSessionId}
+        sessionId={versionsSessionId}
+        busy={steeringEnabled || Boolean(activeComposerOperation)}
+        onClose={() => setVersionsSessionId(undefined)}
+        onRestored={async (continueEditing) => {
+          if (activeIdRef.current !== versionsSessionId) return
+          closePreview()
+          setPreviewReloadKey((value) => value + 1)
+          setUndoOffer(undefined)
+          setOptimisticUndo(undefined)
+          setWorkspaceRestoreNotice(versionsSessionId)
+          await refreshSnapshot(versionsSessionId)
+          if (continueEditing && activeIdRef.current === versionsSessionId) {
+            const draft = composerDraftRef.current?.sessionId === versionsSessionId
+              ? composerDraftRef.current
+              : { sessionId: versionsSessionId, value: '', attachments: [] }
+            applyComposerDraft(draft, true)
+          }
+        }}
+      />}
 
       {appRoute === 'agent' && previewTarget && (
         <aside className="preview-layer" role="dialog" aria-label={activePreviewRenderer === 'html' ? 'Website preview' : 'Artifact preview'}>
@@ -2731,6 +2820,9 @@ export function Composer(props: {
   submitDisabled?: boolean
   onDraftStateChange: (draft: ComposerDraftSnapshot) => void
   running: boolean
+  steeringEnabled?: boolean
+  steeringMessages?: readonly SteeringMessage[]
+  onSteer?: (content: string, clientMessageId: string) => Promise<void>
   resumable: boolean
   tokenLimit?: SessionTokenLimitState
   creditBalance?: CreditBalance
@@ -2755,6 +2847,9 @@ export function Composer(props: {
   const [uploading, setUploading] = useState(false)
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [creditOpen, setCreditOpen] = useState(false)
+  const [steeringPending, setSteeringPending] = useState(false)
+  const steeringAttempt = useRef<{ content: string; clientMessageId: string } | undefined>(undefined)
+  const steeringSubmitting = useRef(false)
   const [modelOverride, setModelSelection] = useState<string>()
   const modelSelection = modelOverride ?? props.modelSelection ?? props.currentModel ?? props.models[0]?.id ?? ''
   const modelPending = !modelSelection
@@ -2765,9 +2860,12 @@ export function Composer(props: {
   const draftAttachmentSequence = useRef(0)
   const applyingDraftCommand = useRef<number | undefined>(undefined)
   const blockedBySessionLimit = Boolean(props.tokenLimit?.reached)
-  const editorLocked = props.readOnly || props.running || blockedBySessionLimit
+  const canSteer = Boolean(props.steeringEnabled && props.onSteer)
+  const editorLocked = props.readOnly || (props.running && !canSteer) || blockedBySessionLimit || steeringPending
   const placeholder = props.readOnly
     ? 'Static replay — new tasks are disabled'
+    : canSteer
+    ? 'Add a requirement or correct the direction…'
     : props.running
     ? 'Agent is working…'
     : blockedBySessionLimit
@@ -2775,6 +2873,13 @@ export function Composer(props: {
       : props.reviewedNodeId
         ? 'Give feedback on this task…'
         : 'Ask anything…'
+  useEffect(() => {
+    const attempt = steeringAttempt.current
+    if (!attempt || steeringPending || !props.steeringMessages?.some((message) => message.clientMessageId === attempt.clientMessageId)) return
+    // SSE may confirm a request whose HTTP response was lost.
+    setValue((current) => current.trim() === attempt.content ? '' : current)
+    steeringAttempt.current = undefined
+  }, [props.steeringMessages, steeringPending])
   useEffect(() => {
     if (props.codingMode) setAttachments([])
   }, [props.codingMode])
@@ -2809,7 +2914,7 @@ export function Composer(props: {
     })
   }, [attachments, props.draftCommand, props.onDraftStateChange, props.sessionId, value])
   const uploadFiles = async (files: File[]) => {
-    if (!files.length || props.readOnly || props.running || blockedBySessionLimit || uploading) return
+    if (!files.length || props.readOnly || props.running || canSteer || blockedBySessionLimit || uploading) return
     const selection = selectAgentUploads(files, attachments.reduce((total, attachment) => total + attachment.size, 0))
     if (selection.accepted.length === 0) {
       if (selection.errors.length > 0) props.onError(new Error(selection.errors.join('; ')))
@@ -2846,6 +2951,29 @@ export function Composer(props: {
     }
   }
   const submit = async () => {
+    if (steeringSubmitting.current) return
+    if (canSteer) {
+      const content = value.trim()
+      if (props.readOnly || props.submitDisabled || steeringSubmitting.current || !content || blockedBySessionLimit || uploading) return
+      if (content.length > MAX_STEERING_CONTENT_LENGTH) { props.onError(new Error('Additional instructions must be 32,000 characters or fewer.')); return }
+      const attempt = steeringAttempt.current?.content === content
+        ? steeringAttempt.current
+        : { content, clientMessageId: crypto.randomUUID() }
+      steeringAttempt.current = attempt
+      steeringSubmitting.current = true
+      setSteeringPending(true)
+      try {
+        await props.onSteer!(content, attempt.clientMessageId)
+        setValue((current) => current.trim() === content ? '' : current)
+        steeringAttempt.current = undefined
+      } catch {
+        // Keep the exact text and idempotency key when a receipt is uncertain.
+      } finally {
+        steeringSubmitting.current = false
+        setSteeringPending(false)
+      }
+      return
+    }
     if (props.readOnly || props.submitDisabled || modelPending || (!value.trim() && (!attachments.length || props.codingMode)) || props.running || blockedBySessionLimit || uploading) return
     const content = value
     setValue('')
@@ -2878,13 +3006,13 @@ export function Composer(props: {
       <div
         className={`composer${draggingFiles ? ' is-dragging' : ''}${props.repositoryControl ? ' has-repository-control' : ''}`}
         onDragEnter={(event) => {
-          if (!event.dataTransfer.types.includes('Files') || props.readOnly || props.running || blockedBySessionLimit || uploading) return
+          if (!event.dataTransfer.types.includes('Files') || props.readOnly || props.running || canSteer || blockedBySessionLimit || uploading) return
           event.preventDefault()
           dragDepth.current += 1
           setDraggingFiles(true)
         }}
         onDragOver={(event) => {
-          if (!event.dataTransfer.types.includes('Files') || props.readOnly || props.running || blockedBySessionLimit || uploading) return
+          if (!event.dataTransfer.types.includes('Files') || props.readOnly || props.running || canSteer || blockedBySessionLimit || uploading) return
           event.preventDefault()
           event.dataTransfer.dropEffect = 'copy'
         }}
@@ -2894,7 +3022,7 @@ export function Composer(props: {
           if (dragDepth.current === 0) setDraggingFiles(false)
         }}
         onDrop={(event) => {
-          if (!event.dataTransfer.types.includes('Files') || props.readOnly || props.running || blockedBySessionLimit || uploading) return
+          if (!event.dataTransfer.types.includes('Files') || props.readOnly || props.running || canSteer || blockedBySessionLimit || uploading) return
           event.preventDefault()
           dragDepth.current = 0
           setDraggingFiles(false)
@@ -2914,6 +3042,7 @@ export function Composer(props: {
           role="textbox"
           aria-label="Message"
           aria-multiline="true"
+          aria-describedby={canSteer ? `steering-hint-${props.sessionId}` : undefined}
           aria-placeholder={placeholder}
           aria-disabled={editorLocked || undefined}
           aria-readonly={props.readOnly || undefined}
@@ -2991,7 +3120,7 @@ export function Composer(props: {
               }
             }}
           />
-          <button className="attach-button" title={props.readOnly ? 'Uploads are disabled in the static replay' : 'Upload files'} disabled={props.readOnly || props.running || blockedBySessionLimit || uploading} onClick={() => fileInput.current?.click()} aria-label={draggingFiles ? 'Drop files' : 'Add files'}>
+          <button className="attach-button" title={props.readOnly ? 'Uploads are disabled in the static replay' : 'Upload files'} disabled={props.readOnly || props.running || canSteer || blockedBySessionLimit || uploading} onClick={() => fileInput.current?.click()} aria-label={draggingFiles ? 'Drop files' : 'Add files'}>
             {uploading ? <LoaderCircle className="spin" size={16} /> : draggingFiles ? <CloudUpload size={16} /> : <Paperclip size={16} />}
             <span>{draggingFiles ? 'Drop files...' : 'Add files'}</span>
           </button>
@@ -3000,20 +3129,27 @@ export function Composer(props: {
             type="button"
             aria-label={props.connectionsEnabled ? 'Connections enabled: GitHub' : 'Connections'}
             aria-expanded={props.connectionsOpen}
-            disabled={props.readOnly || props.running || blockedBySessionLimit}
+            disabled={props.readOnly || props.running || canSteer || blockedBySessionLimit}
             onClick={(event) => {
               const bounds = event.currentTarget.getBoundingClientRect()
               props.onConnections({ left: bounds.left, top: bounds.top })
             }}
           >{props.connectionsEnabled ? <Github size={14} /> : <Plug size={14} />}<ChevronDown className={props.connectionsOpen ? 'open' : ''} size={11} /></button>
           <ModelSelector models={props.models} value={modelSelection} unavailable={props.modelListUnavailable}
-            disabled={Boolean(editorLocked || props.submitDisabled)} onChange={setModelSelection} />
+            disabled={Boolean(editorLocked || canSteer || props.submitDisabled)} onChange={setModelSelection} />
           <span className="composer-spacer" />
           {props.resumable && !props.running && <button className="resume-button" disabled={props.readOnly || props.submitDisabled || modelPending} onClick={() => void props.onResume(modelSelection)}><RotateCcw size={13} /> Continue</button>}
           <CreditGaugeControl balance={props.creditBalance} isFreeSession={props.isFreeSession} open={creditOpen} onOpenChange={setCreditOpen} />
+          {canSteer && <button
+            type="button"
+            className="send-button steering-send"
+            disabled={Boolean(props.readOnly || props.submitDisabled || steeringPending || blockedBySessionLimit || !value.trim() || uploading)}
+            onClick={() => void submit()}
+            aria-label="Add instructions"
+          >{steeringPending ? <LoaderCircle className="spin" size={16} /> : <ArrowUp size={17} />}</button>}
           {props.running
             ? <button className="send-button stop" onClick={() => void props.onStop()} aria-label="Stop agent"><CircleStop size={17} /></button>
-            : <button
+            : !canSteer && <button
               className="send-button"
                 disabled={Boolean(props.readOnly || props.submitDisabled || modelPending || blockedBySessionLimit || ((!value.trim() && (attachments.length === 0 || props.codingMode)) || uploading))}
                 onClick={() => void submit()}
@@ -3021,6 +3157,7 @@ export function Composer(props: {
               ><ArrowUp size={17} /></button>}
         </div>
       </div>
+      {canSteer && <p className="steering-hint" id={`steering-hint-${props.sessionId}`}>Instructions apply in order at the next safe step. The current operation will finish first.</p>}
       {props.repositoryControl}
     </div>
   )
@@ -3220,6 +3357,7 @@ function Timeline({ item, sessionId, onPreview, onApproval, onHitl, onGiveFeedba
     <RichText sessionId={sessionId} resolveLink={markdownHref}>{item.content}</RichText>
   </div>
   if (item.kind === 'plan') return <PlanCard item={item} />
+  if (item.kind === 'verification') return <TaskVerificationSummary verification={item.verification} stale={item.stale} />
   if (item.kind === 'exploration') return <><ExplorationGroup item={item} /><ToolImages tools={item.tools} sessionId={sessionId} /></>
   if (item.kind === 'tool-group') return <><ArenaToolGroup item={item} /><ToolImages tools={item.tools} sessionId={sessionId} /></>
   if (item.kind === 'tool') return <><ToolRow item={item} /><ToolImages tools={[item]} sessionId={sessionId} /></>
@@ -3232,7 +3370,7 @@ function Timeline({ item, sessionId, onPreview, onApproval, onHitl, onGiveFeedba
     <section className="final-answer" data-assistant-response-id={item.messageEventId}>
       {item.streaming && <div className="final-streaming" aria-label="Final answer streaming"><LoaderCircle className="spin" size={13} /></div>}
       <div className="markdown"><RichText sessionId={sessionId} resolveLink={markdownHref}>{item.content}</RichText></div>
-      {!item.streaming && item.messageEventId && <FinalActions content={item.content} onGiveFeedback={onGiveFeedback} />}
+      {!item.streaming && item.messageEventId && <FinalActions content={item.content} onGiveFeedback={onGiveFeedback} verificationOutcome={item.verificationOutcome} verificationStale={item.verificationStale} />}
     </section>
   )
 }
@@ -3243,10 +3381,12 @@ function ToolImages({ tools, sessionId }: { tools: ToolTimelineItem[]; sessionId
   return <div className="tool-inline-images markdown">{paths.map((path) => <InlineImage key={path} src={imageHref(sessionId, path)} alt={path.split('/').at(-1)} />)}</div>
 }
 
-function FinalActions({ content, onGiveFeedback }: { content: string; onGiveFeedback?: () => void }) {
+export function FinalActions({ content, onGiveFeedback, verificationOutcome, verificationStale }: { content: string; onGiveFeedback?: () => void; verificationOutcome?: TaskVerification['outcome']; verificationStale?: boolean }) {
   const [copied, setCopied] = useState(false)
   return <div className="final-actions">
-    <span className="final-completed" aria-label="Completed"><Check size={13} /></span>
+    <span className={`final-completed${verificationStale ? ' stale' : verificationOutcome === 'limited' ? ' limited' : ''}`} aria-label={verificationStale ? 'Earlier result — workspace restored' : verificationOutcome === 'limited' ? 'Completed with limitations' : 'Completed'}>
+      {verificationStale ? <><CircleHelp size={13} />Earlier result</> : verificationOutcome === 'limited' ? <><CircleAlert size={13} />Completed with limitations</> : <Check size={13} />}
+    </span>
     <button type="button" className="final-copy-action" aria-label={copied ? 'Copied' : 'Copy'} onClick={() => {
       void copyText(content).then(() => {
         setCopied(true)
@@ -3334,7 +3474,7 @@ function WorkspacePersistenceStatus({ status }: { status: WorkspacePersistenceVi
 function UndoTurnCallout(props: { disabled?: boolean; onUndo: () => Promise<void>; onDismiss: () => void }) {
   return <div className="composer-above-row">
     <section className="undo-turn-callout" role="status" aria-label="Undo last turn">
-      <span className="undo-turn-copy">Do you want to undo the last turn?</span>
+      <span className="undo-turn-copy">Do you want to undo the last turn?<small>This undoes the conversation only. Files stay unchanged; use Workspace versions to restore files.</small></span>
       <button type="button" className="undo-turn-action" disabled={props.disabled} onClick={() => void props.onUndo()}><RotateCcw size={16} /><span>Undo</span></button>
       <button type="button" className="undo-turn-dismiss" disabled={props.disabled} aria-label="Dismiss" onClick={props.onDismiss}><X size={16} /></button>
     </section>
@@ -4238,6 +4378,7 @@ export function WorkspacePanel(props: {
   onRefresh: () => Promise<void>
   onPreview: () => void
   onRestart: () => Promise<void>
+  onVersions?: () => void
 }) {
   const [websiteRestarting, setWebsiteRestarting] = useState(false)
   const snapshot = props.snapshot
@@ -4286,6 +4427,7 @@ export function WorkspacePanel(props: {
       <div className="workspace-card">
         <div className="workspace-heading">
           <strong>Workspace</strong>
+          {props.onVersions && <button type="button" onClick={props.onVersions} aria-label="Workspace versions" title="Workspace versions"><History size={14} /></button>}
           {props.persistence && <span className={`workspace-persistence-heading ${props.persistence.phase}`} role="status">
             {props.persistence.phase === 'saved'
               ? <Check size={10} aria-hidden="true" />
@@ -4470,6 +4612,7 @@ export function resolveCustomFeedbackOffer(snapshot?: SessionSnapshot): CustomFe
   const activeEvents = snapshot.events.filter((event) => !event.turnId || !undoneTurnIds.has(event.turnId))
   const final = [...activeEvents].reverse().find((event) => event.type === 'assistant.final')
   if (!final) return undefined
+  if (activeEvents.some((event) => event.type === 'workspace.version.restored' && event.seq > final.seq)) return undefined
   const request = [...activeEvents].reverse().find((event) => (
     event.type === 'review.requested'
     && (event.data as { messageEventId?: unknown }).messageEventId === final.id
@@ -4511,6 +4654,7 @@ export function resolveTerminalFeedback(snapshot?: SessionSnapshot, timeline = p
   }
   if (!final?.messageEventId) return undefined
   const event = snapshot.events.find((candidate) => candidate.id === final.messageEventId)
+  if (event && snapshot.events.some((candidate) => candidate.type === 'workspace.version.restored' && candidate.seq > event.seq)) return undefined
   const requested = [...snapshot.events].reverse().find((candidate) => (
     candidate.type === 'review.requested'
     && (candidate.data as { messageEventId?: unknown }).messageEventId === final.messageEventId
@@ -4603,6 +4747,8 @@ export function projectTimeline(
   const visibleEvents = snapshot.events.filter((event) => (
     event.type !== 'turn.undone' && (!event.turnId || !undoneTurnIds.has(event.turnId))
   ))
+  const lastWorkspaceRestoreSeq = snapshot.events.reduce((latest, event) => event.type === 'workspace.version.restored' ? Math.max(latest, event.seq) : latest, -1)
+  const verificationsByTurn = new Map<string, TaskVerificationView>()
   const stepsWithToolCalls = new Set(visibleEvents
     .filter((event) => event.type === 'tool.started' && event.stepId)
     .map((event) => event.stepId as string))
@@ -4652,7 +4798,10 @@ export function projectTimeline(
   }
   for (const event of visibleEvents) {
     const data = event.data as Record<string, any>
-    if (event.type === 'turn.started') {
+    if (event.type === 'task.verification.completed' && Array.isArray(data.checks) && typeof data.summary === 'string' && (data.outcome === 'completed' || data.outcome === 'limited')) {
+      verificationsByTurn.set(event.turnId ?? '', data as TaskVerificationView)
+      items.push({ kind: 'verification', key: event.id, verification: data as TaskVerificationView, stale: event.seq < lastWorkspaceRestoreSeq })
+    } else if (event.type === 'turn.started') {
       beginVisibleActivity()
       const customFeedbackTurn = data.customFeedbackTurn === true && typeof data.reviewedNodeId === 'string'
       items.push({
@@ -4802,7 +4951,13 @@ export function projectTimeline(
         const observedDuration = toolStartedAt.has(call.id) ? Date.parse(event.at) - Date.parse(toolStartedAt.get(call.id)!) : Number.NaN
         tool.durationMs = reportedDuration ?? (Number.isFinite(observedDuration) && observedDuration >= 0 ? observedDuration : undefined)
       }
+    } else if (event.type === 'workspace.version.restored') {
+      items.push({
+        kind: 'thought', key: event.id, label: 'Workspace restored', running: false,
+        content: `Restored ${typeof data.version?.label === 'string' ? data.version.label : 'a saved version'}. Conversation history is preserved. Earlier artifact previews and affected verification results need to be checked again; external actions were not undone.`,
+      })
     } else if (event.type === 'artifact.created') {
+      if (event.seq < lastWorkspaceRestoreSeq) continue
       beginVisibleActivity()
       const artifact = data.artifact as ArtifactRecord
       const current = artifacts.get(artifact.path)
@@ -4925,6 +5080,9 @@ export function projectTimeline(
       final.content = String(data.content || final.content)
       final.streaming = false
       final.messageEventId = event.id
+      const verification = verificationsByTurn.get(event.turnId ?? '')
+      if (verification) final.verificationOutcome = verification.outcome
+      if (event.seq < lastWorkspaceRestoreSeq) final.verificationStale = true
       finalsByMessageEvent.set(event.id, final)
     } else if (event.type === 'feedback.updated') {
       const final = finalsByMessageEvent.get(String(data.messageEventId || ''))
@@ -5126,7 +5284,12 @@ export function reconcileSnapshot(current: SessionSnapshot | undefined, incoming
   if (!current || current.session.id !== hydrated.session.id) return hydrated
   const currentSeq = current.events.reduce((maximum, event) => Math.max(maximum, event.seq), 0)
   const incomingSeq = hydrated.events.reduce((maximum, event) => Math.max(maximum, event.seq), 0)
-  return incomingSeq < currentSeq ? current : hydrated
+  return incomingSeq < currentSeq ? current : {
+    ...hydrated,
+    // An HTTP receipt may precede its SSE event. Snapshot hydration cannot
+    // discard that already accepted instruction while publication catches up.
+    steering: mergeSteeringMessages(current.steering ?? [], hydrated.steering ?? []),
+  }
 }
 
 function applySnapshotProjection(snapshot: SessionSnapshot, event: SessionEvent): SessionSnapshot {
@@ -5135,16 +5298,30 @@ function applySnapshotProjection(snapshot: SessionSnapshot, event: SessionEvent)
     ...snapshot,
     session: applyEventToSummary(snapshot.session, event),
   }
+  if ((event.type === 'user.steering.received' || event.type === 'user.steering.applied' || event.type === 'user.steering.archived') && typeof data.id === 'string' && typeof data.content === 'string') {
+    return { ...projected, steering: mergeSteeringMessages(snapshot.steering ?? [], [data as SteeringMessage]) }
+  }
   if (event.type === 'plan.updated' && data.plan && Array.isArray(data.plan.items)) {
     return { ...projected, plan: data.plan as PlanState }
   }
   if (event.type === 'artifact.created' && data.artifact?.path) {
+    if (snapshot.events.some((entry) => entry.type === 'workspace.version.restored' && entry.seq > event.seq)) return projected
     const artifact = data.artifact as ArtifactRecord
     return { ...projected, artifacts: [...snapshot.artifacts.filter((item) => item.path !== artifact.path), artifact] }
   }
   if (event.type === 'artifact.removed') {
+    if (snapshot.events.some((entry) => entry.type === 'workspace.version.restored' && entry.seq > event.seq)) return projected
     const path = String(data.artifact?.path || data.path || '')
     return path ? { ...projected, artifacts: snapshot.artifacts.filter((artifact) => artifact.path !== path) } : projected
+  }
+  if (event.type === 'workspace.version.restored' && Array.isArray(data.artifacts)) {
+    return {
+      ...projected,
+      plan: null,
+      artifacts: data.artifacts as ArtifactRecord[],
+      ...(data.website ? { website: data.website } : {}),
+      ...(typeof data.workspaceBytes === 'number' ? { session: { ...projected.session, workspaceBytes: data.workspaceBytes } } : {}),
+    }
   }
   if (event.type === 'process.started' || event.type === 'process.output' || event.type === 'process.updated' || event.type === 'process.stopped') {
     const process = data.record as ProcessRecord | undefined

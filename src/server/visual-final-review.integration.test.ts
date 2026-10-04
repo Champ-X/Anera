@@ -192,7 +192,7 @@ describe('visual Final review publication boundary', () => {
       options.onContent(content)
       return modelResult(content)
     }
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       now: () => new Date('2026-09-07T08:22:48.835Z'),
       runTimeoutMs: mode === 'timed_out' ? 300 : undefined,

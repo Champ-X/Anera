@@ -80,7 +80,8 @@ describe('AgentService plan scope recovery', () => {
       observedAuthoring++
       throw new Error('Fixture stops before authoring; no semantic or visual acceptance claimed')
     }
-    const agent = new AgentService(store, { client: { stream } as never, now: () => new Date('2026-09-10T08:00:00Z'),
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, now: () => new Date('2026-09-10T08:00:00Z'),
       tools: { execute: async (call: ToolCallRecord) => {
         executed.push(call.name)
         expect(call.name).toBe('record_research_brief')

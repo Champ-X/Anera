@@ -41,6 +41,9 @@ import {
   type CodingSessionInput,
 } from './github-connector.js'
 import { SessionStore, type StoredSession } from './session-store.js'
+import { WorkspaceVersionService, mountWorkspaceVersionRoutes } from './workspace-versions.js'
+import { withWorkspaceMaintenance } from './workspace-maintenance.js'
+import { publicSteeringMessage } from './steering.js'
 import { injectMaterializedReferenceFonts } from './reference-fonts.js'
 import { extractAttachmentPage } from './attachment-extractor.js'
 import { validateAgentUploadBytes } from './agent-upload-validation.js'
@@ -121,8 +124,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     maxFileBytes: config.githubMaxFileBytes,
   })
   await github.initialize()
+  let workspaceVersions: WorkspaceVersionService | undefined
   const agent = new AgentService(store, {
     ...options.agent,
+    onDelivery: async (sessionId, turnId) => {
+      await workspaceVersions?.capture(sessionId, { reason: 'delivery', turnId })
+      await options.agent?.onDelivery?.(sessionId, turnId)
+    },
     credits,
     models: options.agent?.models ?? (options.model ? [options.model] : config.agentModels),
     connectorTools: {
@@ -143,6 +151,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     },
   })
   await agent.initialize()
+  workspaceVersions = new WorkspaceVersionService(store, agent)
+  await workspaceVersions.recoverAll()
   const app = express()
   app.disable('x-powered-by')
   app.use(['/api', '/nextjs-api'], (request, response, next) => {
@@ -203,6 +213,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   // A 25 MiB Agent file expands to roughly 33.4 MiB as base64 in this local
   // JSON transport. Arena uploads the same bytes through a signed object URL.
   app.use(express.json({ limit: '40mb' }))
+  mountWorkspaceVersionRoutes(app, store, agent, workspaceVersions)
 
   app.post('/api/storage/generate-agent-upload-url', (request, response) => {
     expireSignedAgentUploads(signedAgentUploads)
@@ -412,16 +423,18 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     const session = await store.create({ customFeedbackArm })
     try {
       const attachments: string[] = []
-      for (const upload of input.uploads) {
-        const safeName = safeAgentUploadName(upload.filename)
-        const uploaded = await store.createUpload(
-          session.summary.id,
-          `uploads/${safeName}`,
-          upload.content,
-          upload.mediaType,
-        )
-        attachments.push(uploaded.path)
-      }
+      await withWorkspaceMaintenance(store, session.summary.id, async () => {
+        for (const upload of input.uploads) {
+          const safeName = safeAgentUploadName(upload.filename)
+          const uploaded = await store.createUpload(
+            session.summary.id,
+            `uploads/${safeName}`,
+            upload.content,
+            upload.mediaType,
+          )
+          attachments.push(uploaded.path)
+        }
+      })
       await agent.submit(session.summary.id, {
         content: input.content,
         attachments,
@@ -461,6 +474,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
       website: state.website,
       deployment: state.deployment,
       repository: state.repository,
+      steering: store.redactForDisplay(id, (state.steering ?? []).map(publicSteeringMessage)),
     })
   })
 
@@ -519,6 +533,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
       reviewedNodeId: message.reviewedNodeId,
     })
     response.status(202).json(result)
+  })
+
+  app.post('/api/sessions/:id/steering', async (request, response) => {
+    const steering = await agent.steer(request.params.id, request.body)
+    response.status(202).json({ steering })
   })
 
   app.post('/api/sessions/:id/stop', async (request, response) => {
@@ -746,7 +765,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
       response.status(400).json({ error: policyError })
       return
     }
-    const uploaded = await store.createUpload(request.params.id, `uploads/${safeName}`, buffer, declaredMime)
+    const uploaded = await withWorkspaceMaintenance(store, request.params.id,
+      () => store.createUpload(request.params.id, `uploads/${safeName}`, buffer, declaredMime))
     response.status(201).json(uploaded)
   })
 
@@ -882,7 +902,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
     const id = request.params.id
     let restart = websiteRestartRequests.get(id)
     if (!restart) {
-      restart = (async () => {
+      restart = withWorkspaceMaintenance(store, id, async () => {
         const state = await store.get(id)
         const anchor = [...await store.events(id)].reverse().find((event) => (
           event.type === 'website.updated' || event.type === 'assistant.final'
@@ -944,7 +964,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
           await store.recordWebsiteUpdate(id, failed, { action: 'restart_failed', message: error instanceof Error ? error.message : String(error) }, eventContext)
           throw error
         }
-      })()
+      })
       websiteRestartRequests.set(id, restart)
     }
     try {

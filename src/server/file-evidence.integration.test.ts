@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ModelMessage } from '../shared/types.js'
 import { AgentService } from './agent-service.js'
 import { BrowserManager } from './browser-manager.js'
-import { ATTACHMENT_VERIFIER } from './file-evidence.js'
+import { ATTACHMENT_VERIFIER, attachmentEvidenceStatus } from './file-evidence.js'
 import { ProcessManager } from './process-manager.js'
 import { SessionStore } from './session-store.js'
 import { ToolExecutor } from './tools.js'
@@ -46,7 +46,8 @@ describe('file evidence across actual execution, persistence and presentation', 
       if (call.name === 'bash' && changed) await writeFile(path, 'modified')
       return { isError: false, content: JSON.stringify({ status: 'success', path: 'report.pdf' }) }
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: 'Create and present report.pdf.' })
       await vi.waitFor(() => expect(agent.isRunning(session.summary.id)).toBe(false), { timeout: 5_000, interval: 10 })
@@ -107,6 +108,95 @@ describe('file evidence across actual execution, persistence and presentation', 
       await reloaded.append(context.sessionId, 'tool.completed', { call: extract, result: refreshed.content, fileEvidence: refreshed.fileEvidence }, context)
       expect((await reopenedTools.execute(present, context)).isError).toBe(false)
       expect((await reloaded.events(context.sessionId)).filter((event) => event.type === 'file.presented')).toHaveLength(2)
+    } finally { await processes.stopEverything(); await rm(root, { recursive: true, force: true }) }
+  })
+
+  it('presents changed bytes in adaptive mode without turning stale extraction into a passing check', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anera-adaptive-file-presentation-'))
+    const store = new SessionStore(root, 'offline-model')
+    await store.initialize()
+    const id = (await store.create()).summary.id
+    const original = 'name,value\nA,1\n'
+    const current = 'name,value\nA,2\n'
+    await writeFile(join(store.workspaceDir(id), 'records.csv'), original)
+    const processes = new ProcessManager(() => {}, 10_000)
+    const browser = new BrowserManager()
+    const tools = new ToolExecutor(store, processes, browser, { inspect: vi.fn() }, async () => false, { verificationMode: 'adaptive' })
+    const calls = [
+      { id: 'extract_original', name: 'extract_attachment', args: { path: 'records.csv' } },
+      { id: 'write_current', name: 'write_file', args: { path: 'records.csv', content: current } },
+      { id: 'present_current', name: 'present_file', args: { path: 'records.csv' } },
+      { id: 'finish_limited', name: 'finish_task', args: {
+        summary: 'The updated file is available; its updated values have not been independently verified.', outcome: 'limited',
+        checks: [{ requirement: 'Independently verify the updated values', method: 'Only the earlier revision was extracted.',
+          required: true, status: 'unverified', evidence: { callIds: ['extract_original'], paths: ['records.csv'] },
+          note: 'The file changed after extraction.' }],
+      } },
+    ]
+    let index = 0
+    const stream = vi.fn(async (options: { beforeRequest?: () => Promise<void> }) => {
+      await options.beforeRequest?.()
+      if (index === 3) {
+        const events = await store.events(id)
+        expect(events.filter((event) => event.type === 'file.presented')).toHaveLength(1)
+        expect(events.filter((event) => event.type === 'task.verification.completed')).toHaveLength(0)
+      }
+      const call = calls[index++]
+      if (!call) throw new Error('Unexpected request after limited completion')
+      return { content: '', reasoningContent: '', finishReason: 'tool_calls', toolCalls: [{ id: call.id, type: 'function',
+        function: { name: call.name, arguments: JSON.stringify(call.args) } }],
+        usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10, cachedPromptTokens: 0 } }
+    })
+    const agent = new AgentService(store, { verificationMode: 'adaptive', client: { stream } as never, tools, runTimeoutMs: 5_000 })
+    try {
+      await agent.submit(id, { content: 'Update records.csv to value 2, present it, and report whether the updated values were independently verified.' })
+      await vi.waitFor(() => expect(agent.isRunning(id)).toBe(false), { timeout: 5_000, interval: 10 })
+      expect(stream).toHaveBeenCalledTimes(4)
+      expect((await store.get(id)).summary.status).toBe('completed')
+      const events = await store.events(id)
+      expect(events.find((event) => event.type === 'tool.completed' && event.callId === 'present_current')?.data.isError).toBe(false)
+      expect(events.find((event) => event.type === 'file.presented')?.data).toMatchObject({
+        path: 'records.csv', artifactHash: createHash('sha256').update(current).digest('base64url'), bytes: Buffer.byteLength(current),
+      })
+      const records = events.filter((event) => event.type === 'task.verification.completed')
+      expect(records).toHaveLength(1)
+      expect(records[0].data).toMatchObject({ outcome: 'limited', checks: [{ status: 'unverified' }],
+        fileEvidence: [{ path: 'records.csv', sha256: createHash('sha256').update(current).digest('hex') }] })
+      expect(attachmentEvidenceStatus(events, 'records.csv', createHash('sha256').update(current).digest('hex'), Buffer.byteLength(current)).status).toBe('invalid')
+    } finally { await agent.shutdown(); await processes.stopEverything(); await rm(root, { recursive: true, force: true }) }
+  })
+
+  it.each(['success', 'failure'] as const)('does not reuse pre-restore %s evidence in a reloaded legacy executor', async (previous) => {
+    const root = await mkdtemp(join(tmpdir(), 'anera-restored-file-presentation-'))
+    const store = new SessionStore(root, 'offline-model')
+    await store.initialize()
+    const id = (await store.create()).summary.id
+    const source = join(store.workspaceDir(id), 'records.csv')
+    const content = 'name,value\nA,1\n'
+    const processes = new ProcessManager(() => {}, 10_000)
+    const browser = new BrowserManager()
+    const makeTools = (current: SessionStore) => new ToolExecutor(current, processes, browser, { inspect: vi.fn() }, async () => false)
+    const context = { sessionId: id, turnId: 'turn', stepId: 'step', signal: new AbortController().signal }
+    const extract = { id: 'extract', name: 'extract_attachment', arguments: { path: 'records.csv' } }
+    const present = { id: 'present', name: 'present_file', arguments: { path: 'records.csv' } }
+    try {
+      const tools = makeTools(store)
+      if (previous === 'success') await writeFile(source, content)
+      const parsed = await tools.execute(extract, context)
+      expect(parsed.isError).toBe(previous === 'failure')
+      await store.append(id, parsed.isError ? 'tool.failed' : 'tool.completed', {
+        call: extract, result: parsed.content, isError: parsed.isError, fileEvidence: parsed.fileEvidence,
+      }, context)
+      await writeFile(source, content)
+      expect(attachmentEvidenceStatus(await store.events(id), 'records.csv', createHash('sha256').update(content).digest('hex'), Buffer.byteLength(content)).status)
+        .toBe(previous === 'success' ? 'current' : 'invalid')
+      await store.append(id, 'workspace.version.restored', { restoreId: 'wsr_aaaaaaaaaaaaaaaaaaaa' }, context)
+      const reloaded = new SessionStore(root, 'offline-model')
+      await reloaded.initialize()
+      expect(attachmentEvidenceStatus(await reloaded.events(id), 'records.csv', createHash('sha256').update(content).digest('hex'), Buffer.byteLength(content)))
+        .toEqual({ status: 'unobserved' })
+      expect((await makeTools(reloaded).execute(present, context)).isError).toBe(false)
+      expect((await reloaded.events(id)).filter((event) => event.type === 'file.presented')).toHaveLength(1)
     } finally { await processes.stopEverything(); await rm(root, { recursive: true, force: true }) }
   })
 

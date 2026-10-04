@@ -15,9 +15,16 @@ import { BrowserManager } from './browser-manager.js'
 import { browserRuntimeDecisionContext } from './browser-runtime-diagnostics.js'
 import { EXECUTION_EVIDENCE_POLICY } from './execution-policy.js'
 import { attachmentCoverageAssessment, attachmentEvidenceStatus } from './file-evidence.js'
-import { activeTaskEvidenceEvents, verificationDecisionContext } from './verification-context.js'
+import { activeTaskEvidenceEvents, isWorkspaceRestoreContext, verificationDecisionContext } from './verification-context.js'
 import { inconclusiveVerificationAssessment, verificationAssessment } from './verification-assessment.js'
-import { activeTaskRequestEvents, taskPlanScopeIdentity, taskScopeIdentity, taskTemporalControl } from './task-context.js'
+import { activeTaskRequestEvents, taskPlanScopeIdentity, taskScopeIdentity, taskTemporalControl, workspaceRestoreDecisionContext } from './task-context.js'
+import { SteeringPendingError } from './steering.js'
+import { escapeUntrustedArenaControlText } from './user-control-text.js'
+export { escapeUntrustedArenaControlText } from './user-control-text.js'
+import { ADAPTIVE_VERIFICATION_POLICY, FINISH_TASK_TOOL, bindTaskVerification, taskVerificationFilesCurrent, taskVerificationToolExecuted } from './task-verification.js'
+import { workspaceVersionFingerprint } from './workspace-versions.js'
+import type { TaskVerificationReceipt } from '../shared/task-verification.js'
+import type { WorkspaceVersionSummary } from '../shared/workspace-versions.js'
 import { researchRepairCapabilities, researchRepairToolNames, researchRepairCallAllowed, researchRepairInstruction, withResearchRepairTools } from './research-repair.js'
 import { admitToolBatch } from './tool-batch.js'
 import { requiredCapabilityFailure } from './tool-recovery.js'
@@ -147,7 +154,7 @@ import {
   type VisionInspector,
 } from './tools.js'
 import { DeepSeekVisionClient } from './vision.js'
-import { assertNoSymlinkTraversal, resolveWorkspacePath, workspacePersistenceSnapshot } from './workspace.js'
+import { assertNoSymlinkTraversal, resolveWorkspacePath, workspacePersistenceSnapshot, workspaceFileSnapshot } from './workspace.js'
 
 export interface ArenaAgentPromptOptions {
   date?: Date
@@ -392,12 +399,14 @@ export function systemPromptForTools(
   tools: readonly ToolDefinition[],
   options: Pick<ArenaAgentPromptOptions, 'date' | 'timezone' | 'connectorSlugs'> & {
     includeHarnessConvergence?: boolean
+    verificationMode?: 'adaptive' | 'legacy'
     documentFormats?: readonly DocumentFormat[]
     coding?: Pick<ArenaCodingPromptOptions, 'repoOwner' | 'repoName' | 'baseBranch' | 'baseSha' | 'arenaBranch' | 'cwd' | 'sessionStatus'>
   } = {},
 ): string {
   const names = new Set(tools.map((tool) => tool.function.name))
   const instructions: string[] = []
+  const adaptiveVerification = options.verificationMode === 'adaptive'
   if (options.includeHarnessConvergence) instructions.push(EXECUTION_EVIDENCE_POLICY)
   if (options.includeHarnessConvergence && names.has('bash')) {
     instructions.push('- Bash already starts in the requested workspace cwd. Use relative paths inside commands and inside source code that Bash will run; `/home/user` is a public tool-path namespace, not a source-code runtime path on every host. Never prepend `cd /home/user`, `cd ~`, or a physical path printed by `pwd`. Hard constraint: Bash calls containing heredoc markers (`<<`) or redirection that creates file contents will be rejected; call write_file/edit_file instead.')
@@ -425,23 +434,31 @@ export function systemPromptForTools(
     instructions.push('- list_files returns a bounded immutable Workspace inventory. When hasMore is true, call list_files again and copy nextCursor byte-for-byte as cursor; do not edit, decode, synthesize, skip, or restart the cursor chain. You may omit path on continuation; if you include it, keep the original path exactly. Continue until hasMore is false. A terminal truncated=true means the manifest reached a support cap, so report that limitation instead of claiming the inventory is complete.')
   }
   if (names.has('extract_attachment')) {
+    if (adaptiveVerification) {
+      instructions.push('- extract_attachment can provide independent text and structural observations of PDF and Office inputs or outputs. Choose whether extraction is useful for the current requirement and select the relevant pages/items; a filename or format alone does not prescribe full traversal. Follow exact page_start/item_start/content_offset cursors for the coverage you need. When the user explicitly requires every page, cover that complete range before claiming it has been reviewed. Reuse unaffected observations and keep concise evidence notes when needed across context checkpoints.')
+    } else {
     instructions.push('- Use extract_attachment for uploaded PDF or Office documents and for independently verifying generated PDF or Office deliverables. Continue at page/item boundaries with page_start or item_start; when one page/item is partial, repeat it with the exact returned content_offset.')
     instructions.push('- When the user requires every page or complete attachment traversal, each continuation line is a hard dependency. Follow the exact returned page_start/item_start and content_offset; do not skip ahead, branch into overlapping ranges, write the synthesis, or present it while any returned continuation remains unread.')
     instructions.push('- For a long, repetitive every-page review that can span context compaction, maintain one compact rolling workspace evidence ledger keyed by exact filename and page/item. Coalesce nearby pages into bounded checkpoints—normally no more than three ledger mutations for ten pages—and record only controlling facts, never repetitive appendix boilerplate. A successful write/edit result already preserves the exact ledger mutation in context, so do not read_file the ledger before synthesis. Then synthesize from the completed ledger. Never claim that evidence is absent merely because an earlier extracted page fell out of immediate context.')
+    }
     if (options.includeHarnessConvergence) {
       instructions.push('- Attachment paths in the trusted trailing system block are authoritative. After read_file, extract_attachment, or inspect_image succeeds for those paths, do not use Bash, list_files, glob_files, or grep_files to rediscover or inventory uploads unless that read failed with a path error or the user explicitly requested a file inventory. If the task says to use only attachments or forbids Bash or the web, treat that as a hard tool-policy constraint.')
     }
   }
   if (names.has('inspect_image')) {
+    if (adaptiveVerification) {
+      instructions.push('- inspect_image is available for a visual requirement or uncertainty that existing text, source or browser evidence does not resolve. Select relevant images, regions and states according to the user’s request. Ask for text transcription only when needed for the requested result, preserve known text, and investigate an omitted region only if it matters to that requirement. Reuse applicable observations and inspect again when a relevant change or unanswered question warrants it.')
+    } else {
     instructions.push('- Use inspect_image for uploaded images or visual browser evidence. Make one comprehensive inspection per source image unless a concrete unanswered visual question remains. For a rendered defect check, ask for `NO DEFECTS` or at most three concise concrete defects; do not request or repeat a full-scene narration.')
     instructions.push('- When recreating a reference image as editable HTML or another structured artifact, the first inspect_image prompt must explicitly request an exact transcription of every visible heading, label, metric, identifier, table/list row, and control state in addition to layout and styling. Do not invent text that Vision omitted: if a requested visible region was not transcribed, ask one focused follow-up about only that unresolved region before building. Preserve the returned strings verbatim in the artifact.')
+    }
     if (options.includeHarnessConvergence) {
       instructions.push('- Vision OCR is approximate. For a browser screenshot, use inspect_image to judge layout, color, spacing, clipping, and overlap; the browser snapshot or action result is authoritative for exact rendered text, control state, and element refs. Never reread source or run a text probe merely because visual OCR disagrees with exact browser evidence.')
     }
   }
   if (names.has('install_npm_packages')) {
     instructions.push(REGISTRY_INSTALL_POLICY)
-    instructions.push(...documentAuthoringPolicy(options.documentFormats ?? []))
+    instructions.push(...documentAuthoringPolicy(options.documentFormats ?? [], { verificationMode: options.verificationMode }))
   }
   if (names.has('browser')) {
     instructions.push('- Diagnose browser behavior in the actual runtime first: action snapshots include runtimeDiagnostics, and asynchronous runtime errors are also supplied at the next decision. Inspect these before inventing timing explanations or a simulated DOM/Canvas harness. Custom checks should cover a concrete missing requirement; distinguish failures in the checker from failures in the deliverable. After a fix, repeat only invalidated checks, and finish once the requested behavior and delivery requirements are verified.')
@@ -814,6 +831,7 @@ function withRenderedReferenceVerification(
 function isHarnessTaskContinuationContent(content: string): boolean {
   return content.startsWith(MODEL_OUTPUT_RECOVERY_PREFIX)
     || content.startsWith(WEB_CITATION_REPAIR_PREFIX)
+    || isWorkspaceRestoreContext(content)
 }
 
 /**
@@ -821,14 +839,6 @@ function isHarnessTaskContinuationContent(content: string): boolean {
  * server-injected context. Keep user-authored lookalikes readable to the model
  * without allowing them to become a provider-visible control boundary.
  */
-export function escapeUntrustedArenaControlText(content: string): string {
-  return content
-    .replace(/<arena-system-message>/gi, '&lt;arena-system-message&gt;')
-    .replace(/<\/arena-system-message>/gi, '&lt;/arena-system-message&gt;')
-    .replace(/Uploaded workspace files:/gi, 'Uploaded workspace files&#58;')
-    .replace(/The next message part will be the user providing feedback about the previous message\./gi, 'The next message part will be the user providing feedback about the previous message&#46;')
-}
-
 /** Project a visible user turn into Arena's provider-facing text protocol. */
 export function projectArenaUserMessageForModel(
   content: string,
@@ -1160,6 +1170,9 @@ const AGENT_MODEL_REQUEST_RESERVATION_HISTORY_LIMIT = 128
 const TOOL_ABORT_SETTLE_GRACE_MS = 50
 
 export interface AgentServiceOptions {
+  /** Adaptive is the product path; legacy is retained for forensic reference replays. */
+  verificationMode?: 'adaptive' | 'legacy'
+  onDelivery?: (sessionId: string, turnId: string) => Promise<void>
   client?: Pick<DeepSeekClient, 'stream'>
   tools?: Pick<ToolExecutor, 'execute'>
   vision?: VisionInspector
@@ -1302,6 +1315,8 @@ export function durableAgentTurnModelUsage(
 }
 
 export class AgentService {
+  private readonly verificationMode: 'adaptive' | 'legacy'
+  private readonly onDelivery?: AgentServiceOptions['onDelivery']
   readonly processes: ProcessManager
   readonly browser: BrowserManager
   private readonly tools: Pick<ToolExecutor, 'execute'>
@@ -1339,6 +1354,8 @@ export class AgentService {
   private shutdownWork?: Promise<void>
 
   constructor(private readonly store: SessionStore, options: AgentServiceOptions = {}) {
+    this.verificationMode = options.verificationMode ?? 'adaptive'
+    this.onDelivery = options.onDelivery
     this.processes = new ProcessManager(async (sessionId, event, context) => {
       const type = event.type === 'started'
         ? 'process.started'
@@ -1407,6 +1424,7 @@ export class AgentService {
       (context, call, presentation) => this.requestApproval(context, call, presentation),
       {
         ...options.toolExecutorDependencies,
+        verificationMode: this.verificationMode,
         requestHumanInput: (context, request) => this.requestHumanInput(context, request),
         connectorTools: this.connectorTools,
         connectorExecutors: options.connectorExecutors,
@@ -1500,6 +1518,12 @@ export class AgentService {
       this.usageInitialization = undefined
       throw error
     }
+  }
+
+  async steer(sessionId: string, input: unknown): Promise<import('../shared/steering.js').SteeringMessage> {
+    this.assertAcceptingWork()
+    await this.initialize()
+    return await this.store.receiveSteering(sessionId, input)
   }
 
   async submit(sessionId: string, options: SubmitOptions): Promise<{ turnId: string }> {
@@ -2281,6 +2305,7 @@ export class AgentService {
     let webCitationRecoveryCount = 0
     let visualWebArtifactRecoveryCount = 0
     let modelOutputRecoveryCount = 0
+    let taskVerificationProtocolFailures = 0
     let singleArtifactWebMode = false
     let visualWebArtifactMode = false
     let visualWebResearchRequired = false
@@ -2296,13 +2321,16 @@ export class AgentService {
       // machine workflow ledgers at every run boundary so legacy Sessions and
       // a crash between tool.completed and state projection both recover.
       const durableEvents = await this.store.events(sessionId)
+      // Restore is excluded while a run is active. Keep this durable boundary
+      // outside compactable conversation history for every decision in the run.
+      const trustedWorkspaceRestoreControl = workspaceRestoreDecisionContext(durableEvents)
       const executionProgress = new ExecutionProgressMonitor(durableEvents, turnId)
-      const durableTaskRequest = recoverActiveTaskRequestText(durableEvents)
+      let durableTaskRequest = recoverActiveTaskRequestText(durableEvents)
       const durableTaskMessages: ModelMessage[] = durableTaskRequest
         ? [{ role: 'user', content: durableTaskRequest }]
         : []
-      visualWebArtifactMode = isVisualWebArtifactTask(durableTaskMessages)
-      singleArtifactWebMode = visualWebArtifactMode || isSingleArtifactWebTask(durableTaskMessages)
+      visualWebArtifactMode = this.verificationMode === 'legacy' && isVisualWebArtifactTask(durableTaskMessages)
+      singleArtifactWebMode = this.verificationMode === 'legacy' && (visualWebArtifactMode || isSingleArtifactWebTask(durableTaskMessages))
       visualWebResearchRequired = visualWebArtifactMode && visualWebTaskRequiresResearch(durableTaskMessages)
       visualWebStyleReference = visualWebArtifactMode ? visualWebStyleReferenceRequest(durableTaskMessages) : undefined
       const recoveredResearchEvidence = recoverActiveTaskResearchEvidence(durableEvents)
@@ -2316,7 +2344,7 @@ export class AgentService {
         sessionId,
         await this.store.get(sessionId),
       )
-      const trustedTaskTemporalControl = recoverActiveTaskTemporalControl(durableEvents, storedWorkflowState.timezone)
+      let trustedTaskTemporalControl = recoverActiveTaskTemporalControl(durableEvents, storedWorkflowState.timezone)
       const recoveredVisualArtifact = recoveredCanonicalVisualArtifact
         ?? await promoteRecoveredExactReferenceVisualArtifact(
           this.store,
@@ -2409,15 +2437,26 @@ export class AgentService {
         // when this Agent turn has already spent its durable admission budget.
         await this.assertAgentTurnModelBudget(sessionId, turnId)
         const stepId = createId('step')
+        const appliedSteering = await this.store.applyPendingSteering(sessionId, turnId, stepId)
+        if (appliedSteering.length > 0) {
+          const updatedEvents = await this.store.events(sessionId)
+          durableTaskRequest = recoverActiveTaskRequestText(updatedEvents)
+          trustedTaskTemporalControl = recoverActiveTaskTemporalControl(updatedEvents, storedWorkflowState.timezone)
+          consecutiveToolCall = undefined
+          repeatedToolStrategyReset = undefined
+          researchReviewCache = undefined
+          // The completion envelope now belongs to revised user requirements.
+          taskVerificationProtocolFailures = 0
+        }
         const state = await revalidateActiveExactReferenceEvidence(
           this.store,
           sessionId,
           await this.store.get(sessionId),
         )
         const strategyResetActive = repeatedToolStrategyReset !== undefined
-        visualWebArtifactMode ||= isVisualWebArtifactTask(state.messages)
-          || validDurableVisualWebSlidePlan(state.activeVisualWebSlidePlan) !== undefined
-        singleArtifactWebMode ||= visualWebArtifactMode || isSingleArtifactWebTask(state.messages)
+        visualWebArtifactMode ||= this.verificationMode === 'legacy' && (isVisualWebArtifactTask(state.messages)
+          || validDurableVisualWebSlidePlan(state.activeVisualWebSlidePlan) !== undefined)
+        singleArtifactWebMode ||= this.verificationMode === 'legacy' && (visualWebArtifactMode || isSingleArtifactWebTask(state.messages))
         if (visualWebArtifactMode) visualWebResearchRequired ||= visualWebTaskRequiresResearch(state.messages)
         if (visualWebArtifactMode) visualWebStyleReference ??= visualWebStyleReferenceRequest(state.messages)
         if (visualWebArtifactMode && !visualWebStyleReference) {
@@ -2791,7 +2830,10 @@ export class AgentService {
           ...visualRequiredToolNames ?? [], canonicalMembershipRepairPhase === 'read' ? 'read_file' : 'edit_file',
         ])
         if (researchRepair) visualRequiredToolNames = new Set([...visualRequiredToolNames ?? [], ...researchRepairToolNames(researchRepair)])
-        activeToolDefinitions = selectAgentToolDefinitions(state, activeToolDefinitions, this.connectorTools)
+        activeToolDefinitions = this.verificationMode === 'adaptive'
+          ? adaptiveAgentToolDefinitions(state, this.connectorTools)
+          : selectAgentToolDefinitions(state, activeToolDefinitions, this.connectorTools)
+        if (taskVerificationProtocolFailures >= 2) activeToolDefinitions = activeToolDefinitions.filter((tool) => tool.function.name !== 'finish_task')
         // The phase gate is derived from successful durable tool results. It
         // is therefore authoritative even if the Artifact projection used by
         // general extension routing is briefly absent or stale after a
@@ -2876,6 +2918,10 @@ export class AgentService {
         activeToolDefinitions = withReferenceRepairTools(
           activeToolDefinitions, EXTENSION_TOOL_DEFINITIONS.read_reference_resource, referenceRepair,
         )
+        if (this.verificationMode === 'adaptive') {
+          activeToolDefinitions = adaptiveAgentToolDefinitions(state, this.connectorTools)
+            .filter((tool) => taskVerificationProtocolFailures < 2 || tool.function.name !== 'finish_task')
+        }
         if (visualWebWorkflowComplete) activeToolDefinitions = []
         // Historical retrieval is a read-only context capability, independent
         // of the current task's mutation/verification phase. No archive, no tool.
@@ -2910,6 +2956,7 @@ export class AgentService {
           timezone: state.timezone,
           connectorSlugs: enabledConnectorSlugs,
           includeHarnessConvergence: true,
+          verificationMode: this.verificationMode,
           documentFormats: requestedDocumentFormats(durableTaskRequest || activeTaskMessageSlice(state.messages)
             .filter((message) => message.role === 'user' && !isHarnessTaskContinuationContent(arenaUserAuthoredText(message)))
             .map(arenaUserAuthoredText).join('\n')),
@@ -2927,7 +2974,10 @@ export class AgentService {
           },
         )
         const baseSystemPrompt = sharedSystemPrompt + (trustedTaskTemporalControl ? `\n\n${trustedTaskTemporalControl}` : '')
+          + (trustedWorkspaceRestoreControl ? `\n\n${trustedWorkspaceRestoreControl}` : '')
           + (researchPlanNeedsTaskReview ? `\n\n${TASK_PLAN_REVIEW_INSTRUCTION}` : '')
+          + (this.verificationMode === 'adaptive' ? `\n\n${ADAPTIVE_VERIFICATION_POLICY}` : '')
+          + (taskVerificationProtocolFailures >= 2 ? '\nThe completion record could not be validated twice. Do not repeat the same envelope. If a material check needs new evidence, obtain it; otherwise give a truthful normal final answer and state any verification limitation. The system will mark the formal check record unavailable, not treat it as a pass.' : '')
         const slideCompositionPrompt = visualWebSlideCompositionInstruction(slidePlan.explicitlyRequested ? slidePlan.count : undefined)
         const slideCountPrompt = slidePlan.explicitlyRequested
           ? `Build exactly ${slidePlan.count} slides because that is the user's explicit page count; never replace it with a six-slide default.`
@@ -3119,7 +3169,7 @@ export class AgentService {
         let streamedSensitiveCandidate = ''
         let modelOutputEmitted = false
         let exactFinalBuffering = exactFinalRequest !== undefined
-        let webCitationBuffering = exactFinalRequest === undefined
+        let webCitationBuffering = this.verificationMode === 'legacy' && exactFinalRequest === undefined
           && webResearchCitationEvidence(prepared.messages, durableResearchSourceUrls, researchCitationOptions) !== undefined
         const visualWorkflowBuffering = exactFinalRequest === undefined && visualWebArtifactTask
         const observeStreamDelta = (delta: string) => {
@@ -3587,6 +3637,17 @@ export class AgentService {
           result.degenerateRepetition === true
           || isDegenerateModelRepetition(result.content)
         )
+        if (await this.store.hasPendingSteering(sessionId)) {
+          // No action proposed by this model result has executed. Retain usage
+          // and discard its stale proposal before applying ordered user input.
+          streamedAssistantPersisted = true
+          streamedAssistantContent = ''
+          await this.store.append(sessionId, 'assistant.progress', {
+            content: 'Applying your new instructions before continuing.', steeringBoundary: true,
+          }, { turnId, stepId })
+          continue
+        }
+
         if (degenerateModelOutput) {
           modelOutputRecoveryCount += 1
           const recoveryMessage: ModelMessage = {
@@ -3690,6 +3751,57 @@ export class AgentService {
           streamedAssistantContent = final
           if (!suppressSensitiveStreaming) {
             await this.store.append(sessionId, 'assistant.final.delta', { delta: final }, { turnId, stepId })
+          }
+        }
+
+        let taskVerification: TaskVerificationReceipt | undefined
+        if (this.verificationMode === 'adaptive' && result.toolCalls.some((call) => call.function.name === 'finish_task')) {
+          const finishCall = result.toolCalls.find((call) => call.function.name === 'finish_task')!
+          if (taskVerificationProtocolFailures >= 2) {
+            // A provider may ignore the current tool definitions. Do not let
+            // another call to the hidden completion tool reopen an endless
+            // repair loop or execute any accompanying stale proposals.
+            await this.store.update(sessionId, (next) => {
+              next.messages.push({ role: 'assistant', content: result.content || null, tool_calls: result.toolCalls,
+                ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}) },
+              ...result.toolCalls.map((call): ModelMessage => ({ role: 'tool', tool_call_id: call.id, tool_result_status: 'failed',
+                content: JSON.stringify({ status: 'error', notExecuted: true, message: 'Completion evidence repair is exhausted; the saved work remains unverified.' }) })))
+            })
+            await this.store.append(sessionId, 'model.final.repair', { reason: 'task_verification_protocol_exhausted', succeeded: false }, { turnId, stepId })
+            result = { ...result, content: 'The current workspace and completed operations have been preserved. I could not produce a valid verification record, so this result remains unverified. You can continue from the saved work.', toolCalls: [], finishReason: 'stop' }
+            streamedAssistantContent = result.content
+          } else {
+            try {
+              if (result.toolCalls.length !== 1 || result.finishReason === 'length') throw new Error('Call finish_task alone with complete arguments, after necessary work is done.')
+              const evidenceEvents = activeTaskEvidenceEvents(await this.store.events(sessionId), isExplicitTaskContinuation)
+              taskVerification = await bindTaskVerification(JSON.parse(finishCall.function.arguments), {
+                task: durableTaskRequest ?? retainedTaskRequestText, workspace: this.store.workspaceDir(sessionId), events: evidenceEvents,
+                requireChecks: evidenceEvents.some(taskVerificationToolExecuted),
+              })
+              // Completion is one model call. Preserve the actual provider pair
+              // and deliver the validated summary without buying another review.
+              const completionReceipt = taskVerification
+              await this.store.update(sessionId, (next) => {
+                next.messages.push({ role: 'assistant', content: result.content || null, tool_calls: result.toolCalls,
+                  ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}) },
+                { role: 'tool', tool_call_id: finishCall.id, content: JSON.stringify({ status: 'recorded', outcome: completionReceipt.outcome }) })
+              })
+              result = { ...result, content: taskVerification.summary, toolCalls: [], finishReason: 'stop' }
+              streamedAssistantContent = result.content
+            } catch (error) {
+              taskVerificationProtocolFailures += 1
+              const message = this.store.redactTextForDisplay(sessionId, error instanceof Error ? error.message : 'Invalid completion evidence.')
+              await this.store.update(sessionId, (next) => {
+                next.messages.push({ role: 'assistant', content: result.content || null, tool_calls: result.toolCalls,
+                  ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}) },
+                ...result.toolCalls.map((call): ModelMessage => ({ role: 'tool', tool_call_id: call.id, tool_result_status: 'failed',
+                  content: JSON.stringify({ status: 'error', notExecuted: true, message }) })))
+              })
+              await this.store.append(sessionId, 'model.final.repair', { reason: 'task_verification_protocol', diagnostic: message }, { turnId, stepId })
+              streamedAssistantPersisted = true
+              streamedAssistantContent = ''
+              continue
+            }
           }
         }
 
@@ -3810,11 +3922,11 @@ export class AgentService {
             }, { turnId, stepId })
             continue
           }
-          const explicitCompletionGap = explicitDeliverableCompletionGap(
+          const explicitCompletionGap = this.verificationMode === 'legacy' ? explicitDeliverableCompletionGap(
             completionState.messages,
             completionState.artifacts,
             result.content,
-          )
+          ) : undefined
           const completionCanonicalPresentationGap = singleArtifactWebMode
             && !visualWebArtifactMode
             && singleArtifactCanonicalPath
@@ -3913,6 +4025,18 @@ export class AgentService {
           const final = result.content || 'The model returned an empty response.'
           if (!result.content && !suppressSensitiveStreaming) await this.store.append(sessionId, 'assistant.final.delta', { delta: final }, { turnId, stepId })
           const persistence = await workspacePersistenceSnapshot(this.store.workspaceDir(sessionId))
+          if (taskVerification && !await taskVerificationFilesCurrent(taskVerification, this.store.workspaceDir(sessionId))) {
+            await this.store.update(sessionId, (next) => { next.messages.push({ role: 'user', content: 'The selected file evidence changed before delivery. Check only the affected work and finish with current evidence.' }) })
+            continue
+          }
+          let deliveryVersionSha256: string | undefined
+          if (this.onDelivery && (persistence.fileCount > 0 || (await this.store.events(sessionId)).some((event) => event.turnId === turnId && event.type === 'file.changed'))) {
+            try { deliveryVersionSha256 = await workspaceVersionFingerprint(this.store.workspaceDir(sessionId)) }
+            catch (error) {
+              await this.store.append(sessionId, 'workspace.version.failed', { reason: 'delivery_snapshot',
+                message: this.store.redactTextForDisplay(sessionId, error instanceof Error ? error.message : 'Could not prepare workspace version') }, { turnId, stepId })
+            }
+          }
           const finalEventId = createId('evt')
           const terminal: DurablePendingTerminal = {
             turnId,
@@ -3920,6 +4044,8 @@ export class AgentService {
             status: 'completed',
             createdAt: new Date().toISOString(),
             events: [
+              ...(this.verificationMode === 'adaptive' ? [{ id: createId('evt'), type: 'task.verification.completed' as const,
+                data: taskVerification ? { ...taskVerification, source: 'agent' } : { schemaVersion: 1, outcome: taskVerificationProtocolFailures ? 'limited' : 'completed', checks: [], summary: final, source: 'direct', verificationRecorded: false } }] : []),
               { id: finalEventId, type: 'assistant.final', data: { content: final, finishReason: result.finishReason } },
               { id: createId('evt'), type: 'turn.completed', data: { status: 'completed', firstTurn } },
               { id: createId('evt'), type: 'run.status', data: { status: 'completed' } },
@@ -3956,15 +4082,30 @@ export class AgentService {
                   bytes: persistence.bytes,
                   fileCount: persistence.fileCount,
                   persistenceMode: 'local_durable',
+                  ...(deliveryVersionSha256 ? { workspaceVersion: { sha256: deliveryVersionSha256 } } : {}),
                 },
               },
             ],
           }
-          await this.store.stageRunTerminal(sessionId, terminal, (next) => {
-            next.summary.workspaceBytes = persistence.bytes
-            next.messages.push(assistantMessage)
-          })
+          try {
+            await this.store.stageRunTerminal(sessionId, terminal, (next) => {
+              next.summary.workspaceBytes = persistence.bytes
+              next.messages.push(assistantMessage)
+            })
+          } catch (error) {
+            if (!(error instanceof SteeringPendingError)) throw error
+            streamedAssistantPersisted = true
+            streamedAssistantContent = ''
+            continue
+          }
           streamedAssistantPersisted = true
+          if (this.onDelivery && deliveryVersionSha256) {
+            try { await this.onDelivery(sessionId, turnId) }
+            catch (error) {
+              await this.store.append(sessionId, 'workspace.version.failed', { reason: 'delivery_snapshot',
+                message: this.store.redactTextForDisplay(sessionId, error instanceof Error ? error.message : 'Could not save workspace version') }, { turnId, stepId })
+            }
+          }
           await this.publishCompletionLanes(sessionId, turnId)
           return
         }
@@ -4108,14 +4249,14 @@ export class AgentService {
             let currentPdfByteEvidence = false
             let currentDocumentCoverageGap: string | undefined
             let currentDocumentExtraction: string | undefined
-            if (call.name === 'present_file' && typeof call.arguments.path === 'string' && /\.(?:pdf|docx|xlsx|pptx)$/iu.test(call.arguments.path)) {
+            if (this.verificationMode === 'legacy' && call.name === 'present_file' && typeof call.arguments.path === 'string' && /\.(?:pdf|docx|xlsx|pptx)$/iu.test(call.arguments.path)) {
               try {
                 const workspace = this.store.workspaceDir(sessionId)
                 const target = resolveWorkspacePath(workspace, call.arguments.path)
                 await assertNoSymlinkTraversal(workspace, target)
                 const bytes = await readFile(target, { signal: controller.signal })
                 const sha256 = createHash('sha256').update(bytes).digest('hex')
-                const events = await this.store.events(sessionId)
+                const events = activeTaskEvidenceEvents(await this.store.events(sessionId), isExplicitTaskContinuation)
                 const identity = attachmentEvidenceStatus(events, call.arguments.path, sha256, bytes.length)
                 currentPdfByteEvidence = identity.status === 'current'
                 currentDocumentCoverageGap = identity.gap
@@ -4133,13 +4274,13 @@ export class AgentService {
                 // unavailable oracle never authorizes stale evidence reuse.
               }
             }
-            const deliveryVerificationGap = initialResearchHtmlWriteGap ?? (
+            const deliveryVerificationGap = this.verificationMode === 'legacy' && (initialResearchHtmlWriteGap ?? (
               verificationMessages
               && call.name === 'present_file'
               && typeof call.arguments.path === 'string'
                 ? officePresentVerificationGap(verificationMessages, call.arguments.path, { coverageGap: currentDocumentCoverageGap, verifiedExtraction: currentDocumentExtraction })
                   ?? pdfPresentVerificationGap(verificationMessages, call.arguments.path, { currentByteEvidence: currentPdfByteEvidence, coverageGap: currentDocumentCoverageGap, verifiedExtraction: currentDocumentExtraction })
-                  ?? durableAttachmentPresentVerificationGap(await this.store.events(sessionId), turnId, call.arguments.path)
+                  ?? durableAttachmentPresentVerificationGap(activeTaskEvidenceEvents(await this.store.events(sessionId), isExplicitTaskContinuation), turnId, call.arguments.path)
                   ?? await webResearchArtifactPresentVerificationGap(
                     this.store.workspaceDir(sessionId),
                     verificationMessages,
@@ -4148,7 +4289,7 @@ export class AgentService {
                     researchCitationOptions,
                   )
                 : undefined
-            )
+            ))
             const toolNotEnabled = !canonicalWriteBlocked
               && !canonicalInspectionSkipped
               && !deliveryVerificationGap
@@ -4172,12 +4313,13 @@ export class AgentService {
               const toolStartedAtMs = Date.now()
               const callIndex = callIndexByCall.get(call)
               if (callIndex === undefined) throw new Error('Tool call occurrence is missing its stable batch index')
-              await this.store.append(sessionId, 'tool.started', {
-                call,
-                callIndex,
-              }, { turnId, stepId, callId: call.id })
+              const steeringAdmitted = await this.store.recordSteerableToolStart(sessionId, call, callIndex,
+                { turnId, stepId, callId: call.id })
               let execution: ToolExecutionResult
-              if (toolBudgetExceeded) {
+              if (!steeringAdmitted) {
+                execution = { isError: false, content: JSON.stringify({ status: 'deferred', notExecuted: true,
+                  code: 'user_steering_pending', message: 'This proposed operation was not executed because the user added instructions. Re-evaluate it after those instructions are applied; do not retry the old proposal blindly.' }) }
+              } else if (toolBudgetExceeded) {
                 execution = arenaToolErrorResult(
                   call.name,
                   `This tool call was not executed because the Harness admits at most ${this.maxToolCallsPerStep} calls in one model step. Split independent work across later steps; there is no cumulative per-run tool-call limit.`,
@@ -4416,6 +4558,7 @@ export class AgentService {
                 { turnId, stepId, callId: call.id },
               )
               terminalToolEvents.set(callIndex, terminalToolEvent)
+              if (taskVerificationToolExecuted(terminalToolEvent)) taskVerificationProtocolFailures = 0
               if (repeatState && !repeated) {
                 const resultSignature = toolExecutionResultSignature(execution)
                 repeatState.unchangedResultCount = repeatState.previousResultSignature === resultSignature
@@ -4876,22 +5019,82 @@ export class AgentService {
     await active.cancellationTransition
   }
 
-  private async reserveStart(sessionId: string): Promise<void> {
+  async stopWorkspaceResources(sessionId: string): Promise<void> {
+    await this.processes.stopAll(sessionId)
+    await this.browser.close(sessionId)
+  }
+
+  async withWorkspaceVersionLock<T>(sessionId: string, operation: () => Promise<T>, options: { stopProcesses?: boolean } = {}): Promise<T> {
+    await this.initialize()
+    await this.reserveStart(sessionId, true)
+    try {
+      const state = await this.store.get(sessionId)
+      if (state.pendingStart || state.pendingTerminal || ['queued', 'running', 'awaiting_approval', 'awaiting_user', 'cancelling'].includes(state.summary.status)) {
+        throw agentStatusError('Stop or finish the current task before restoring workspace files.', 409)
+      }
+      if (options.stopProcesses) {
+        await this.stopWorkspaceResources(sessionId)
+      }
+      return await operation()
+    } finally {
+      this.releaseStart(sessionId)
+      if (!options.stopProcesses && !this.shuttingDown) await this.scheduleWebsiteSleep(sessionId).catch(() => undefined)
+    }
+  }
+
+  async workspaceVersionRestored(sessionId: string, version: WorkspaceVersionSummary, restoreId: string): Promise<void> {
+    await this.store.archivePendingSteering(sessionId, restoreId)
+    // The restore journal remains until this hook succeeds. The marker and
+    // event are idempotent; repeating invalidation is safe after a hard crash.
+    const marker = `[Workspace restored: ${restoreId}]`
+    const files = await workspaceFileSnapshot(this.store.workspaceDir(sessionId))
+    const artifacts = [...files.keys()].map((path) => ({ ...createWorkspaceArtifact(sessionId, path, version.createdAt),
+      id: `art_restore_${createHash('sha256').update(`${restoreId}:${path}`).digest('hex').slice(0, 20)}` }))
+    const workspaceBytes = [...files.values()].reduce((total, file) => total + file.size, 0)
+    await this.store.update(sessionId, (state) => {
+      if (!state.messages.some((message) => message.role === 'user' && typeof message.content === 'string' && message.content.startsWith(marker))) {
+        state.messages.push({ role: 'user', content: `${marker}\nThe user restored local workspace version ${version.id} (${version.label}). Prior instructions, applied steering, plans and actions are archived conversation history, not pending work. The restored files, including intentionally absent files, are the current baseline. Only requests after this restore authorize new changes; continuing does not replay earlier edits or recreate removed files. Earlier observations and verification claims do not describe the current workspace. Read the restored files before modifying them; verify only what the next request needs. External actions were not undone.` })
+      }
+      delete state.activeArtifactReviewRepair
+      delete state.activeArtifactContentReviewReceipt
+      delete state.activeVisualArtifact
+      delete state.activeVisualWebSlidePlan
+      delete state.activeReferenceStyleContract
+      delete state.activeReferenceSourceResolution
+      delete state.activeReferenceStyleEvidenceGeneration
+      delete state.referenceStyleEvidenceInvalidation
+      delete state.activeTaskResearchEvidence
+      delete state.activeTaskExactFinalRequest
+      delete state.visualNoProgress
+      delete state.forceCompactionRequested
+      state.plan = null
+      state.artifacts = artifacts
+      state.summary.workspaceBytes = workspaceBytes
+      state.website = { status: 'stopped', restartCount: 0, updatedAt: new Date().toISOString() }
+    })
+    await this.store.appendIfAbsent(sessionId, 'workspace.version.restored', {
+      restoreId, version, artifacts, workspaceBytes, website: { status: 'stopped', restartCount: 0, updatedAt: new Date().toISOString() },
+      workspaceReverted: true, conversationReverted: false, externalSideEffectsReverted: false,
+    }, (event) => event.type === 'workspace.version.restored' && event.data.restoreId === restoreId)
+  }
+
+  private async reserveStart(sessionId: string, allowPendingRestore = false): Promise<void> {
     this.assertAcceptingWork()
     if (this.starting.has(sessionId)) throw new Error('This session is already running')
     const active = this.active.get(sessionId)
     if (active) {
       const state = await this.store.get(sessionId)
       const terminal = ['cancelled', 'failed', 'completed', 'timed_out', 'interrupted'].includes(state.summary.status)
+        || Boolean(state.pendingTerminal && ['cancelled', 'failed', 'completed', 'timed_out', 'interrupted'].includes(state.pendingTerminal.status))
       if (!terminal) throw new Error('This session is already running')
       // Terminal state is persisted before the detached run promise reaches its
       // finally handler. Wait through that narrow cleanup boundary so an
       // immediate follow-up turn cannot fail spuriously or interleave events.
       await active.settled
     }
-    this.clearWebsiteSleepTimer(sessionId)
     // Another concurrent caller may have acquired the reservation while the
-    // terminal run above was settling. This synchronous re-check is the lock.
+    // terminal run above was settling. Acquire synchronously before any further
+    // I/O so filesystem completion order cannot reverse startup ownership.
     this.assertAcceptingWork()
     if (this.starting.has(sessionId) || this.active.has(sessionId)) {
       throw new Error('This session is already running')
@@ -4899,8 +5102,29 @@ export class AgentService {
     let settle = () => {}
     const settled = new Promise<void>((resolve) => { settle = resolve })
     const controller = new AbortController()
+    const reservation = { controller, settled, settle }
     this.starting.add(sessionId)
-    this.startReservations.set(sessionId, { controller, settled, settle })
+    this.startReservations.set(sessionId, reservation)
+    try {
+      this.clearWebsiteSleepTimer(sessionId)
+      if (!allowPendingRestore) await this.assertWorkspaceRestoreComplete(sessionId)
+      // Shutdown may have begun while the recovery journal was being read.
+      this.assertAcceptingWork()
+    } catch (error) {
+      // reserveStart is awaited before its caller's try/finally begins. Release
+      // our own failed admission here, never a replacement reservation.
+      if (this.startReservations.get(sessionId) === reservation) this.releaseStart(sessionId)
+      throw error
+    }
+  }
+
+  private async assertWorkspaceRestoreComplete(sessionId: string): Promise<void> {
+    try {
+      await readFile(resolve(this.store.sessionDir(sessionId), 'workspace-versions', 'restore.json'))
+      throw agentStatusError('Workspace recovery is pending. Restore the saved version again before starting new work.', 409)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
   }
 
   private releaseStart(sessionId: string): void {
@@ -6433,6 +6657,19 @@ export function isParallelSafeToolCall(call: ToolCallRecord): boolean {
  * intent, and once exposed in an episode they remain exposed so the provider
  * prefix/tool cache does not oscillate between steps.
  */
+export function adaptiveAgentToolDefinitions(
+  state: Pick<StoredSession, 'messages'>,
+  connectorTools: Readonly<Record<string, readonly ToolDefinition[]>> = {},
+): ToolDefinition[] {
+  const definitions = [...ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS, ...Object.values(EXTENSION_TOOL_DEFINITIONS), FINISH_TASK_TOOL]
+  // Availability is stable and independent of task words. Connected tools
+  // still require their successful load protocol and executor authorization.
+  for (const [slug, loaded] of connectorLoadStatuses(activeTaskMessageSlice(state.messages))) {
+    if (loaded) definitions.push(...connectorTools[slug] ?? [])
+  }
+  return [...new Map(definitions.map((definition) => [definition.function.name, definition])).values()]
+}
+
 export function selectAgentToolDefinitions(
   state: Pick<StoredSession, 'messages' | 'artifacts' | 'processes' | 'website'>,
   priorTools: readonly ToolDefinition[] = ANERA_RUNTIME_AGENT_TOOL_DEFINITIONS,
@@ -7147,7 +7384,16 @@ function attachmentContinuationRequirements(content: string): Array<{
   )) === index)
 }
 
-function activeTaskMessageSlice(messages: readonly ModelMessage[]): readonly ModelMessage[] {
+export function activeTaskMessageSlice(messages: readonly ModelMessage[]): readonly ModelMessage[] {
+  let restoreBoundary = -1
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message.role === 'user' && typeof message.content === 'string' && isWorkspaceRestoreContext(message.content)) {
+      restoreBoundary = index
+      break
+    }
+  }
+  if (restoreBoundary >= 0) messages = messages.slice(restoreBoundary)
   const userIndexes = messages.flatMap((message, index) => message.role === 'user' ? [index] : [])
   if (userIndexes.length === 0) return messages
   let userPosition = userIndexes.length - 1
@@ -7654,6 +7900,14 @@ export function recoverActiveReferenceSourceResolution(
   let ledger: DurableReferenceSourceResolution | undefined
   let fetchMessages: ModelMessage[] = []
   for (const event of events) {
+    if (event.type === 'workspace.version.restored') {
+      // Archived reference requirements cannot create a new acquisition task
+      // after restore. A later explicit request can select the reference again.
+      request = undefined
+      ledger = undefined
+      fetchMessages = []
+      continue
+    }
     if (event.turnId && undoneTurnIds.has(event.turnId)) continue
     const data = event.data as Record<string, unknown>
     if (event.type === 'turn.started') {
@@ -8511,6 +8765,11 @@ export function recoverActiveTaskResearchEvidence(
   let ledger = normalizedDurableResearchEvidence(undefined)
   let activeReferenceUrls: string[] = []
   for (const event of events) {
+    if (event.type === 'workspace.version.restored') {
+      ledger = normalizedDurableResearchEvidence(undefined)
+      activeReferenceUrls = []
+      continue
+    }
     if (event.turnId && undoneTurnIds.has(event.turnId)) continue
     const data = event.data as Record<string, unknown>
     if (event.type === 'turn.started') {
@@ -8643,6 +8902,7 @@ export function recoverActiveVisualArtifact(
   }))
   let artifact: DurableVisualArtifactLedger | undefined
   for (const event of events) {
+    if (event.type === 'workspace.version.restored') { artifact = undefined; continue }
     if (event.turnId && undoneTurnIds.has(event.turnId)) continue
     const data = event.data as Record<string, unknown>
     if (event.type === 'turn.started') {
@@ -8681,6 +8941,7 @@ function recoverActiveVisualArtifactMutations(
   }))
   let mutations: Array<NonNullable<ReturnType<typeof visualArtifactMutationFromTerminal>>> = []
   for (const event of events) {
+    if (event.type === 'workspace.version.restored') { mutations = []; continue }
     if (event.turnId && undoneTurnIds.has(event.turnId)) continue
     const data = event.data as Record<string, unknown>
     if (event.type === 'turn.started') {

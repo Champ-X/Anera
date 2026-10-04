@@ -50,7 +50,8 @@ describe('research phase control', () => {
     const execute = vi.fn(async (call: { name: string }) => ({ isError: false,
       content: JSON.stringify(call.name === 'fetch_page' ? { status: 'success', url, content } : { status: 'success', brief }),
     }))
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: '看看最近一周娱乐新闻，制作中文 HTML Slides。', timezone: 'Asia/Shanghai' })
       for (let attempt = 0; attempt < 500 && agent.isRunning(session.summary.id); attempt += 1) {

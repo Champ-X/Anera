@@ -9,8 +9,8 @@ import { SessionStore } from './session-store.js'
 describe('domain context selection in the actual Agent request', () => {
   it.each([
     ['Install the pinned npm dependency vite@5.4.19 and run the build.', undefined],
-    ['Create and present budget.xlsx.', 'XLSX API guidance'],
-    ['Create and present brief.pdf.', 'PDF API guidance'],
+    ['Create and present budget.xlsx.', 'XLSX API reference'],
+    ['Create and present brief.pdf.', 'PDF API reference'],
   ])('does not inject unrelated artifact recipes for %s', async (request, expected) => {
     const root = await mkdtemp(join(tmpdir(), 'anera-domain-context-'))
     const store = new SessionStore(root, 'test-model')
@@ -27,10 +27,12 @@ describe('domain context selection in the actual Agent request', () => {
       await vi.waitFor(() => expect(agent.isRunning(session.summary.id)).toBe(false), { timeout: 5_000, interval: 10 })
       const system = messages.filter((message) => message.role === 'system').map((message) => message.content).join('\n')
       expect(system).toContain('Lifecycle scripts, audit, and funding calls are disabled')
-      for (const label of ['PDF API guidance', 'DOCX API guidance', 'XLSX API guidance', 'PPTX API guidance']) {
+      for (const label of ['PDF API reference', 'DOCX API reference', 'XLSX API reference', 'PPTX API reference']) {
         expect(system.includes(label)).toBe(label === expected)
       }
       expect(system).not.toContain('at most three generator executions')
+      expect(system).not.toContain('OFFICE VERIFICATION FAILED')
+      expect(system).not.toContain('Consume its continuations and compare parsed structure')
       expect(system).not.toContain('For Letter width 612 and SAFE 48')
     } finally { await agent.shutdown(); await rm(root, { recursive: true, force: true }) }
   })

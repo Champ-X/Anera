@@ -1278,38 +1278,71 @@ describe('browser manager', () => {
       ]))
 
     // Keep the same four real layout variants used by the AI-weekly-news
-    // regression. Copy is deliberately collapsed to tiny localized strings so
+    // regression. Headings and list copy are collapsed to localized strings so
     // content-owned natural block height cannot masquerade as style drift.
     // The last metric also changes from negative to positive: Chromium folds
     // currentColor into the computed value of an invisible `border: none`,
     // which must not create a false mismatch.
-    const validSix = keepBlueProfessionalSlides(source, [0, 1, 2, 4, 7, 9])
+    const contentHeavySix = keepBlueProfessionalSlides(source, [0, 1, 2, 4, 7, 9])
       .replace(/(<h2>)[\s\S]*?(<\/h2>)/gu, '$1短标题$2')
       .replace(/(<div class="metric-(?:label|desc)">)[\s\S]*?(<\/div>)/gu, '$1短$2')
       .replace(/(<li>)[\s\S]*?(<\/li>)/gu, '$1短$2')
       .replace(/(<div class="step-(?:title|desc)">)[\s\S]*?(<\/div>)/gu, '$1短$2')
       .replace('metric-change negative', 'metric-change positive')
-    await manager.open('blue-real-six', `data:text/html,${encodeURIComponent(validSix)}`)
+    // The shorter agenda fits the compact viewport. The original metrics
+    // support rows and split citation still intersect navigation at 480x300:
+    // matching the real source CSS must not certify those content defects.
+    const localizedSix = contentHeavySix
+      .replace(/(<h3>)[\s\S]*?(<\/h3>)/gu, '$1短$2')
+      .replace(/(<p>)[\s\S]*?(<\/p>)/gu, '$1短$2')
+    await manager.open('blue-real-six', `data:text/html,${encodeURIComponent(localizedSix)}`)
     await manager.press('blue-real-six', 'ArrowRight')
-    const valid = await manager.verifyRenderedReferenceStyle('blue-real-six', renderProfile, 'content')
-    expect(valid, valid.violations.join('\n')).toMatchObject({
-      fidelity: 'pass',
-      score: 100,
+    const localized = await manager.verifyRenderedReferenceStyle('blue-real-six', renderProfile, 'content')
+    expect(localized, localized.violations.join('\n')).toMatchObject({
+      fidelity: 'mismatch',
+      observationGapCount: 0,
       interiorAttestation: {
         candidateSlides: 4,
-        matchedSlides: 4,
+        matchedSlides: 2,
         referenceVariants: 8,
         slides: [
-          { slideIndex: 1, matchedVariant: '.layout-agenda', fidelity: 'pass' },
-          { slideIndex: 2, matchedVariant: '.layout-metrics', fidelity: 'pass' },
-          { slideIndex: 3, matchedVariant: '.layout-split', fidelity: 'pass' },
-          { slideIndex: 4, matchedVariant: '.layout-timeline', fidelity: 'pass' },
+          { slideIndex: 1, layoutSelector: '.layout-agenda', matchedVariant: '.layout-agenda', fidelity: 'pass' },
+          { slideIndex: 2, layoutSelector: '.layout-metrics', fidelity: 'mismatch' },
+          { slideIndex: 3, layoutSelector: '.layout-split', fidelity: 'mismatch' },
+          { slideIndex: 4, layoutSelector: '.layout-timeline', matchedVariant: '.layout-timeline', fidelity: 'pass' },
         ],
       },
     })
-    expect(valid.violations).toEqual([])
+    const compactSurfaces = localized.surfaceAttestations!
+    expect(compactSurfaces.map((surface) => surface.phase)).toEqual([
+      'content', 'content slide 2', 'content slide 3', 'content slide 4', 'content slide 5',
+    ])
+    for (const surface of compactSurfaces) {
+      expect(surface).toMatchObject({ viewport: { width: 480, height: 300 }, restored: true, observationGaps: 0 })
+    }
+    expect(compactSurfaces.filter((surface) => surface.checked !== surface.matched).map((surface) => surface.phase))
+      .toEqual(['content slide 3', 'content slide 4'])
+    expect(localized.violations).toEqual([
+      expect.stringMatching(/content slide 3 \(\.layout-metrics\): render content slide 3 compact surface 480x300 external controls intercept.*"text":"短".*"control":"button Previous slide"/u),
+      expect.stringMatching(/content slide 4 \(\.layout-split\): render content slide 4 compact surface 480x300 external controls intercept.*Senior PM, multi-strategy fund.*"control":"button Previous slide"/u),
+    ])
+    expect(localized.checked - localized.matched).toBe(2)
+    // Keep a full-size positive assertion independently of the two real compact
+    // failures: every design-viewport style and restoration check must match.
+    const compactChecked = compactSurfaces.reduce((sum, surface) => sum + surface.checked, 0)
+    const compactMatched = compactSurfaces.reduce((sum, surface) => sum + surface.matched, 0)
+    expect(localized.checked - compactChecked).toBeGreaterThan(0)
+    expect(localized.matched - compactMatched).toBe(localized.checked - compactChecked)
 
-    const stackedVariant = validSix.replace(
+    // Preserve the real compact-surface defect as a negative case: a source
+    // style match must not waive content intercepted by navigation controls.
+    await manager.open('blue-real-overlong', `data:text/html,${encodeURIComponent(contentHeavySix)}`)
+    await manager.press('blue-real-overlong', 'ArrowRight')
+    const overlong = await manager.verifyRenderedReferenceStyle('blue-real-overlong', renderProfile, 'content')
+    expect(overlong.fidelity).toBe('mismatch')
+    expect(overlong.violations.join('\n')).toMatch(/compact surface 480x300 external controls intercept.*Strategic Recommendations/iu)
+
+    const stackedVariant = localizedSix.replace(
       'slide layout-agenda',
       'slide layout-agenda layout-metrics',
     )
@@ -1323,7 +1356,7 @@ describe('browser manager', () => {
       /content slide 2 stacks alternative reference layout variants \.layout-agenda, \.layout-metrics/iu,
     )
 
-    const shiftedFlowDecoration = validSix.replace(
+    const shiftedFlowDecoration = localizedSix.replace(
       '</head>',
       '<style>html body .layout-timeline .step-circle{position:relative!important;top:90px!important}</style></head>',
     )
@@ -1335,7 +1368,7 @@ describe('browser manager', () => {
     expect(shiftedFlowVerification.fidelity).toBe('mismatch')
     expect(shiftedFlowVerification.violations.join('\n')).toMatch(/layout-timeline \.step-circle.*top/iu)
 
-    const driftedThirdPage = validSix.replace(
+    const driftedThirdPage = localizedSix.replace(
       '</head>',
       '<style>html body .layout-metrics .metrics-row{display:block!important}</style></head>',
     )
@@ -1343,7 +1376,7 @@ describe('browser manager', () => {
     await manager.press('blue-real-drift', 'ArrowRight')
     const drift = await manager.verifyRenderedReferenceStyle('blue-real-drift', renderProfile, 'content')
     expect(drift.fidelity).toBe('mismatch')
-    expect(drift.interiorAttestation).toMatchObject({ candidateSlides: 4, matchedSlides: 3 })
+    expect(drift.interiorAttestation).toMatchObject({ candidateSlides: 4, matchedSlides: 2 })
     expect(drift.violations.join('\n')).toMatch(/content slide 3.*layout-metrics.*(?:display|size|position)/iu)
   }, 75_000)
 

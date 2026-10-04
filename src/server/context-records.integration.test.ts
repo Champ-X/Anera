@@ -103,7 +103,7 @@ describe('retrievable provider context', () => {
     const store = new SessionStore(root,'offline-model'); await store.initialize(); const {summary} = await store.create()
     const stream = vi.fn(async (_options: unknown) => ({ content:'Done',reasoningContent:'',toolCalls:[],finishReason:'stop',
       usage:{promptTokens:4_100_000,completionTokens:1,totalTokens:4_100_001,cachedPromptTokens:0},modelCallCount:1 }))
-    const agent = new AgentService(store,{client:{stream} as never,maxAgentTotalTokensPerTurn:0})
+    const agent = new AgentService(store,{client:{stream} as never,maxAgentTotalTokensPerTurn:0,maxAgentModelRequestsPerTurn:96})
     try {
       const pending = {modelRequests:1,totalTokens:4_121_743}
       expect(await agent['assertAgentTurnModelBudget'](summary.id,'turn_test',pending)).toEqual(pending)

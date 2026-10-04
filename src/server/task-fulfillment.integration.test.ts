@@ -52,7 +52,8 @@ describe('AgentService task fulfillment admission', () => {
       return { ...modelResult(''), content: '', finishReason: 'tool_calls', toolCalls: [{ id: 'write', type: 'function',
         function: { name: 'write_file', arguments: JSON.stringify({ path: 'report.html', content: html }) } }] }
     }
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute: async (call: ToolCallRecord) => {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute: async (call: ToolCallRecord) => {
       expect(call.name).toBe('write_file')
       await writeFile(resolve(store.workspaceDir(id), 'report.html'), html)
       return { content: JSON.stringify({ status: 'success', path: 'report.html', hash: hash(html), canonical_html: true }), isError: false }
@@ -137,7 +138,8 @@ describe('AgentService task fulfillment admission', () => {
       return { ...modelResult(''), content: '', finishReason: 'tool_calls', toolCalls: [{ id: call.id, type: 'function',
         function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] }
     }
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute: async (call: ToolCallRecord) => {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute: async (call: ToolCallRecord) => {
       executed.push(call.id)
       if (call.name === 'read_file') return { content: JSON.stringify({ kind: 'text', content: html, hasMore: false }), isError: false }
       expect(['write_file', 'edit_file']).toContain(call.name)

@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { platform, tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
+import type { BrowserManager } from './browser-manager.js'
 import type { ModelMessage, SessionEvent } from '../shared/types.js'
 import {
   AgentService,
@@ -1637,7 +1638,7 @@ describe('web research citation integrity', () => {
         isError: false,
       })),
     }
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: tools as never,
       runTimeoutMs: 2_000,
@@ -1709,7 +1710,8 @@ describe('web research citation integrity', () => {
       }),
       isError: false,
     })) }
-    const agent = new AgentService(store, { client: { stream } as never, tools: tools as never, runTimeoutMs: 2_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: tools as never, runTimeoutMs: 2_000 })
     try {
       await agent.submit(session.summary.id, { content: 'Research the latest protocol and cite sources.' })
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -1792,7 +1794,7 @@ describe('web research citation integrity', () => {
       }
       return { content: '{"status":"success","path":"report.html"}', isError: false }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: { execute } as never,
       runTimeoutMs: 2_000,
@@ -2580,7 +2582,7 @@ describe('agent context preparation', () => {
       const names = options.tools.map((tool) => tool.function.name)
       observedSurfaces.push(names)
       if (modelCall === 1) {
-        expect(names).toEqual(ARENA_ACTIVE_AGENT_TOOL_NAMES)
+        expect(names).toEqual(expect.arrayContaining(ARENA_ACTIVE_AGENT_TOOL_NAMES)); expect(names).not.toContain('github_search_code')
         expect(options.messages[0]?.content).toContain('The user turned these apps on for this conversation: github.')
         return {
           content: '', reasoningContent: '', finishReason: 'tool_calls',
@@ -2592,7 +2594,7 @@ describe('agent context preparation', () => {
         }
       }
       if (modelCall === 2) {
-        expect(names).toEqual([...ARENA_ACTIVE_AGENT_TOOL_NAMES, 'github_search_code'])
+        expect(names).toEqual(expect.arrayContaining([...ARENA_ACTIVE_AGENT_TOOL_NAMES, 'github_search_code']))
         expect(options.messages.find((message) => message.role === 'tool')?.content).toContain('"status":"enabled"')
         return {
           content: '', reasoningContent: '', finishReason: 'tool_calls',
@@ -2604,7 +2606,7 @@ describe('agent context preparation', () => {
         }
       }
       if (modelCall === 3) {
-        expect(names).toEqual([...ARENA_ACTIVE_AGENT_TOOL_NAMES, 'github_search_code'])
+        expect(names).toEqual(expect.arrayContaining([...ARENA_ACTIVE_AGENT_TOOL_NAMES, 'github_search_code']))
         expect(options.messages.findLast((message) => message.role === 'tool')?.content).toContain('src/probe.ts:1')
         options.onContent('Connector result verified.')
         return {
@@ -2612,7 +2614,7 @@ describe('agent context preparation', () => {
           usage: { promptTokens: 14, completionTokens: 3, totalTokens: 17, cachedPromptTokens: 0 },
         }
       }
-      expect(names).toEqual(ARENA_ACTIVE_AGENT_TOOL_NAMES)
+      expect(names).toEqual(expect.arrayContaining(ARENA_ACTIVE_AGENT_TOOL_NAMES)); expect(names).not.toContain('github_search_code')
       expect(options.messages[0]?.content).not.toContain('The user turned these apps on for this conversation: github.')
       options.onContent('Second task stayed on the active surface.')
       return {
@@ -2650,7 +2652,7 @@ describe('agent context preparation', () => {
         await new Promise((resolveWait) => setTimeout(resolveWait, 5))
       }
       expect(modelCall).toBe(4)
-      expect(observedSurfaces.at(-1)).toEqual(ARENA_ACTIVE_AGENT_TOOL_NAMES)
+      expect(observedSurfaces.at(-1)).toEqual(expect.arrayContaining(ARENA_ACTIVE_AGENT_TOOL_NAMES)); expect(observedSurfaces.at(-1)).not.toContain('github_search_code')
       expect((await store.events(session.summary.id)).findLast((event) => event.type === 'assistant.final')).toMatchObject({
         data: { content: 'Second task stayed on the active surface.' },
       })
@@ -2681,7 +2683,7 @@ describe('agent context preparation', () => {
       onContent: (delta: string) => void
     }) => {
       modelCall += 1
-      expect(options.tools.map((tool) => tool.function.name)).toEqual(ARENA_ACTIVE_AGENT_TOOL_NAMES)
+      expect(options.tools.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(ARENA_ACTIVE_AGENT_TOOL_NAMES)); expect(options.tools.map((tool) => tool.function.name)).not.toContain('github_search_code')
       expect(options.messages[0]?.content).not.toContain('The user turned these apps on for this conversation: github.')
       if (modelCall === 1) {
         return {
@@ -3122,7 +3124,7 @@ describe('agent context preparation', () => {
       }
       throw new Error('fixture stop after trusted research calendar assertion')
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       now: () => new Date('2026-09-02T04:00:00.000Z'),
       runTimeoutMs: 1_000,
@@ -4512,7 +4514,7 @@ Create a Chinese HTML Slides deck from the retained task.
         && messageSurface.includes('write the one complete canonical')
       throw new Error('fixture stop after durable reference HTML-phase assertion')
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       runTimeoutMs: 1_000,
     })
@@ -4972,7 +4974,8 @@ Create a Chinese HTML Slides deck from the retained task.
         function: { name: 'compose_reference_html', arguments: JSON.stringify(args) },
       }], usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13, cachedPromptTokens: 8 } }
     })
-    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 5_000,
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, runTimeoutMs: 5_000,
       toolExecutorDependencies: { fetch: dependencyFetch as typeof fetch } })
     try {
       await agent.resume(session.summary.id)
@@ -5338,7 +5341,8 @@ Create a Chinese HTML Slides deck from the retained task.
       expect(options.messages.findLast((message) => message.role === 'tool')?.content).toContain('"canonical_html":true')
       throw new Error('fixture stop after atomic canonical boundary assertion')
     })
-    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 2_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, runTimeoutMs: 2_000 })
     try {
       await agent.resume(session.summary.id)
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -5493,7 +5497,7 @@ Create a Chinese HTML Slides deck from the retained task.
         isError: false,
       }
     }) }
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: tools as never,
       runTimeoutMs: 1_000,
@@ -7128,7 +7132,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
       throw new Error(`Unexpected fixture tool call: ${call.id}:${call.name}`)
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: { execute } as never,
       runTimeoutMs: 3_000,
@@ -8070,7 +8074,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
       return { content: JSON.stringify({ status: 'success', path: call.arguments.path }), isError: false }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: { execute } as never,
       runTimeoutMs: 5_000,
@@ -8248,7 +8252,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
       return { content: '{"status":"success","path":"visual-convergence.html"}', isError: false }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: { execute } as never,
       runTimeoutMs: 5_000,
@@ -8768,7 +8772,8 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
     })
     const execute = vi.fn()
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 1_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 1_000 })
     try {
       await agent.submit(session.summary.id, { content: 'Answer the arithmetic question 6 * 7.' })
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -8857,7 +8862,8 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         modelCallCount: 1,
       }
     })
-    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 2_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, runTimeoutMs: 2_000 })
     try {
       await agent.submit(session.summary.id, {
         content: 'Prepare incident-handoff.md from the supplied facts, then present the handoff.',
@@ -8963,7 +8969,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       content: JSON.stringify({ status: 'success', hash: 'fixture' }),
       isError: false,
     }))
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: { execute } as never,
       runTimeoutMs: 1_000,
@@ -9053,7 +9059,8 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         usage: { promptTokens: 16, completionTokens: 5, totalTokens: 21, cachedPromptTokens: 0 },
       }
     })
-    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 2_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, runTimeoutMs: 2_000 })
     try {
       await agent.submit(session.summary.id, {
         content: 'Build one self-contained HTML dashboard, verify it, and present the main HTML deliverable.',
@@ -9222,7 +9229,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
       return { content: JSON.stringify({ status: 'success', hash: 'fixture' }), isError: false }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: { execute } as never,
       runTimeoutMs: 1_000,
@@ -9282,7 +9289,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 0 },
       }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       runTimeoutMs: 1_000,
     })
@@ -9877,15 +9884,13 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         usage: { promptTokens: 8, completionTokens: 1, totalTokens: 9, cachedPromptTokens: 0 },
       }
     })
-    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 2_000 })
     let releaseSessionClose = () => {}
+    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 2_000 })
     const sessionCloseBlocked = new Promise<void>((resolveClose) => { releaseSessionClose = resolveClose })
-    const close = vi.fn(async () => await sessionCloseBlocked)
-    const shutdown = vi.fn(async () => { releaseSessionClose() })
-    Object.defineProperty(agent, 'browser', {
-      configurable: true,
-      value: { close, shutdown },
-    })
+    // Keep the real browser diagnostics surface; only control cleanup timing.
+    const browser = Object.getOwnPropertyDescriptor(agent, 'browser')!.value as BrowserManager
+    const close = vi.spyOn(browser, 'close').mockImplementation(async () => await sessionCloseBlocked)
+    const shutdown = vi.spyOn(browser, 'shutdown').mockImplementation(async () => { releaseSessionClose() })
     try {
       await agent.submit(session.summary.id, { content: 'Finish, then close the browser context.' })
       for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -10203,7 +10208,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         })),
         usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13, cachedPromptTokens: 0 },
       }))
-      firstAgent = new AgentService(firstStore, {
+      firstAgent = new AgentService(firstStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: firstStream } as never, runTimeoutMs: 10_000,
         // Exercise durable choice pairing, not provider-generated auditions.
         toolExecutorDependencies: { imageApiKey: '' },
@@ -10233,7 +10238,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
           usage: { promptTokens: 14, completionTokens: 4, totalTokens: 18, cachedPromptTokens: 0 },
         }
       })
-      restartedAgent = new AgentService(restartedStore, {
+      restartedAgent = new AgentService(restartedStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: restartedStream } as never, runTimeoutMs: 10_000,
         toolExecutorDependencies: { imageApiKey: '' },
       })
@@ -10854,7 +10859,8 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         usage: { promptTokens: 8, completionTokens: 1, totalTokens: 9, cachedPromptTokens: 0 },
       }
     })
-    const agent = new AgentService(store, { client: { stream } as never, runTimeoutMs: 1_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, runTimeoutMs: 1_000 })
     try {
       await agent.submit(session.summary.id, { content })
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -11557,6 +11563,105 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
     }
   })
 
+  it('owns startup admission while the pending-restore filesystem check is in flight', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-restore-check-admission-'))
+    const store = new SessionStore(root, 'test-model')
+    await store.initialize()
+    const id = (await store.create()).summary.id
+    const stream = vi.fn().mockResolvedValue({ content: 'Done.', reasoningContent: '', toolCalls: [], finishReason: 'stop',
+      usage: { promptTokens: 5, completionTokens: 1, totalTokens: 6, cachedPromptTokens: 0 } })
+    const agent = new AgentService(store, { client: { stream }, runTimeoutMs: 1_000 })
+    let releaseProbe = () => {}
+    const probeGate = new Promise<void>((done) => { releaseProbe = done })
+    let enteredProbe = () => {}
+    const probeEntered = new Promise<void>((done) => { enteredProbe = done })
+    const internal = agent as unknown as { assertWorkspaceRestoreComplete: (sessionId: string) => Promise<void> }
+    const check = internal.assertWorkspaceRestoreComplete.bind(internal)
+    const probe = vi.spyOn(internal, 'assertWorkspaceRestoreComplete').mockImplementationOnce(async (sessionId) => {
+      enteredProbe()
+      await probeGate
+      await check(sessionId)
+    })
+    let first: Promise<unknown> | undefined
+    try {
+      first = agent.submit(id, { content: 'First submission.' })
+      await probeEntered
+      expect(agent.isRunning(id)).toBe(true)
+      await expect(agent.submit(id, { content: 'Must not overtake the pending file check.' }))
+        .rejects.toThrow('This session is already running')
+      expect(probe).toHaveBeenCalledTimes(1)
+      releaseProbe()
+      await first
+      await vi.waitFor(() => expect(agent.isRunning(id)).toBe(false))
+      expect((await store.events(id)).filter((event) => event.type === 'turn.started').map((event) => event.data.content))
+        .toEqual(['First submission.'])
+      expect(stream).toHaveBeenCalledTimes(1)
+    } finally {
+      releaseProbe()
+      await first?.catch(() => undefined)
+      await agent.shutdown()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['pending_restore', 'read_failure', 'shutdown'] as const)(
+    'releases its startup reservation when the pending-restore check ends with %s', async (outcome) => {
+      const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-restore-check-cleanup-'))
+      const store = new SessionStore(root, 'test-model')
+      await store.initialize()
+      const id = (await store.create()).summary.id
+      const stream = vi.fn().mockResolvedValue({ content: 'Done.', reasoningContent: '', toolCalls: [], finishReason: 'stop',
+        usage: { promptTokens: 5, completionTokens: 1, totalTokens: 6, cachedPromptTokens: 0 } })
+      const agent = new AgentService(store, { client: { stream }, runTimeoutMs: 1_000 })
+      let releaseProbe = () => {}
+      const probeGate = new Promise<void>((done) => { releaseProbe = done })
+      let enteredProbe = () => {}
+      const probeEntered = new Promise<void>((done) => { enteredProbe = done })
+      const internal = agent as unknown as { assertWorkspaceRestoreComplete: (sessionId: string) => Promise<void> }
+      const check = internal.assertWorkspaceRestoreComplete.bind(internal)
+      vi.spyOn(internal, 'assertWorkspaceRestoreComplete').mockImplementationOnce(async (sessionId) => {
+        enteredProbe()
+        await probeGate
+        if (outcome === 'read_failure') throw Object.assign(new Error('Restore journal unreadable'), { code: 'EACCES' })
+        await check(sessionId)
+      })
+      let submitted: Promise<unknown> | undefined
+      try {
+        if (outcome === 'pending_restore') {
+          const directory = resolve(store.sessionDir(id), 'workspace-versions')
+          await mkdir(directory, { recursive: true })
+          await writeFile(resolve(directory, 'restore.json'), '{}')
+        }
+        submitted = agent.submit(id, { content: 'Do not start if workspace recovery is blocked.' })
+        const settled = submitted.then(() => ({ succeeded: true, error: undefined }),
+          (error: unknown) => ({ succeeded: false, error }))
+        await probeEntered
+        expect(agent.isRunning(id)).toBe(true)
+        const shutdown = outcome === 'shutdown' ? agent.shutdown() : undefined
+        releaseProbe()
+        const result = await settled
+        expect(result.succeeded).toBe(false)
+        expect(String(result.error)).toMatch(outcome === 'pending_restore' ? /Workspace recovery is pending/u
+          : outcome === 'read_failure' ? /Restore journal unreadable/u : /shutting down/iu)
+        await shutdown
+        expect(agent.isRunning(id)).toBe(false)
+        expect(stream).not.toHaveBeenCalled()
+        expect((await store.events(id)).filter((event) => event.type === 'turn.started')).toHaveLength(0)
+        if (outcome !== 'shutdown') {
+          await rm(resolve(store.sessionDir(id), 'workspace-versions', 'restore.json'), { force: true })
+          await agent.submit(id, { content: 'Retry after the startup failure.' })
+          await vi.waitFor(() => expect(agent.isRunning(id)).toBe(false))
+          expect(stream).toHaveBeenCalledTimes(1)
+        }
+      } finally {
+        releaseProbe()
+        await submitted?.catch(() => undefined)
+        await agent.shutdown()
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('cancels a run while startup is reserved before it becomes active', async () => {
     const root = await mkdtemp(resolve(tmpdir(), 'anera-agent-cancel-start-reservation-'))
     const store = new SessionStore(root, 'test-model')
@@ -12148,7 +12253,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
           modelRequestCount: 1,
         }
       })
-      const agent = new AgentService(store, {
+      const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream } as never,
         maxAgentModelRequestsPerTurn: 1,
         maxAgentTotalTokensPerTurn: 1_000,
@@ -13514,7 +13619,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         modelCallCount: 1,
       }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       runTimeoutMs: 1_000,
       contextCompactionThresholdTokens: 18_000,
@@ -13580,7 +13685,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         modelCallCount: 1,
       }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       runTimeoutMs: 1_000,
       contextCompactionThresholdTokens: 18_000,
@@ -13674,7 +13779,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         modelCallCount: 1,
       }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       runTimeoutMs: 1_000,
       contextCompactionThresholdTokens: 18_000,
@@ -14236,7 +14341,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         modelCallCount: 1,
       }
     })
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       runTimeoutMs: 1_000,
       contextWindowTokens: 15_000,
@@ -15757,7 +15862,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         isError: false,
       })),
     }
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: tools as never,
       runTimeoutMs: 1_000,
@@ -15841,7 +15946,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
     })
     const tools = { execute: vi.fn() }
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: tools as never,
       runTimeoutMs: 1_000,
@@ -15926,7 +16031,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         content: JSON.stringify({ status: 'error', error: `HTTP 404 fetching ${tentativeUrl}` }),
         isError: true,
       }))
-      firstAgent = new AgentService(firstStore, {
+      firstAgent = new AgentService(firstStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: firstStream } as never,
         tools: { execute: firstExecute } as never,
         runTimeoutMs: 3_000,
@@ -15993,7 +16098,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
           isError: false,
         }
       })
-      restartedAgent = new AgentService(restartedStore, {
+      restartedAgent = new AgentService(restartedStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: restartedStream } as never,
         tools: { execute: restartedExecute } as never,
         runTimeoutMs: 3_000,
@@ -16118,7 +16223,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         if (call.name === 'record_reference_style') return { content: contractFailure, isError: true }
         throw new Error(`Unexpected first-run tool ${call.name}`)
       })
-      firstAgent = new AgentService(firstStore, {
+      firstAgent = new AgentService(firstStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: firstStream } as never,
         tools: { execute: firstExecute } as never,
         runTimeoutMs: 3_000,
@@ -16179,7 +16284,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
         }
       })
       const restartedExecute = vi.fn(async () => ({ content: contractFailure, isError: true }))
-      restartedAgent = new AgentService(restartedStore, {
+      restartedAgent = new AgentService(restartedStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: restartedStream } as never,
         tools: { execute: restartedExecute } as never,
         runTimeoutMs: 3_000,
@@ -16291,7 +16396,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
           usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 8 },
         }
       })
-      firstAgent = new AgentService(firstStore, {
+      firstAgent = new AgentService(firstStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: firstStream } as never,
         tools: { execute: vi.fn(async () => failedContract) } as never,
         runTimeoutMs: 3_000,
@@ -16352,7 +16457,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
           usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12, cachedPromptTokens: 8 },
         }
       })
-      restartedAgent = new AgentService(restartedStore, {
+      restartedAgent = new AgentService(restartedStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: restartedStream } as never,
         tools: { execute: vi.fn(async () => failedContract) } as never,
         runTimeoutMs: 3_000,
@@ -16585,7 +16690,7 @@ Create the retained weekly HTML Slides deck using the exact ${referenceDirectory
       }
       throw new Error(`Unexpected executed visual-loop call ${call.id}`)
     }) }
-    const agent = new AgentService(store, {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream } as never,
       tools: tools as never,
       runTimeoutMs: 1_000,

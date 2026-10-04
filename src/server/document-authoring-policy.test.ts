@@ -23,4 +23,14 @@ describe('format adapters, not task exemplars', () => {
     for (const removed of ['516', '540', '660', 'C2-D2', '9000', 'Executive Summary', 'requiredStrings', 'at most three generator']) expect(policy).not.toContain(removed)
     expect(policy.length).toBeLessThan(4_500)
   })
+  it('keeps useful runtime API references without format-triggered verification requirements in adaptive mode', () => {
+    const policy = documentAuthoringPolicy(['pdf', 'docx', 'xlsx', 'pptx'], { verificationMode: 'adaptive' }).join('\n')
+    for (const api of ['PDFPage has no public page.doc.getFont API', 'HeadingLevel.TITLE', 'PageNumber.CURRENT', 'cell.result', 'addTable accepts row arrays']) {
+      expect(policy).toContain(api)
+    }
+    for (const imposed of ['Structured artifact contract', 'Execute the generator, then use extract_attachment', 'Consume its continuations',
+      'OFFICE VERIFICATION FAILED', 'compare the independent extraction too', 'Validate actual rendered data shape']) expect(policy).not.toContain(imposed)
+    expect(documentAuthoringPolicy([], { verificationMode: 'adaptive' })).toEqual([])
+    expect(documentAuthoringPolicy(['xlsx'])).toEqual(documentAuthoringPolicy(['xlsx'], { verificationMode: 'legacy' }))
+  })
 })

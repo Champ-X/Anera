@@ -252,7 +252,7 @@ describe('page-body research evidence', () => {
     const store = new SessionStore(root, 'test-model')
     await store.initialize()
     const session = await store.create()
-    const original = new AgentService(store, {
+    const original = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
       client: { stream: vi.fn(async () => { throw new Error('fixture interruption before legacy checkpoint') }) } as never,
     })
     let resumed: AgentService | undefined
@@ -271,7 +271,7 @@ describe('page-body research evidence', () => {
       })
       const restartedStore = new SessionStore(root, 'test-model')
       await restartedStore.initialize()
-      resumed = new AgentService(restartedStore, {
+      resumed = new AgentService(restartedStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
         client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: Array<{ function: { name: string } }> }) => {
           const names = options.tools.map((tool) => tool.function.name)
           expect(names).toContain('web_search')

@@ -19,6 +19,14 @@ export interface FileEvidenceReceipt {
 
 export const ATTACHMENT_VERIFIER = 'attachment-extractor-v1'
 
+/** Restoring a workspace starts a new observation history, even for identical bytes. */
+function eventsAfterWorkspaceRestore(events: readonly SessionEvent[]): readonly SessionEvent[] {
+  for (let index = events.length - 1; index >= 0; index--) {
+    if (events[index].type === 'workspace.version.restored') return events.slice(index + 1)
+  }
+  return events
+}
+
 export function attachmentExtractionCoverage(
   extracted: AttachmentExtractionPage, options: AttachmentExtractionOptions,
 ): FileEvidenceReceipt['coverage'] {
@@ -42,7 +50,7 @@ export function attachmentCoverageAssessment(
   let totalUnits: number | undefined
   let unit: 'page' | 'item' | undefined
   const excerpts = new Map<string, { from: EvidenceCursor; text: string }>()
-  for (const event of events) {
+  for (const event of eventsAfterWorkspaceRestore(events)) {
     const call = event.data.call as { name?: string; arguments?: Record<string, unknown> } | undefined
     if (event.type !== 'tool.completed' || event.data.notExecuted === true || event.data.isError === true
       || call?.name !== 'extract_attachment' || evidencePath(call.arguments?.path) !== normalized) continue
@@ -128,7 +136,7 @@ export function attachmentEvidenceStatus(
   if (!normalizedPath) return { status: 'invalid', gap: 'Cannot establish a workspace file identity for verification.' }
   let gap: string | undefined
   let observed = false
-  for (const event of events) {
+  for (const event of eventsAfterWorkspaceRestore(events)) {
     if (!['tool.completed', 'tool.failed', 'tool.timed_out'].includes(event.type)
       || event.data.notExecuted === true) continue
     const call = event.data.call as { name?: string; arguments?: Record<string, unknown> } | undefined

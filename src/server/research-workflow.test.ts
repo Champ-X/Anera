@@ -190,7 +190,8 @@ describe('research review workflow boundary', () => {
       if (invocation === 5) return modelCall('no-op-content-edit', 'edit_file', { path: 'deck.html', old_text: stale, new_text: stale })
       return modelCall('remove-unsupported-story', 'edit_file', { path: 'deck.html', old_text: stale, new_text: corrected })
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5000 })
     try {
       await agent.resume(sessionId)
       await settled(agent, sessionId)
@@ -214,7 +215,8 @@ describe('research review workflow boundary', () => {
       const { root, store, sessionId, html } = await rejectedCanonicalSourceFixture(kind)
       let observed = false
       const execute = vi.fn(async () => { throw new Error('No tool executes in this admission probe') })
-      const agent = new AgentService(store, { tools: { execute }, client: { stream: vi.fn(async (options: { tools: ToolDefinition[] }) => {
+      const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+        tools: { execute }, client: { stream: vi.fn(async (options: { tools: ToolDefinition[] }) => {
         const names = options.tools.map((tool) => tool.function.name)
         expect(names).toEqual(expect.arrayContaining(['web_search', 'web_fetch', 'fetch_page']))
         expect(names).not.toContain('edit_file')
@@ -278,7 +280,8 @@ describe('research review workflow boundary', () => {
         if (invocation === 3) return modelCall('continued-research', 'fetch_page', { url: oldUrl })
         throw new Error('fixture stop after continued research executed unchanged')
       })
-      const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5000 })
+      const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+        client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5000 })
       try {
         await agent.resume(sessionId)
         await settled(agent, sessionId)
@@ -382,7 +385,8 @@ describe('research review workflow boundary', () => {
       if (call.name === 'write_file') { writes += 1; return { content: JSON.stringify({ status: 'success', path: 'slides.html' }), isError: false } }
       throw new Error(`Unexpected fixture tool: ${call.name}`)
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: String(request.content) })
       await settled(agent, session.summary.id)
@@ -532,7 +536,8 @@ describe('research review workflow boundary', () => {
       }
       throw new Error(`Unexpected fixture tool: ${call.name}`)
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: { execute } as never, runTimeoutMs: 5_000 })
     try {
       await agent.submit(session.summary.id, { content: String(request.content) })
       await settled(agent, session.summary.id)
@@ -608,7 +613,8 @@ describe('research review workflow boundary', () => {
       expect(options.messages.some((message) => String(message.content).includes('Previously retrieved research source passages'))).toBe(false)
       throw new Error('fixture stop at accepted generation boundary')
     })
-    const agent = new AgentService(store, { client: { stream } as never, tools: executor, runTimeoutMs: 10_000 })
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream } as never, tools: executor, runTimeoutMs: 10_000 })
     let restarted: AgentService | undefined
     try {
       await agent.submit(session.summary.id, { content: String(request.content) })
@@ -633,7 +639,8 @@ describe('research review workflow boundary', () => {
       const reopenedStore = new SessionStore(root, 'test-model')
       await reopenedStore.initialize()
       let observed = false
-      restarted = new AgentService(reopenedStore, { client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: ToolDefinition[] }) => {
+      restarted = new AgentService(reopenedStore, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+        client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: ToolDefinition[] }) => {
         expect(options.tools.map((tool) => tool.function.name)).toContain('write_file')
         expect(options.messages.some((message) => String(message.content).includes(accepted!.sha256))).toBe(true)
         observed = true
@@ -676,7 +683,8 @@ describe('research review workflow boundary', () => {
     })
     const execute = vi.fn(async () => { throw new Error('No tool or network call is needed to restore source bytes') })
     let observed = false
-    const agent = new AgentService(store, { tools: { execute }, client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: ToolDefinition[] }) => {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      tools: { execute }, client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: ToolDefinition[] }) => {
       const review = options.messages.find((message) => String(message.content).includes('Previously retrieved research source passages'))
       expect(review?.content).toContain(passage)
       expect(review?.content).toContain(hash)
@@ -824,7 +832,8 @@ describe('research review workflow boundary', () => {
       canonicalPath: 'deck.html', researchSourceUrls: [url], researchPageReads: [read], researchBrief: brief })).toBeUndefined()
     let calls = 0
     const execute = vi.fn(async () => { throw new Error('No tools execute in this Final-boundary probe') })
-    const agent = new AgentService(store, { tools: { execute }, client: { stream: vi.fn(async (options: { tools: ToolDefinition[]; messages: ModelMessage[] }) => {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      tools: { execute }, client: { stream: vi.fn(async (options: { tools: ToolDefinition[]; messages: ModelMessage[] }) => {
       calls += 1
       expect(options.tools.map((tool) => tool.function.name)).toEqual(['edit_file'])
       if (calls === 1) return { content: 'The deck is complete.', reasoningContent: '', toolCalls: [], finishReason: 'stop', usage, modelCallCount: 1 }
@@ -914,7 +923,8 @@ describe('research review workflow boundary', () => {
         }) : [])]
     })
     const seen: string[][] = []
-    const agent = new AgentService(store, { client: { stream: vi.fn(async (options: { tools: ToolDefinition[]; messages: ModelMessage[] }) => {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream: vi.fn(async (options: { tools: ToolDefinition[]; messages: ModelMessage[] }) => {
       const names = options.tools.map((tool) => tool.function.name)
       seen.push(names)
       if (needsRepair && seen.length === 1) {
@@ -973,7 +983,8 @@ describe('research review workflow boundary', () => {
       ]
     })
     let observed = false
-    const agent = new AgentService(store, { client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: ToolDefinition[] }) => {
+    const agent = new AgentService(store, { verificationMode: 'legacy', // Historical fixed-phase replay; product defaults to adaptive.
+      client: { stream: vi.fn(async (options: { messages: ModelMessage[]; tools: ToolDefinition[] }) => {
       const names = options.tools.map((tool) => tool.function.name)
       expect(names).toContain('fetch_page')
       expect(names).toContain('web_search')
