@@ -21,6 +21,7 @@ import { modelRouteAvailability } from '../src/eval/model-route-availability.js'
 import { publicReadTransport } from '../src/eval/public-read-transport.js'
 import { assertReviewProbeSource } from '../src/eval/visual-final-review-probe.js'
 import { runGeneralAgentCanary } from '../src/eval/general-agent-canary.js'
+import { runAdaptiveAgentCanary } from '../src/eval/adaptive-agent-canary.js'
 import { visualDeliveryContext, visualDeliveryCompletionControl, visualDeliveryHandoffOutcome } from '../src/server/visual-delivery.js'
 import { isVisualReviewProtocolError, runVisualFinalReview, visualArtifactReviewMessages, visualFinalEvidenceIssues, visualFinalReviewMessages } from '../src/server/visual-final-review.js'
 import { resolveWorkspacePath } from '../src/server/workspace.js'
@@ -37,7 +38,8 @@ if (paidTestMode(process.argv.slice(2)) === 'preflight') {
   process.exit(0)
 }
 const budget = openAuthorizedModelTestBudget(process.argv.slice(2))
-const canaryModel = 'deepseek-v4-flash'
+const adaptiveMode = ['adaptive', 'adaptive-restore'].includes(process.env.ANERA_ARENA_CANARY_MODE ?? '')
+const canaryModel = adaptiveMode ? config.model : 'deepseek-v4-flash'
 let evidenceRoot: string | undefined
 const startedAt = new Date().toISOString()
 try {
@@ -131,6 +133,17 @@ const vision = new DeepSeekVisionClient({
 })
 if (process.env.ANERA_ARENA_CANARY_MODE === 'general') {
   await runGeneralAgentCanary({ client, vision, model: canaryModel, budget, dataRoot: evidenceRoot })
+  return
+}
+if (adaptiveMode) {
+  const restoreReplay = process.env.ANERA_ARENA_CANARY_MODE === 'adaptive-restore'
+  if (restoreReplay && (!process.env.ANERA_ARENA_CANARY_SOURCE_ROOT || !process.env.ANERA_ARENA_CANARY_SOURCE_SESSION || !process.env.ANERA_ADAPTIVE_RESTORE_VERSION)) {
+    throw new Error('Adaptive restore replay requires explicit source root, session and version ID')
+  }
+  await runAdaptiveAgentCanary({ client, vision, model: canaryModel, budget, dataRoot: evidenceRoot,
+    ...(restoreReplay ? { restoreSource: { dataRoot: resolve(process.env.ANERA_ARENA_CANARY_SOURCE_ROOT!),
+      sessionId: process.env.ANERA_ARENA_CANARY_SOURCE_SESSION!, versionId: process.env.ANERA_ADAPTIVE_RESTORE_VERSION! } } : {}),
+  })
   return
 }
 const mode = process.env.ANERA_ARENA_CANARY_MODE === 'fresh' ? 'fresh'

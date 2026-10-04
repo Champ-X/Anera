@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { inspectModelTestBudget, ModelTestBudget, USER_AUTHORIZED_ADDITIONAL_20_CNY_20260909,
   USER_AUTHORIZED_ADDITIONAL_30_CNY_20260909, USER_AUTHORIZED_LIMIT_REMOVAL_20260909,
-  TEST_MODEL_TARIFF_VALID_UNTIL } from './model-test-budget.js'
+  TEST_MODEL_TARIFF_VALID_UNTIL, TEST_MODEL_TARIFF_VERIFIED_AT, TEST_MODEL_TARIFF_POLICY } from './model-test-budget.js'
 
 const endpoint = 'https://api.deepseek.com/chat/completions'
 const clock = () => Date.parse('2026-09-09T10:00:00+08:00')
@@ -428,5 +428,94 @@ describe('cumulative model-test CNY budget (zero provider calls)', () => {
       writeFileSync(budget.path, corrupted.map((line) => JSON.stringify(line)).join('\n') + '\n')
       expect(() => inspectModelTestBudget(budget.path)).toThrow('invalid usage-bound halt evidence')
     }
+  })
+})
+
+describe('versioned official model-test tariffs (zero provider calls)', () => {
+  function openCurrent(path?: string) {
+    if (!path) { const dir = mkdtempSync(join(tmpdir(), 'anera-current-budget-test-')); dirs.push(dir); path = join(dir, 'ledger.jsonl') }
+    const budget = new ModelTestBudget(path, () => Date.parse(TEST_MODEL_TARIFF_VERIFIED_AT) + 1_000)
+    budgets.push(budget)
+    return budget
+  }
+
+  it.each(['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'])('reserves and settles the official current ¥2/¥8 Flash route: %s', async (model) => {
+    const budget = openCurrent()
+    expect(budget.assertModel(model)).toEqual({ input: 2, output: 8 })
+    const transport = vi.fn<typeof fetch>(async () => {
+      expect(budget.snapshot().accountedUpperBoundCny).toBe(2.228224)
+      const reserved = JSON.parse(readFileSync(budget.path, 'utf8').trim().split('\n').at(-1)!)
+      expect(reserved).toMatchObject({ type: 'reserve', model, tariffPolicy: TEST_MODEL_TARIFF_POLICY, maximum: 2_228_224 })
+      return sse(completed)
+    })
+    await (await budget.wrapFetch(transport)(endpoint, request(model))).text()
+    expect(budget.snapshot()).toMatchObject({ requests: 1, unsettledRequests: 0, accountedUpperBoundCny: 0.00036 })
+    const original = readFileSync(budget.path, 'utf8')
+    budget.close()
+    const reopened = openCurrent(budget.path)
+    expect(reopened.snapshot().accountedUpperBoundCny).toBe(0.00036)
+    expect(readFileSync(budget.path, 'utf8')).toBe(original)
+  })
+
+  it('keeps historical unversioned reservations and anomalous settlement bytes while appending current-rate records', async () => {
+    const originalBudget = open()
+    originalBudget.close()
+    const historicalReserve = { type: 'reserve', id: 'historical_anomaly', model: 'deepseek-v4-flash', maximum: 3_293_184 }
+    const historicalUnknown = { type: 'reserve', id: 'historical_unknown', model: 'deepseek-v4-flash-vision-exp', maximum: 3_293_184 }
+    const usageBound = { requestId: historicalReserve.id, input: 1_048_577, output: 16_385, total: 1_064_962, maxInput: 1_048_576, maxOutput: 16_384 }
+    const legacyRecords = [additionalGrant, latestGrant,
+      { type: 'limit_removed', authorizationId: USER_AUTHORIZED_LIMIT_REMOVAL_20260909, previousCap: 70_000_000, previousHalt: '' },
+      historicalReserve, { type: 'settle', id: historicalReserve.id, charged: 1_048_577 * 3 + 16_385 * 9, usageBound }, historicalUnknown]
+    const original = readFileSync(originalBudget.path, 'utf8') + legacyRecords.map((record) => JSON.stringify(record) + '\n').join('')
+    writeFileSync(originalBudget.path, original)
+    const budget = openCurrent(originalBudget.path)
+    const before = budget.snapshot()
+    expect(before).toMatchObject({ capCny: null, unsettledRequests: 1, requests: 2, accountedUpperBoundCny: (3_293_196 + 3_293_184) / 1_000_000 })
+    const currentUsage = { prompt_tokens: 1_048_577, completion_tokens: 16_385, total_tokens: 1_064_962 }
+    const response = await budget.wrapFetch(async () => sse(`data: ${JSON.stringify({ usage: currentUsage })}\n\ndata: [DONE]\n\n`))(endpoint, request('deepseek-flash'))
+    await response.text()
+    const mixed = readFileSync(budget.path, 'utf8')
+    expect(mixed.startsWith(original)).toBe(true)
+    expect(budget.snapshot()).toMatchObject({ capCny: null, unsettledRequests: 1, requests: 3,
+      accountedUpperBoundCny: (3_293_196 + 3_293_184 + 2_228_234) / 1_000_000 })
+    budget.close()
+    const reopened = openCurrent(budget.path)
+    expect(inspectModelTestBudget(budget.path)).toEqual(reopened.snapshot())
+    expect(readFileSync(budget.path, 'utf8')).toBe(mixed)
+    expect(reopened.snapshot().unsettledRequests).toBe(1)
+  })
+
+  it('reopens an unversioned historical usage-bound halt using ¥3/¥9 and never reprices its unresolved reservation', () => {
+    const originalBudget = open()
+    originalBudget.close()
+    const reserve = { type: 'reserve', id: 'historical_halt', model: 'deepseek-v4-flash', maximum: 3_293_184 }
+    const halt = { type: 'halt', reason: 'provider usage exceeded verified request bound; reconciliation required',
+      usageBound: { requestId: reserve.id, input: 100, output: 16_385, total: 16_485, maxInput: 1_048_576, maxOutput: 16_384 } }
+    const original = readFileSync(originalBudget.path, 'utf8') + [reserve, halt].map((record) => JSON.stringify(record) + '\n').join('')
+    writeFileSync(originalBudget.path, original)
+    const reopened = openCurrent(originalBudget.path)
+    expect(reopened.snapshot()).toMatchObject({ accountedUpperBoundCny: 3.293184, unsettledRequests: 1 })
+    expect(() => reopened.assertModel('deepseek-flash')).toThrow('reconciliation required')
+    expect(readFileSync(reopened.path, 'utf8')).toBe(original)
+  })
+
+  it('does not apply the current quote before it was verified, or after its validity window', () => {
+    const budget = openCurrent()
+    budget.close()
+    for (const now of [Date.parse('2026-09-20T00:00:00Z'), TEST_MODEL_TARIFF_VALID_UNTIL]) {
+      const stale = new ModelTestBudget(budget.path, () => now)
+      budgets.push(stale)
+      expect(() => stale.assertModel('deepseek-flash')).toThrow('verified tariff expired')
+      stale.close()
+    }
+  })
+
+  it.each(['invented-tariff', null, 123])('rejects an unrecognized reservation tariff policy without rewriting records: %s', (tariffPolicy) => {
+    const budget = openCurrent()
+    budget.close()
+    const original = readFileSync(budget.path, 'utf8') + JSON.stringify({ type: 'reserve', id: 'bad_policy', model: 'deepseek-flash', maximum: 2_228_224, tariffPolicy }) + '\n'
+    writeFileSync(budget.path, original)
+    expect(() => openCurrent(budget.path)).toThrow('invalid reservation ledger')
+    expect(readFileSync(budget.path, 'utf8')).toBe(original)
   })
 })

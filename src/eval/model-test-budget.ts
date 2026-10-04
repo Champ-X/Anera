@@ -3,22 +3,45 @@ import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 // Test-only, write-ahead accounting. Never import this into production routing.
-// CNY peak/cache-miss rates verified 2026-09-09:
-// https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+// CNY peak/cache-miss rates verified against the live official table 2026-09-26.
+// Archived rates remain immutable because historical ledger usageBound records
+// depend on their original request tariff. A refresh never re-prices old entries.
 // 1 Mi tokens is deliberately above the advertised 1M context ceiling.
-export const TEST_MODEL_TARIFFS = {
+const HISTORICAL_TEST_MODEL_TARIFFS = {
   'deepseek-v4-flash': { input: 3, output: 9 },
   'deepseek-v4-pro': { input: 9, output: 27 },
   'deepseek-v4-flash-vision-exp': { input: 3, output: 9 },
 } as const
-// Rechecked official pricing at this instant; peak/cache-miss rates unchanged.
+export const TEST_MODEL_TARIFFS = {
+  'deepseek-flash': { input: 2, output: 8 },
+  'deepseek-v4-flash': { input: 2, output: 8 },
+  'deepseek-v4-pro': { input: 9, output: 27 },
+  'deepseek-v4-flash-vision-exp': { input: 2, output: 8 },
+} as const
+export const TEST_MODEL_TARIFF_POLICY = 'deepseek-cny-peak-2026-09-26-v1'
+export const TEST_MODEL_TARIFF_EVIDENCE = {
+  pricingUrl: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+  pricingSha256: '5a7b1832592387340f2fc456399b34b89b05f3fa167c2e35909e2fa4afe021e3',
+  pricingLastModified: '2026-09-24T09:35:28.000Z',
+  releaseUrl: 'https://api-docs.deepseek.com/updates',
+  releaseDate: '2026-09-10',
+  evidenceDirectory: 'reports/goal-pricing/20260926T100913Z',
+} as const
+// Official pricing explicitly bills both retired Flash aliases at the current
+// deepseek-flash rate; this is documented routing, not an inferred alias price.
 // Use a 24-hour freshness window, not an imminent local-midnight cutoff.
-export const TEST_MODEL_TARIFF_VERIFIED_AT = '2026-09-09T15:45:04.945Z'
+export const TEST_MODEL_TARIFF_VERIFIED_AT = '2026-09-26T10:09:13.850Z'
 export const TEST_MODEL_TARIFF_VALID_UNTIL = Date.parse(TEST_MODEL_TARIFF_VERIFIED_AT) + 24 * 60 * 60 * 1_000
 const CONTEXT_CEILING = 1_048_576
 const MAX_OUTPUT = 393_216
 const CAP_MICRO_CNY = 20_000_000
 const POLICY = 'deepseek-cny-peak-2026-09-09-v1'
+const HISTORICAL_TARIFF_VALID_UNTIL = Date.parse('2026-09-09T15:45:04.945Z') + 24 * 60 * 60 * 1_000
+const TARIFF_POLICIES = {
+  [POLICY]: HISTORICAL_TEST_MODEL_TARIFFS,
+  [TEST_MODEL_TARIFF_POLICY]: TEST_MODEL_TARIFFS,
+} as const
+type TariffPolicy = keyof typeof TARIFF_POLICIES
 // Explicit, single-use user authorizations; neither an environment override
 // nor a caller-selected amount. The original policy header remains ¥20.
 export const USER_AUTHORIZED_ADDITIONAL_20_CNY_20260909 = 'user-2026-09-09-additional-cny20-cap40-v1' as const
@@ -30,12 +53,12 @@ const AUTHORIZED_GRANTS = [
 ] as const
 type AuthorizationId = typeof AUTHORIZED_GRANTS[number]['authorizationId']
 type Tariff = { input: number; output: number }
-type Entry = { id: string; model: string; maximum: number; charged: number; settled: boolean }
+type Entry = { id: string; model: string; maximum: number; charged: number; settled: boolean; tariffPolicy?: TariffPolicy }
 type Authorization = { cap: number | null; authorizationIds: string[] }
 type UsageBoundEvidence = { requestId: string; input: number; output: number; total: number; maxInput: number; maxOutput: number }
 type RecordLine =
   | { type: 'policy'; policy: string; cap: number }
-  | { type: 'reserve'; id: string; model: string; maximum: number }
+  | { type: 'reserve'; id: string; model: string; maximum: number; tariffPolicy?: TariffPolicy }
   | { type: 'settle'; id: string; charged: number; usageBound?: UsageBoundEvidence }
   | { type: 'halt'; reason: string; usageBound?: UsageBoundEvidence }
   | { type: 'grant'; authorizationId: string; previousCap: number; additional: number; cap: number }
@@ -43,6 +66,12 @@ type RecordLine =
 
 export class ModelTestBudgetError extends Error {
   constructor(message: string) { super(`Model test budget stopped: ${message}`); this.name = 'ModelTestBudgetError' }
+}
+
+function reservationTariff(entry: Entry | undefined): Tariff | undefined {
+  if (!entry) return undefined
+  const rates = TARIFF_POLICIES[entry.tariffPolicy ?? POLICY]
+  return rates && Object.hasOwn(rates, entry.model) ? rates[entry.model as keyof typeof rates] : undefined
 }
 
 function applyRecord(entries: Map<string, Entry>, stopped: string, record: RecordLine, authorization: Authorization): string {
@@ -68,8 +97,7 @@ function applyRecord(entries: Map<string, Entry>, stopped: string, record: Recor
     if (record.usageBound !== undefined) {
       const evidence = record.usageBound
       const entry = evidence && entries.get(evidence.requestId)
-      const tariff = entry && Object.hasOwn(TEST_MODEL_TARIFFS, entry.model)
-        ? TEST_MODEL_TARIFFS[entry.model as keyof typeof TEST_MODEL_TARIFFS] : undefined
+      const tariff = reservationTariff(entry)
       if (!evidence || Object.keys(evidence).sort().join(',') !== 'input,maxInput,maxOutput,output,requestId,total'
         || !entry || entry.settled || !tariff
         || ![evidence.input, evidence.output, evidence.total, evidence.maxOutput].every((value) => Number.isSafeInteger(value) && value >= 0)
@@ -96,7 +124,9 @@ function applyRecord(entries: Map<string, Entry>, stopped: string, record: Recor
   }
   if (record.type === 'reserve') {
     if (typeof record.id !== 'string' || !record.id || typeof record.model !== 'string' || !record.model
-      || entries.has(record.id) || !Number.isSafeInteger(record.maximum) || record.maximum <= 0) {
+      || entries.has(record.id) || !Number.isSafeInteger(record.maximum) || record.maximum <= 0
+      || record.tariffPolicy !== undefined && (typeof record.tariffPolicy !== 'string' || !Object.hasOwn(TARIFF_POLICIES, record.tariffPolicy)
+        || !Object.hasOwn(TARIFF_POLICIES[record.tariffPolicy], record.model))) {
       throw new ModelTestBudgetError('invalid reservation ledger')
     }
     entries.set(record.id, { ...record, charged: record.maximum, settled: false })
@@ -108,7 +138,7 @@ function applyRecord(entries: Map<string, Entry>, stopped: string, record: Recor
     }
     if (record.usageBound !== undefined) {
       const evidence = record.usageBound
-      const tariff = TEST_MODEL_TARIFFS[entry.model as keyof typeof TEST_MODEL_TARIFFS]
+      const tariff = reservationTariff(entry)
       if (!evidence || authorization.cap !== null || evidence.requestId !== entry.id || !tariff
         || Object.keys(evidence).sort().join(',') !== 'input,maxInput,maxOutput,output,requestId,total'
         || ![evidence.input, evidence.output, evidence.total, evidence.maxOutput].every((value) => Number.isSafeInteger(value) && value >= 0)
@@ -238,15 +268,21 @@ export class ModelTestBudget {
   }
 
   assertModel(model: string): Tariff {
+    return this.assertModelWithPolicy(model).tariff
+  }
+
+  private assertModelWithPolicy(model: string): { tariff: Tariff; tariffPolicy: TariffPolicy } {
     if (this.closed || this.stopped) this.stop(this.closed ? 'ledger closed' : this.stopped)
     // Refresh the official tariff before another day's paid test; keep the
     // same authorization ledger and do not grant a new ¥20 allowance.
-    if (this.now() >= TEST_MODEL_TARIFF_VALID_UNTIL) this.stop('verified tariff expired; refresh pricing before reuse')
-    const tariff = Object.hasOwn(TEST_MODEL_TARIFFS, model)
-      ? TEST_MODEL_TARIFFS[model as keyof typeof TEST_MODEL_TARIFFS] : undefined
-    // Do not infer a current tariff from an old alias or change the chosen model.
+    const now = this.now()
+    const tariffPolicy = now >= Date.parse(TEST_MODEL_TARIFF_VERIFIED_AT) && now < TEST_MODEL_TARIFF_VALID_UNTIL
+      ? TEST_MODEL_TARIFF_POLICY : now < HISTORICAL_TARIFF_VALID_UNTIL ? POLICY : undefined
+    if (!tariffPolicy) this.stop('verified tariff expired; refresh pricing before reuse')
+    const rates = TARIFF_POLICIES[tariffPolicy]
+    const tariff = Object.hasOwn(rates, model) ? rates[model as keyof typeof rates] : undefined
     if (!tariff) this.stop(`no verified current tariff for ${model}`)
-    return tariff
+    return { tariff, tariffPolicy }
   }
 
   private append(record: RecordLine) {
@@ -266,12 +302,12 @@ export class ModelTestBudget {
   }
 
   private reserve(model: string, maxOutput: number) {
-    const tariff = this.assertModel(model)
+    const { tariff, tariffPolicy } = this.assertModelWithPolicy(model)
     if (!Number.isSafeInteger(maxOutput) || maxOutput <= 0 || maxOutput > MAX_OUTPUT) this.stop('unknown output ceiling')
     const maximum = CONTEXT_CEILING * tariff.input + maxOutput * tariff.output
     const used = [...this.entries.values()].reduce((sum, entry) => sum + entry.charged, 0)
     if (this.authorization.cap !== null && used + maximum > this.authorization.cap) this.stop(`next physical request cannot fit within cumulative ¥${this.authorization.cap / 1_000_000}`)
-    const record = { type: 'reserve' as const, id: randomUUID(), model, maximum }
+    const record: Extract<RecordLine, { type: 'reserve' }> = { type: 'reserve', id: randomUUID(), model, maximum, tariffPolicy }
     this.append(record)
     this.apply(record)
     return { id: record.id, tariff, maxOutput }
