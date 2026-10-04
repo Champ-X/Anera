@@ -23,8 +23,8 @@ Anera 基于 Arena Agent Mode 的公开页面、可见执行日志、手工运�
 | --- | --- |
 | 版本 | **桌面 Agent Mode v1 · 主体能力已收敛** |
 | 主链 | 任务 → 推理 → 工具 → 持久化 → 验证 → 产物/网站 → 最终回复 |
-| 能力 | 19 工具 Agent、Workspace、联网研究、Browser、视觉验证、人机协作、Cancel/Resume 与故障恢复 |
-| 工程门禁 | 53 个测试文件 / 963 项测试；类型检查、Production/Showcase 构建与依赖审计均通过 |
+| 能力 | 工具 Agent、Workspace、联网研究、Browser、自主验收、运行中纠偏、成果版本与故障恢复 |
+| 工程门禁 | 模块、集成、真实浏览器与付费模型分层验证；范围与证据见下方验证基线及 TESTING.md |
 | 暂缓 | 移动端、完整 GitHub Connector、Arena exact trace/pixel/latency/cost parity |
 
 > “主体能力已收敛”指 Anera 自身的桌面执行链已经闭环，不代表获得了 Arena 的私有源码、模型权重或内部策略。
@@ -117,7 +117,7 @@ Production 默认监听 [http://127.0.0.1:4174](http://127.0.0.1:4174)。反向�
         ↓
 Session / Event / Workspace 持久化
         ↓
-来源、结构、Browser、视觉质量门禁
+Agent 根据需求选择适度验证，记录实际证据
         ↓
 产物（Artifact）/ 网站预览 / present_file
         ↓
@@ -126,14 +126,19 @@ Session / Event / Workspace 持久化
 
 执行过程会实时投影到桌面工作台：中间是对话与 Thought/Tool 时间线，右侧承载 Workspace、文件预览、Artifact 和运行中的 Website。任务被取消、服务重启或上下文压缩后，Harness 会从持久状态继续，而不是把一次运行仅保存在内存中。
 
+默认采用通用自主验收：Agent 选择与需求相称的检查，通过 `finish_task` 一次提交验收记录与最终回复，服务端绑定真实工具事件和文件版本。简单回答可以直接结束；核心缺口如实有限交付，非关键观测缺口不会强制重做整个任务。历史 HTML/Slides 固定阶段仅在显式 `verificationMode: 'legacy'` 的回放中启用。证据绑定证明记录来源，不等同于独立事实认证。
+
+运行时可在输入框追加要求，界面区分 Received 与 Applied；指令持久化并在安全的执行边界按序生效。Workspace 的 Versions 支持自动交付版本、手动保存、版本比较、真实文件恢复及继续修改。恢复前自动保存当前文件，尚未应用的旧指令归档为 Archived；对话 Undo 只撤销对话，外部发布或远程操作不会随本地文件回退。设计与恢复边界见 [AGENT_EXECUTION_DESIGN.md](AGENT_EXECUTION_DESIGN.md)。
+
 ## 能力地图
 
 | 层 | 已实现能力 |
 | --- | --- |
 | Agent Runtime | 流式 Thought、工具路由、并行读取、顺序写操作、失败恢复、唯一 Final |
-| 生命周期 | Cancel、Continue/Resume、context compaction、进程重启恢复、幂等事件与 usage 结算 |
-| Workspace | 文件读写、精确编辑、搜索、Shell、依赖安装、附件提取、分页与大文件处理 |
-| 联网研究 | Tavily Search、Firecrawl Fetch、安全 fallback、来源台账、引用校验、无来源时拒绝交付 |
+| 生命周期 | Cancel、Continue/Resume、运行中指令收据与应用、context compaction、进程重启恢复、幂等事件与 usage 结算 |
+| Workspace | 文件读写、版本对比与恢复、精确编辑、搜索、Shell、依赖安装、附件提取、分页与大文件处理 |
+| 联网研究 | Tavily Search、Firecrawl Fetch、安全 fallback、来源台账、引用校验、来源缺口说明 |
+| 通用验收 | Agent 自选检查、真实工具与文件证据绑定、局部补验、有限交付 |
 | Browser 与视觉 | 真实页面打开与交互、截图、DeepSeek `deepseek-v4-flash-vision-exp` 视觉检查 |
 | Process 与 Website | 受管后台进程、端口发现、实时日志、Website Preview、空闲休眠与恢复 |
 | Artifact | HTML、Markdown、图片、PDF、Office 等文件的预览、验证、下载与 `present_file` 发布 |
@@ -153,7 +158,7 @@ Session / Event / Workspace 持久化
 | [真实联网 Provider](evidence/live-web-provider-summary.json) | **PASS** | Tavily 搜索/图片回退、Firecrawl 多段抓取与 turn 内缓存均通过真实调用验证 |
 | [真实 Vision Provider](evidence/live-vision-summary.json) | **PASS · 最新任务 2/2 calls** | DeepSeek Vision 两次 physical/metered 调用、Browser 复核与 Artifact 交付在同一任务闭环 |
 | [桌面 UI 回归](evidence/ui-state-coverage-summary.json) | **62/62 状态** | 1440×900 下 0 console error、0 横向与外层纵向溢出；62 张截图均验证 bytes/SHA-256 |
-| 当前工程门禁 | **53 个文件 / 963 项测试** | 单元、集成与契约测试、typecheck、Production/Showcase 构建与高危依赖审计通过 |
+| 历史工程门禁 | **53 个文件 / 963 项测试** | 该冻结版本的单元、集成与契约测试、typecheck、Production/Showcase 构建与高危依赖审计通过 |
 
 这些数字是 **Anera 自身的冻结回归基线**，不是“Arena 相似度百分比”。它们不能证明 Arena 的私有后端、模型权重、随机策略、逐步轨迹、像素、延迟或成本与 Anera 相同。
 

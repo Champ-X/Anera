@@ -2,7 +2,24 @@
 
 按模块职责和资源边界组织测试，不为某个新闻、会话或模板任务新增专用测试流水线。
 
+默认 `adaptive` 路径由 Agent 自选验收内容与工具，`finish_task` 同时记录证据和交付最终回复，不额外调用评审模型。以下历史视觉/研究固定阶段的断言在对应测试夹具中显式使用 `verificationMode: 'legacy'`，它们证明旧机制仍可回放，不代表当前默认流程。新默认行为由 `adaptive-verification.integration.test.ts` 覆盖。
+
+持续协作验证同时检查真实文件与持久状态：`steering*.test.ts` 覆盖接收/应用、取消恢复和终态竞态；`workspace-versions*.test.ts` 覆盖字节恢复、并发互斥与崩溃恢复；客户端测试和隔离浏览器验证追加要求、版本比较、恢复后继续修改。`ANERA_ARENA_CANARY_MODE=adaptive npm run test:paid` 复用下述唯一预算入口，用真实模型完成简单回答、数据统计、运行中纠偏、文件恢复与继续编辑、交互网页；报告保留实际耗时、工具调用、协议修复和独立结果检查。确定性模型夹具、真实浏览器交互与真实模型结果须分别报告。
+
+恢复既是文件/证据边界，也是任务边界。`task-context.test.ts`、`restored-evidence.test.ts` 与实际 Agent 集成回归应检查：恢复前请求和已应用 steering 仍可审计，但不再进入当前需求；恢复后的 Continue 只沿用恢复状态与之后的请求；重载、摘要及撤回聊天节点不能重新激活旧指令。除目标文件外，必须比较完整公共文件清单与哈希，捕获旧任务重新创建文件的回归。`verification-context.test.ts`、`file-evidence*.test.ts` 同时检查旧工具收据/抽取覆盖不复用，展示当前文件也不自动记为 passed。
+
+持续协作回归还覆盖取消后积压纠偏与新追问的需求顺序、事件发布失败后的进程内恢复，以及版本恢复对未应用纠偏的持久归档。版本测试检查存储目录/恢复事务的符号链接、损坏快照重试和差异预览在截断前的完整脱敏。验收协议测试检查字段类型、公共工作区路径、外部文件修改后的抽取字节收据，以及未执行返回不能重开重试预算。浏览器回归使用离线响应，检查乱序请求、会话切换、恢复后的刷新失败、键盘焦点与草稿保留。
+
 证据表示改动先用固定材料做只读投影比较，核对字节上限、来源覆盖、逐字引文、缺失计数与源哈希，不为此启动付费模型。共享excerptRef的解码、损坏引用拒绝、脱敏后身份和收据失效由模块用例覆盖；模型实际看到紧凑输入。投影改善不是语义质量通过，仍需在集中验收时检验真实任务结果。
+
+## 2026-10-04 提交前验证记录
+
+- 更新兼容的传递依赖后，`npm run verify` 通过类型检查及 155 个文件、2,762 项模块/集成测试；Production 与 Showcase 构建均通过。
+- 前一轮完整测试中的 6 个浏览器文件、96 项用例全部通过；该轮另发现启动预留竞态，修复后已通过上述模块/集成回归，未再运行完整浏览器层。本次审查与提交前验证没有调用付费模型。
+- `npm audit --audit-level=high` 通过，高危及严重项为零；仍有 Vitest / `@vitest/mocker` 的 2 项中危开发依赖公告，尚未进行测试框架大版本升级。
+- `public-evidence-integrity.ts` 未通过：153 项均为当前源码/构建与历史冻结版本的指纹差异，包含旧构建文件名已不存在的情况。冻结证据保持原样，不能用来证明本次提交通过历史版本的完整验收。
+
+详细本地日志保留在未纳入版本控制的 `reports/review-20261003/` 中；上述记录分别说明已执行的层与未复验的边界。
 
 ## 日常只运行需要的层
 
@@ -41,6 +58,24 @@ Vitest 在加载产品配置前使用 synthetic 凭据和不可达 Provider 地�
 - 长运行观察订阅新增持久化事件，不每秒重读完整会话/工作区/历史；开始和结束仍读取真实快照，最终验收保留完整日志。报告分开记录产品终态与观察器的 `terminal / deadline / budget / observer_error` 原因，测试窗口取消不冒充模型自主失败或验收通过。订阅须在启动前建立，结束清理；默认 900 秒窗口、取消后的结算等待及所有验收条件不变。
 - 分析上下文成本时，先核对实际 Provider 投影；磁盘上的完整参考 profile 不等于重复发送给模型的数据。自动摘要的字节压力与 token 估算共用投影后的上下文口径，计入 system、工具定义和当前补充控制。`context.compacted.contextByteBasis = provider_context_v1` 的 `beforeBytes/afterBytes` 是该上下文字节数；`beforeDurableMessageBytes/afterDurableMessageBytes` 单列持久消息大小。没有此标记的旧事件保留原口径。字节减少不是供应商账单或最终质量通过，也不能释放费用预留。
 
+## 恢复后继续的定向真实回放
+
+恢复语义修复完成并通过受影响的免费测试后，可用 `adaptive-restore` 只重放恢复后的继续请求，不重新购买简单回答、统计、纠偏或网页生成。它复用同一付费入口与预算账本，使用当前配置的模型、thinking、输出及续写设置；这是一次真实模型调用流程，不是零模型只读诊断。
+
+以下命令选择首轮保存的统计版本。更换来源时，必须同时指定已有源数据根、completed 会话和实际版本 ID；源会话不能有待启动或待提交终态事务。
+
+```sh
+ANERA_ARENA_CANARY_MODE=adaptive-restore \
+ANERA_ARENA_CANARY_SOURCE_ROOT="$PWD/.anera/canary-runs/run-ixroAs/runtime" \
+ANERA_ARENA_CANARY_SOURCE_SESSION=ses_b6fe33ac7b7e40a8bc8d \
+ANERA_ADAPTIVE_RESTORE_VERSION=wsv_ce7b063789e74457892d \
+npm run test:paid
+```
+
+入口将源会话复制到新的 `.anera/canary-runs/run-*/runtime`，通过真实恢复 API 恢复指定版本，再提交“只在 summary.md 末尾增加一行复核完成”的请求。独立判据检查目标正文保留且只追加要求内容、其余全部公共文件清单及哈希不变，并核对源 `state.json`、`events.jsonl` 与公共工作区的前后身份。结果写入新目录的 `adaptive-report.json`，模式为 `adaptive_restore_replay`；源会话和旧报告保留。
+
+2026-09-26 首轮 `run-ixroAs` 的恢复后继续实际重建了旧纠偏产生的 `progress.txt`、`result.txt`。原报告中的 `passed:true` 来自旧判据只检查已有统计文件，遗漏了额外文件，不能作为这一能力通过的证据。判据已补齐完整文件集合比较；修复后的 `run-aC2nl8` 定向回放通过：7.302 秒，仅追加目标文字，其余完整公共文件集合及哈希不变，源会话不变。原报告及独立复核失败记录保留；后续以新回放报告记录结果，不把任务终态 completed 等同于独立验收通过。
+
 ## 上下文管理的零模型验证
 
 `npx vitest run --project integration src/server/context-records.integration.test.ts src/server/context-pressure.integration.test.ts src/server/visual-compaction.test.ts --project module src/server/checkpoint-context.test.ts src/server/thinking-protocol.test.ts src/server/config.test.ts` 集中检查完整原文重建、会话隔离、哈希校验、调用配对/思考文本保留、真实 Agent 检索调度、持久计量与禁用 token 停止。
@@ -57,15 +92,15 @@ Vitest 在加载产品配置前使用 synthetic 凭据和不可达 Provider 地�
 
 真实历史 UI 不必重新生成：设置 `ANERA_UI_REPLAY_SESSION_DIR=/absolute/data/sessions/ses_...` 后运行 `npx tsx scripts/long-thought-ui-server.ts`（保持 stdin 打开）。仅接受无待恢复人工交互的终态会话，先复制完整 journal/CAS/workspace 到新的持久目录，拒绝符号链接、身份错配与目标覆盖，再启动真实 App。HTTP 仅允许 GET/HEAD；真实模式 stdin 仅允许 `status`/`shutdown`。退出时对源的全部文件哈希复核，text/Vision/tools 尝试必须为零；连接器状态探测独立计数并始终在网络前拒绝。历史 usage 保留原值，不算本次费用。保留 `ui-replay-report.json`，不要把该回放或标准 viewport 渲染结果当成所有展示尺寸的通过证据。
 
-默认交付的模型 scope/limitations 仅以声明来源、内容指纹和数量索引提供；完整文字仍在同快照内容视图。需要实质解释或必要限制时仍可扩展，不能按索引数量推断“有缺陷”或“已解决”。独立成品审阅保留全部观察文字与来源摘录，隔离旧模型解释；单测应同时检查隔离和证据保留，而非仅断言输入更短。
+legacy 固定流水线交付阶段的模型 scope/limitations 仅以声明来源、内容指纹和数量索引提供；完整文字仍在同快照内容视图。需要实质解释或必要限制时仍可扩展，不能按索引数量推断“有缺陷”或“已解决”。独立成品审阅保留全部观察文字与来源摘录，隔离旧模型解释；单测应同时检查隔离和证据保留，而非仅断言输入更短。
 
-成品内容审阅在研究与确定性源码检查之后、渲染/交互/展示之前运行；已有问题走正常 read/edit 修复，不重复购买相同问题诊断。显式空 verdict 的私有收据绑定审阅版本、原任务和整个证据输入（含文件字节哈希），可跨 Continue 复用，Final 不再重复同版本成品审阅。CSS、未投影文字、来源、正文、任务或审阅器版本变化都失效；收据不代表事实认证，也不代替 Browser/Vision/Final 门禁。测试同时断言调用顺序、变更/取消时禁止写入收据、失败请求计量、重载复用和新任务/撤回的状态清理。
+legacy 固定流水线的成品内容审阅在研究与确定性源码检查之后、渲染/交互/展示之前运行；已有问题走正常 read/edit 修复，不重复购买相同问题诊断。显式空 verdict 的私有收据绑定审阅版本、原任务和整个证据输入（含文件字节哈希），可跨 Continue 复用，Final 不再重复同版本成品审阅。CSS、未投影文字、来源、正文、任务或审阅器版本变化都失效；收据不代表事实认证，也不代替 Browser/Vision/Final 门禁。测试同时断言调用顺序、变更/取消时禁止写入收据、失败请求计量、重载复用和新任务/撤回的状态清理。
 
-计划、审阅、时间上下文、修复与handoff共用 `activeTaskRequestEvents` 的任务投影。只有已有任务后的纯Continue/Resume控制消息可不改变需求身份；完整journal与模型对话不删除该消息。新附件、结构化反馈、实质追加需求和第一条控制消息保留。回归须走实际 `submit("Continue")` 并断言既有内容收据复用，不能仅测 `resume()` 或单独的plan hash。已完成源需集中重验时，显式 `ANERA_ARENA_CANARY_MODE=continue` 只在新隔离副本提交Continue；`resume`仍拒绝completed，不伪造failed或删除Final。
+计划、审阅、时间上下文、修复与handoff共用 `activeTaskRequestEvents` 的任务投影。只有同一恢复边界内已有任务后的纯Continue/Resume控制消息可不改变需求身份；完整journal与模型对话不删除该消息。`workspace.version.restored` 先清空当前请求投影，之后的第一条 Continue 建立新范围，不能复用恢复前内容收据。新附件、结构化反馈、实质追加需求和第一条控制消息保留。无恢复的回归须走实际 `submit("Continue")` 并断言既有内容收据复用，不能仅测 `resume()` 或单独的plan hash。已完成源需集中重验时，显式 `ANERA_ARENA_CANARY_MODE=continue` 只在新隔离副本提交Continue；`resume`仍拒绝completed，不伪造failed或删除Final。
 
-当前生产审阅同时返回 `artifactIssues` 与 `taskFulfillment`，在同一次模型请求中分开评估已有内容的事实问题和原始需求满足性。只有事实问题为空且需求明确 `satisfied` 才生成包含两种判定的收据；旧事实收据不能自动升级。需求缺失项必须引用原始用户要求，不能从成品/计划/模型建议创造新任务。原有内容全部准确但缺少必要内容时，允许 `artifactIssues:[]` 与 `needs_work` 并存；仅加免责声明仍须复审。来源缺失可受控重入已有研究依赖，不开放任意写入或跳过后续验证。测试按真实状态/边界分组，不能通过换题材重复同一夹具来宣称跨类别验收；通用合约模块和当前接入适配器的范围要分别报告。
+legacy 路径的成品审阅同时返回 `artifactIssues` 与 `taskFulfillment`，在同一次模型请求中分开评估已有内容的事实问题和原始需求满足性。只有事实问题为空且需求明确 `satisfied` 才生成包含两种判定的收据；旧事实收据不能自动升级。需求缺失项必须引用原始用户要求，不能从成品/计划/模型建议创造新任务。原有内容全部准确但缺少必要内容时，允许 `artifactIssues:[]` 与 `needs_work` 并存；仅加免责声明仍须复审。来源缺失可受控重入已有研究依赖，不开放任意写入或跳过后续验证。测试按真实状态/边界分组，不能通过换题材重复同一夹具来宣称跨类别验收；通用合约模块和当前接入适配器的范围要分别报告。
 
-语义审阅实验也必须有退出标准：2026-09-10尝试同请求的来源/内容双向覆盖表，免费协议测试通过并不代表模型效果改善。单向版本仍漏检，双向版本连续三段只思考后无有效判定，因此撤回生产接入并保留隔离实验与失败报告，不作为新默认门禁；当前仍为artifact-content-v1。没有改质量、thinking或输出限额来包装实验成功，也不重跑未变输入。后续不能仅凭“协议更严格”恢复该方案，须提出新的可验证设计依据。
+语义审阅实验也必须有退出标准：2026-09-10尝试同请求的来源/内容双向覆盖表，免费协议测试通过并不代表模型效果改善。单向版本仍漏检，双向版本连续三段只思考后无有效判定，因此撤回生产接入并保留隔离实验与失败报告，不作为新默认门禁；legacy 路径仍使用 artifact-content-v1。没有改质量、thinking或输出限额来包装实验成功，也不重跑未变输入。后续不能仅凭“协议更严格”恢复该方案，须提出新的可验证设计依据。
 
 研究计划的适用性与来源字节分开验证：控制器在成功 `record_research_brief` 的终态事件中记录任务/计划指纹，投影到 `briefTaskBinding`；不信任模型参数/工具正文里自称的绑定，也不为旧事件补造绑定。原始任务/时间范围或计划版本不匹配时保留来源、重开研究评审；当前明确缺少计划时，不能从历史消息回退恢复它。纯 Continue/Resume 不重置计划，实质反馈或新附件保留为任务范围变化。测试夹具若明确从“已评审计划”开始，应显式生成测试绑定；旧/错误绑定的迁移和恢复必须单独覆盖，禁止在生产中为通过旧夹具自动升级。
 
@@ -107,17 +142,17 @@ ANERA_ARENA_CANARY_MODE=general npm run test:paid
 
 ## 只检查当前失败的审阅边界（只读）
 
-已有真实 canary 的终态产物需要定位成品审阅问题时，可使用同一入口的只读模式。artifact 诊断可读取 completed/failed/cancelled/timed_out 的匹配快照，不要求先付费通过渲染和展示；真实文件仍必须 hash_verified。运行中、状态/路径/型号不一致的快照拒绝：
+本节针对 legacy 独立审阅器的显式诊断回放，不属于默认 adaptive 的完成路径。已有真实 canary 的终态产物需要定位成品审阅问题时，可使用同一入口的只读模式。artifact 诊断可读取 completed/failed/cancelled/timed_out 的匹配快照，不要求先付费通过渲染和展示；真实文件仍必须 hash_verified。运行中、状态/路径/型号不一致的快照拒绝：
 
 ```sh
 ANERA_ARENA_CANARY_MODE=review ANERA_ARENA_CANARY_SOURCE_ROOT=/absolute/path/to/canary-root npm run test:paid
 ```
 
-它仍先核对官方模型目录，使用相同 Flash 配置和固定费用账本。只把原任务与 hash-bound 成品/来源证据交给生产的独立成品审阅器，不传 Final 草稿；最多 2 个逻辑审阅（正常请求 + 至多一次格式纠正），每次保留生产客户端的重试与长度续写配置，记录每笔实际 HTTP 请求，不以禁用正常续写降低测试质量。不启动 App/Browser、不修改/恢复源会话、不发布 Final。输出独立报告并比对源 state/events/HTML 的前后哈希。`acceptanceVerified:false` 恒定：协议通过不是事实真值，更不是端到端验收。成品问题仍需模型正常修复并完成必要复验；不要为定位审阅格式问题反复运行整条流程。
+它仍先核对官方模型目录，使用相同 Flash 配置和固定费用账本。只把原任务与 hash-bound 成品/来源证据交给 legacy 路径的独立成品审阅器，不传 Final 草稿；最多 2 个逻辑审阅（正常请求 + 至多一次格式纠正），每次保留生产客户端的重试与长度续写配置，记录每笔实际 HTTP 请求，不以禁用正常续写降低测试质量。不启动 App/Browser、不修改/恢复源会话、不发布 Final。输出独立报告并比对源 state/events/HTML 的前后哈希。`acceptanceVerified:false` 恒定：协议通过不是事实真值，更不是端到端验收。成品问题仍需模型正常修复并完成必要复验；不要为定位审阅格式问题反复运行整条流程。
 
-只修改最终交付审阅边界时，同一入口可加 `ANERA_REVIEW_TARGET=handoff`：必须是 completed、已展示且无剩余验证阶段的快照，并有已保存 Final。以原需求和当前 hash-bound 证据检查生产交付器，已保存 Final 仅在程序侧用于差异记录，不作为模型输入。它不重新生成成品、不发布结果、不冒充完整成品审阅或端到端通过。默认仍为 `artifact`；未知 target 拒绝。缺失/畸形的可选 corrections 元数据只记录安全诊断，实际文本变化由程序记录；不能用协议合规或解释元数据代替内容正确性。
+只修改最终交付审阅边界时，同一入口可加 `ANERA_REVIEW_TARGET=handoff`：必须是 completed、已展示且无剩余验证阶段的快照，并有已保存 Final。以原需求和当前 hash-bound 证据检查 legacy 路径的交付器，已保存 Final 仅在程序侧用于差异记录，不作为模型输入。它不重新生成成品、不发布结果、不冒充完整成品审阅或端到端通过。默认仍为 `artifact`；未知 target 拒绝。缺失/畸形的可选 corrections 元数据只记录安全诊断，实际文本变化由程序记录；不能用协议合规或解释元数据代替内容正确性。
 
-交付器默认接收完成凭据；若明确的详细回答需要正文，可申请一次同快照完整证据，不授予工具权限或重新采集。该模式最多三个逻辑请求（初次、至多一次证据扩展、至多一次格式修复），不按证据扩展重置修复次数；artifact 模式仍最多两个。每个逻辑请求保留生产续写/transport 配置，所有物理请求共用原账本计费。未知/旧凭据格式保留完整上下文，已知成品矛盾仍走完整内容审阅；不能因减少输入而隐藏限制或直接判内容通过。
+legacy 交付器默认接收完成凭据；若明确的详细回答需要正文，可申请一次同快照完整证据，不授予工具权限或重新采集。该模式最多三个逻辑请求（初次、至多一次证据扩展、至多一次格式修复），不按证据扩展重置修复次数；artifact 模式仍最多两个。每个逻辑请求保留生产续写/transport 配置，所有物理请求共用原账本计费。未知/旧凭据格式保留完整上下文，已知成品矛盾仍走完整内容审阅；不能因减少输入而隐藏限制或直接判内容通过。
 
 内部凭据与交付consumer view分开：默认位置投影不附字节/修订/源元素数量/模型声明索引/链接页码清点；完成记录使用scope/outcome，不把performed升级为pass，也不传执行阶段的动作指令。需要详细审计、校验和、内容或必要限制时，原始操作控制与完整现有有界证据仍在同快照展开中。回归必须检查原数据和数组隔离、用户需求原样保留、未知schema回退、展开后精确身份可取，以及实际控制器在文件变化/取消/超时后的发布拦截。不要再以“默认模型输入包含文件hash”代替真正的发布前身份校验；投影不是新的完成权限。只读文本变短不等于语义/整个任务通过，不能为满足字数目标重复付费。
 
