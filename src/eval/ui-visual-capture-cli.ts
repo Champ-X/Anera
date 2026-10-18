@@ -9,6 +9,7 @@ import { findBrowserExecutable } from '../server/browser-executable.js'
 import { fingerprintProductionImplementation } from './implementation-fingerprint.js'
 import { captureUiStateContract, type UiStateContract, type UiVisualContract } from './ui-contract.js'
 import {
+  VISUAL_FIXTURE_MODEL,
   advanceVisualRunningFixture,
   advanceVisualWorkspacePersistenceSaved,
   advanceVisualWorkspacePersistenceSaving,
@@ -90,7 +91,17 @@ interface WorkspaceFileInteractionCheck {
   workspaceRestoredAfterPreviewClose: true
 }
 
-interface StreamingWriteInteractionCheck {
+interface RunningComposerInteractionCheck {
+  composerEditable: true
+  placeholder: 'Add a requirement or correct the direction…'
+  addActionsDisabled: true
+  modelSelectionDisabled: true
+  emptyInstructionsDisabled: true
+  typedInstructionsEnabled: true
+  stopVisible: true
+}
+
+interface StreamingWriteInteractionCheck extends RunningComposerInteractionCheck {
   path: 'ai-weekly-2026-08-31.html'
   visibleTailLines: 8
   firstVisibleLine: 415
@@ -98,8 +109,6 @@ interface StreamingWriteInteractionCheck {
   timelineByteBadgeAbsent: true
   workspaceDraftVisible: true
   workspaceBytesMatchUtf8: true
-  composerLocked: true
-  stopVisible: true
 }
 
 const args = parseArgs(process.argv.slice(2))
@@ -201,13 +210,13 @@ try {
   }
   const selectDesktopSession = async (title: string) => {
     await page.locator('.history-list button').filter({ hasText: title }).click()
-    await page.locator('.history-list button.active').filter({ hasText: title }).waitFor({ state: 'visible' })
+    await page.locator('.history-list button[aria-current="page"]').filter({ hasText: title }).waitFor({ state: 'visible' })
     await settle(page)
   }
   const expectSessionRoute = async (id: string, title: string) => {
     const expected = `/agent/${id}`
     await page.waitForURL((url) => url.pathname === expected, { timeout: 5_000 })
-    await page.locator('.history-list button.active').filter({ hasText: title }).waitFor({ state: 'visible' })
+    await page.locator('.history-list button[aria-current="page"]').filter({ hasText: title }).waitFor({ state: 'visible' })
   }
   const ensureWorkspaceOpen = async () => {
     const workspacePanel = page.locator('.workspace-panel')
@@ -235,7 +244,7 @@ try {
     return payload.sessions.length
   })
   const sessionCountBeforeDraftActions = await countSessions()
-  if (await page.locator('.history-list button.active').count() !== 0) throw new Error('Direct /agent draft hydration selected a persisted Session')
+  if (await page.locator('.history-list button[aria-current="page"]').count() !== 0) throw new Error('Direct /agent draft hydration selected a persisted Session')
   await page.getByRole('button', { name: 'New Chat', exact: true }).first().click()
   if (await countSessions() !== sessionCountBeforeDraftActions) throw new Error('New Chat eagerly created an Agent Session')
   await page.reload({ waitUntil: 'domcontentloaded' })
@@ -390,7 +399,7 @@ try {
       return {
         path: window.location.pathname,
         rootClass: document.querySelector('.app-shell')?.className || null,
-        activeConversation: document.querySelector('.history-list button.active')?.textContent?.trim() || null,
+        activeConversation: document.querySelector('.history-list button[aria-current="page"]')?.textContent?.trim() || null,
         previewCount: document.querySelectorAll('.preview-layer').length,
         documentTitle: document.title,
         loadingCount: document.querySelectorAll('.center-state').length,
@@ -625,9 +634,9 @@ try {
     const panel = document.querySelector<HTMLElement>('.workspace-panel')
     if (!root || !panel) return false
     const box = panel.getBoundingClientRect()
-    return Math.abs(box.x - 1192) <= 1
-      && Math.abs(box.width - 248) <= 1
-      && getComputedStyle(root).gridTemplateColumns.endsWith(' 248px')
+    return Math.abs(box.x - 1184) <= 1
+      && Math.abs(box.width - 256) <= 1
+      && getComputedStyle(root).gridTemplateColumns.endsWith(' 256px')
   }, undefined, { timeout: 5_000 })
   const workspaceGeometry = await page.evaluate(() => {
     const panel = document.querySelector<HTMLElement>('.workspace-panel')?.getBoundingClientRect()
@@ -640,9 +649,9 @@ try {
     } : null
   })
   const expectedWorkspaceGeometry = {
-    panel: { x: 1192, y: 53, width: 248, height: 847 },
-    card: { x: 1192, y: 65, width: 248 },
-    toggle: { top: 11, right: 15, width: 31 },
+    panel: { x: 1184, y: 0, width: 256, height: 900 },
+    card: { x: 1196, y: 12, width: 232 },
+    toggle: { top: 11, right: 266, width: 31 },
   }
   if (JSON.stringify(workspaceGeometry) !== JSON.stringify(expectedWorkspaceGeometry)) {
     const workspaceLayoutDiagnostic = await page.evaluate(() => {
@@ -689,7 +698,7 @@ try {
       const snapshot = sessionId ? await fetch(`/api/sessions/${sessionId}`).then((response) => response.json()) : null
       return {
         path: window.location.pathname,
-        activeConversation: document.querySelector('.history-list button.active')?.textContent?.trim() || null,
+        activeConversation: document.querySelector('.history-list button[aria-current="page"]')?.textContent?.trim() || null,
         composerCount: document.querySelectorAll('.composer').length,
         reviewCount: document.querySelectorAll('.task-review-panel').length,
         finalCount: document.querySelectorAll('.final-answer').length,
@@ -798,12 +807,11 @@ try {
     },
     metadata: { timezone: customFeedbackTimezone, submissionSource: 'chat_input' },
     v2Source: 'agentic_chat_submit',
-    model: null,
+    model: VISUAL_FIXTURE_MODEL,
     enabledConnectorSlugs: [],
   }
-  if (!customFeedbackPayload
-    || JSON.stringify(customFeedbackPayload) !== JSON.stringify(expectedCustomFeedbackPayload)
-    || await feedbackEditor.textContent() !== 'The title should be Q3 Review.'
+  assertMessageEnvelope(customFeedbackPayload, expectedCustomFeedbackPayload, 'Custom feedback')
+  if (await feedbackEditor.textContent() !== 'The title should be Q3 Review.'
     || await feedbackEditor.getAttribute('data-placeholder') !== 'Give feedback on this task…') {
     throw new Error(`Custom-feedback failure did not preserve Arena transport, correlation, chip, placeholder, and draft: ${JSON.stringify(customFeedbackPayload)}`)
   }
@@ -979,7 +987,8 @@ try {
     whiteSpace: 'pre-wrap',
     overflowY: 'auto',
     minHeight: '93px',
-    maxHeight: '180px',
+    // Current composer allows 40dvh, capped at 360px (900px fixture viewport).
+    maxHeight: '360px',
   }
   if (JSON.stringify(composerContract) !== JSON.stringify(expectedComposerContract)) {
     throw new Error(`Composer DOM contract mismatch: ${JSON.stringify(composerContract)}`)
@@ -1054,15 +1063,13 @@ try {
   await page.waitForFunction(() => document.querySelector('.composer-editor')?.textContent === '')
   await page.locator('.composer-operation-status').filter({ hasText: 'Preparing message...' }).waitFor({ state: 'hidden' })
   const expectedTimezone = await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
-  if (JSON.stringify(interceptedMessages[0]) !== JSON.stringify({
+  assertMessageEnvelope(interceptedMessages[0], {
     message: { text: 'First line\nSecond line' },
     metadata: { timezone: expectedTimezone, submissionSource: 'chat_input' },
     v2Source: 'agentic_chat_submit',
-    model: null,
+    model: VISUAL_FIXTURE_MODEL,
     enabledConnectorSlugs: [],
-  })) {
-    throw new Error(`Enter submission payload mismatch: ${JSON.stringify(interceptedMessages[0])}`)
-  }
+  }, 'Enter submission')
   await messageEditor.fill('restore this draft')
   await page.waitForFunction(() => {
     const button = document.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')
@@ -1122,18 +1129,20 @@ try {
     },
     metadata: { timezone: expectedTimezone, submissionSource: 'chat_input' },
     v2Source: 'agentic_chat_submit',
-    model: null,
+    model: VISUAL_FIXTURE_MODEL,
     enabledConnectorSlugs: [],
   }
-  if (JSON.stringify(interceptedMessages[2]) !== JSON.stringify(expectedAttachmentOnlyPayload)) {
-    throw new Error(`Attachment-only submission payload mismatch: ${JSON.stringify(interceptedMessages[2])}`)
-  }
+  assertMessageEnvelope(interceptedMessages[2], expectedAttachmentOnlyPayload, 'Attachment-only submission')
   await page.locator('.attachment-chip').waitFor({ state: 'detached' })
   await page.unroute(messagePattern, messageRoute)
 
-  const connectionsTrigger = page.getByRole('button', { name: /^Connections(?: enabled: GitHub)?$/ })
-  if (await connectionsTrigger.getAttribute('aria-label') !== 'Connections') throw new Error('Connected GitHub appeared enabled while its conversation switch was off')
-  await connectionsTrigger.click()
+  const connectionsTrigger = page.getByRole('button', { name: 'Add files and connections', exact: true })
+  const openConnectionsMenu = async () => {
+    await connectionsTrigger.click()
+    await page.getByRole('menuitem', { name: 'GitHub connection', exact: true }).click()
+  }
+  if (await connectionsTrigger.getAttribute('data-connections-enabled') !== 'false') throw new Error('Connected GitHub appeared enabled while its conversation switch was off')
+  await openConnectionsMenu()
   const connectionsDialog = page.getByRole('dialog', { name: 'Connections' })
   await connectionsDialog.waitFor({ state: 'visible' })
   const [connectionsTriggerBox, connectionsDialogBox] = await Promise.all([connectionsTrigger.boundingBox(), connectionsDialog.boundingBox()])
@@ -1148,19 +1157,19 @@ try {
   await page.keyboard.press('Escape')
   await connectionsDialog.waitFor({ state: 'detached' })
   if (await connectionsTrigger.getAttribute('aria-expanded') !== 'false') throw new Error('Connections trigger stayed expanded after Escape')
-  await connectionsTrigger.click()
+  await openConnectionsMenu()
   await connectionsDialog.waitFor({ state: 'visible' })
   await page.getByRole('heading', { name: 'What would you like to do?' }).click()
   await connectionsDialog.waitFor({ state: 'detached' })
   if (await connectionsTrigger.getAttribute('aria-expanded') !== 'false') throw new Error('Connections trigger stayed expanded after outside click')
-  await connectionsTrigger.click()
+  await openConnectionsMenu()
   await connectionsDialog.waitFor({ state: 'visible' })
   await page.locator('.connection-switch').click()
   await page.getByRole('checkbox', { name: 'Show repository panel' }).waitFor({ state: 'attached' })
   if (!await page.getByRole('checkbox', { name: 'Show repository panel' }).isChecked()) throw new Error('Repository panel switch did not turn on')
-  await connectionsTrigger.click()
+  await page.keyboard.press('Escape')
   await connectionsDialog.waitFor({ state: 'detached' })
-  if (await connectionsTrigger.getAttribute('aria-label') !== 'Connections enabled: GitHub') throw new Error('Conversation switch did not enable GitHub in the Composer')
+  if (await connectionsTrigger.getAttribute('data-connections-enabled') !== 'true') throw new Error('Conversation switch did not enable GitHub in the Composer')
   await page.waitForFunction(() => {
     try { return JSON.parse(localStorage.getItem('coding-repo-connect-panel') || '{}').isOpen === true }
     catch { return false }
@@ -1172,7 +1181,7 @@ try {
   await page.locator('.repository-loading').waitFor({ state: 'visible' })
   await capture('coding-repository-loading-desktop')
   await page.getByRole('button', { name: 'Select a repository' }).waitFor({ state: 'visible' })
-  await page.getByRole('button', { name: 'Add files' }).waitFor({ state: 'visible' })
+  await page.getByRole('button', { name: 'Add files and connections', exact: true }).waitFor({ state: 'visible' })
   if (await messageEditor.getAttribute('data-placeholder') !== 'Ask anything…') throw new Error('Coding Composer changed the public Ask anything… placeholder')
   const codingAttachment = await page.evaluate(() => {
     const composer = document.querySelector('.composer')
@@ -1281,12 +1290,12 @@ try {
   connectionFixtureMode = 'disconnected'
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 })
   await page.locator('.app-shell').waitFor({ state: 'visible' })
-  await connectionsTrigger.click()
+  await openConnectionsMenu()
   await connectionsDialog.waitFor({ state: 'visible' })
   await page.getByLabel('GitHub outage notice').waitFor({ state: 'visible' })
   await page.getByRole('link', { name: 'View Status', exact: true }).waitFor({ state: 'visible' })
   await capture('connections-github-outage-desktop')
-  await connectionsTrigger.click()
+  await page.keyboard.press('Escape')
   await connectionsDialog.waitFor({ state: 'detached' })
   connectionFixtureMode = 'normal'
   githubStatusFixtureMode = 'normal'
@@ -1343,14 +1352,7 @@ try {
   await selectDesktopSession(running.title)
   await expectSessionRoute(running.id, running.title)
   await page.locator('.thought-row.running').waitFor({ state: 'visible' })
-  await page.getByRole('button', { name: 'Stop agent' }).waitFor({ state: 'visible' })
-  await page.getByRole('textbox', { name: 'Message' }).evaluate((element) => {
-    if (element.getAttribute('aria-placeholder') !== 'Agent is working…'
-      || element.getAttribute('contenteditable') !== 'false'
-      || element.getAttribute('aria-disabled') !== 'true') {
-      throw new Error('Running composer did not project its locked contenteditable state')
-    }
-  })
+  const runningComposerInteractionCheck = await verifyRunningComposerSteering(page, 'Running thought')
   await setConversationScroll(page, 'bottom')
   await capture('running-thinking-desktop')
 
@@ -1415,12 +1417,9 @@ try {
   if (!(await page.locator('.workspace-usage').innerText()).replaceAll(' ', '').includes(expectedDraftUsage)) {
     throw new Error(`Workspace did not project the streaming UTF-8 byte count ${expectedDraftUsage}`)
   }
-  const writingComposer = page.getByRole('textbox', { name: 'Message' })
-  const composerLocked = await writingComposer.getAttribute('contenteditable') === 'false'
-    && await writingComposer.getAttribute('aria-disabled') === 'true'
-  const stopVisible = await page.getByRole('button', { name: 'Stop agent' }).isVisible()
-  if (!composerLocked || !stopVisible) throw new Error('Streaming write lost its locked composer or Stop control')
+  const writingComposerInteractionCheck = await verifyRunningComposerSteering(page, 'Streaming write')
   const streamingWriteInteractionCheck: StreamingWriteInteractionCheck = {
+    ...writingComposerInteractionCheck,
     path: 'ai-weekly-2026-08-31.html',
     visibleTailLines: 8,
     firstVisibleLine: 415,
@@ -1428,8 +1427,6 @@ try {
     timelineByteBadgeAbsent: true,
     workspaceDraftVisible: true,
     workspaceBytesMatchUtf8: true,
-    composerLocked: true,
-    stopVisible: true,
   }
   await capture('running-writing-desktop')
 
@@ -1694,8 +1691,18 @@ try {
   const streamingWriteInteractionsPassed = streamingWriteInteractionCheck.timelineByteBadgeAbsent
     && streamingWriteInteractionCheck.workspaceDraftVisible
     && streamingWriteInteractionCheck.workspaceBytesMatchUtf8
-    && streamingWriteInteractionCheck.composerLocked
+    && streamingWriteInteractionCheck.composerEditable
+    && streamingWriteInteractionCheck.addActionsDisabled
+    && streamingWriteInteractionCheck.modelSelectionDisabled
+    && streamingWriteInteractionCheck.emptyInstructionsDisabled
+    && streamingWriteInteractionCheck.typedInstructionsEnabled
     && streamingWriteInteractionCheck.stopVisible
+  const runningComposerInteractionsPassed = runningComposerInteractionCheck.composerEditable
+    && runningComposerInteractionCheck.addActionsDisabled
+    && runningComposerInteractionCheck.modelSelectionDisabled
+    && runningComposerInteractionCheck.emptyInstructionsDisabled
+    && runningComposerInteractionCheck.typedInstructionsEnabled
+    && runningComposerInteractionCheck.stopVisible
   const hitlInteractionsPassed = hitlInteractionCheck.pendingQuestionCount === 2
     && hitlInteractionCheck.pendingOptionCount === 4
     && hitlInteractionCheck.pendingCustomInputCount === 2
@@ -1760,6 +1767,7 @@ try {
     && executionLogInteractionsPassed
     && workspaceFileInteractionsPassed
     && streamingWriteInteractionsPassed
+    && runningComposerInteractionsPassed
     && hitlInteractionsPassed
   await writeFile(resolve(output, 'capture-summary.json'), `${JSON.stringify({
     schemaVersion: contract.schemaVersion,
@@ -1784,6 +1792,7 @@ try {
     executionLogInteraction: executionLogInteractionCheck,
     workspaceFileInteraction: workspaceFileInteractionCheck,
     streamingWriteInteraction: streamingWriteInteractionCheck,
+    runningComposerInteraction: runningComposerInteractionCheck,
     hitlInteraction: hitlInteractionCheck,
     websiteWorkspaceInteraction: websiteWorkspaceInteractionChecks,
     workspacePersistenceInteraction: workspacePersistenceInteractionCheck,
@@ -1791,7 +1800,7 @@ try {
     undoFailureAndCompaction: undoFailureAndCompactionPassed,
     passed,
   }, null, 2)}\n`, 'utf8')
-  process.stdout.write(`${JSON.stringify({ output, states: states.length, consoleErrors: errors.length, horizontalOverflows: overflows.length, verticalOverflows: verticalOverflows.length, agentDraftRouteInteractions: agentDraftRouteInteractionChecks, leaderboardInteractions: leaderboardInteractionChecks, conversationSearchInteractions: conversationSearchInteractionChecks, conversationFollowInteractions: conversationFollowInteractionChecks, executionLogInteraction: executionLogInteractionCheck, workspaceFileInteraction: workspaceFileInteractionCheck, streamingWriteInteraction: streamingWriteInteractionCheck, hitlInteraction: hitlInteractionCheck, websiteWorkspaceInteraction: websiteWorkspaceInteractionChecks, workspacePersistenceInteraction: workspacePersistenceInteractionCheck, previewElementPickerInteraction: previewElementPickerInteractionChecks, taskReviewInteractions: taskReviewInteractionChecks.length, taskReviewOptimisticRollback: taskReviewGate.optimisticRollbackPassed, taskCompletionInteractions: taskCompletionInteractionChecks.length, taskCompletionOptimisticRollback: taskCompletionGate.optimisticRollbackPassed, taskCompletionThankYou: taskCompletionThankYouPassed, customFeedbackArenaTransport: customFeedbackArenaTransportPassed, undoInteraction: undoSuccess, undoFailureAndCompaction: undoFailureAndCompactionPassed, passed }, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify({ output, states: states.length, consoleErrors: errors.length, horizontalOverflows: overflows.length, verticalOverflows: verticalOverflows.length, agentDraftRouteInteractions: agentDraftRouteInteractionChecks, leaderboardInteractions: leaderboardInteractionChecks, conversationSearchInteractions: conversationSearchInteractionChecks, conversationFollowInteractions: conversationFollowInteractionChecks, executionLogInteraction: executionLogInteractionCheck, workspaceFileInteraction: workspaceFileInteractionCheck, streamingWriteInteraction: streamingWriteInteractionCheck, runningComposerInteraction: runningComposerInteractionCheck, hitlInteraction: hitlInteractionCheck, websiteWorkspaceInteraction: websiteWorkspaceInteractionChecks, workspacePersistenceInteraction: workspacePersistenceInteractionCheck, previewElementPickerInteraction: previewElementPickerInteractionChecks, taskReviewInteractions: taskReviewInteractionChecks.length, taskReviewOptimisticRollback: taskReviewGate.optimisticRollbackPassed, taskCompletionInteractions: taskCompletionInteractionChecks.length, taskCompletionOptimisticRollback: taskCompletionGate.optimisticRollbackPassed, taskCompletionThankYou: taskCompletionThankYouPassed, customFeedbackArenaTransport: customFeedbackArenaTransportPassed, undoInteraction: undoSuccess, undoFailureAndCompaction: undoFailureAndCompactionPassed, passed }, null, 2)}\n`)
   if (!passed) process.exitCode = 1
 } finally {
   if (browser) await browser.close()
@@ -1800,9 +1809,70 @@ try {
   await rm(dataRoot, { recursive: true, force: true })
 }
 
+function assertMessageEnvelope(
+  payload: Record<string, unknown> | undefined,
+  expected: Record<string, unknown>,
+  label: string,
+): void {
+  const { clientMessageId, ...envelope } = payload ?? {}
+  if (typeof clientMessageId !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(clientMessageId)) {
+    throw new Error(`${label} did not include a valid UUIDv7 clientMessageId: ${JSON.stringify(payload)}`)
+  }
+  if (JSON.stringify(envelope) !== JSON.stringify(expected)) {
+    throw new Error(`${label} payload mismatch: ${JSON.stringify(payload)}`)
+  }
+}
+
 async function settle(page: import('playwright-core').Page): Promise<void> {
   await page.evaluate(() => new Promise<void>((resolveFrame) => requestAnimationFrame(() => requestAnimationFrame(() => resolveFrame()))))
   await page.waitForTimeout(60)
+}
+
+async function verifyRunningComposerSteering(
+  page: import('playwright-core').Page,
+  label: string,
+): Promise<RunningComposerInteractionCheck> {
+  const editor = page.getByRole('textbox', { name: 'Message', exact: true })
+  const instructions = page.getByRole('button', { name: 'Add instructions', exact: true })
+  const stop = page.getByRole('button', { name: 'Stop agent', exact: true })
+  await stop.waitFor({ state: 'visible' })
+  const state = {
+    contentEditable: await editor.getAttribute('contenteditable'),
+    disabled: await editor.getAttribute('aria-disabled'),
+    readOnly: await editor.getAttribute('aria-readonly'),
+    placeholder: await editor.getAttribute('aria-placeholder'),
+    dataPlaceholder: await editor.getAttribute('data-placeholder'),
+    value: await readComposerValue(editor),
+    addActionsDisabled: await page.getByRole('button', { name: 'Add files and connections', exact: true }).isDisabled(),
+    modelSelectionDisabled: await page.getByRole('combobox', { name: '选择模型', exact: true }).isDisabled(),
+    emptyInstructionsDisabled: await instructions.isDisabled(),
+    stopEnabled: await stop.isEnabled(),
+  }
+  if (state.contentEditable !== 'true' || state.disabled === 'true' || state.readOnly === 'true'
+    || state.placeholder !== 'Add a requirement or correct the direction…'
+    || state.dataPlaceholder !== state.placeholder || state.value !== ''
+    || !state.addActionsDisabled || !state.modelSelectionDisabled || !state.emptyInstructionsDisabled || !state.stopEnabled) {
+    throw new Error(`${label} composer did not expose the running steering contract: ${JSON.stringify(state)}`)
+  }
+  await editor.fill('Keep the final report concise.')
+  if (!await instructions.isEnabled() || !await stop.isEnabled()) {
+    throw new Error(`${label} did not enable instructions while preserving Stop after typing`)
+  }
+  await editor.fill('')
+  if (!await instructions.isDisabled() || !await stop.isEnabled()) {
+    throw new Error(`${label} did not restore the empty steering controls after clearing the draft`)
+  }
+  await editor.blur()
+  return {
+    composerEditable: true,
+    placeholder: 'Add a requirement or correct the direction…',
+    addActionsDisabled: true,
+    modelSelectionDisabled: true,
+    emptyInstructionsDisabled: true,
+    typedInstructionsEnabled: true,
+    stopVisible: true,
+  }
 }
 
 interface ConversationScrollMetrics {

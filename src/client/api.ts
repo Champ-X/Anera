@@ -1,5 +1,6 @@
 import type {
   AgentModelOption,
+  CancelRunTarget,
   CreditBalance,
   GitHubBranchPage,
   GitHubConnectionState,
@@ -49,6 +50,34 @@ export interface AgentMessageAttachment {
 
 export interface AgentCreateChatAttachment extends AgentMessageAttachment {
   url?: string
+}
+
+export interface AgentSubmissionAttempt {
+  fingerprint: string
+  messageId: string
+}
+
+/** Keep an uncertain HTTP receipt bound to exactly the same user intent. */
+export function resolveAgentSubmissionAttempt(
+  previous: AgentSubmissionAttempt | undefined,
+  input: {
+    sessionId?: string
+    content: string
+    attachments: readonly AgentCreateChatAttachment[]
+    model: string | null
+    enabledConnectorSlugs: readonly string[]
+    reviewedNodeId?: string
+  },
+): AgentSubmissionAttempt {
+  const fingerprint = JSON.stringify({
+    sessionId: input.sessionId ?? null,
+    content: input.content.trim(),
+    attachments: input.attachments.map(({ path, name, mime, url }) => ({ path, name, mime, url })),
+    model: input.model,
+    enabledConnectorSlugs: [...new Set(input.enabledConnectorSlugs)].sort(),
+    reviewedNodeId: input.reviewedNodeId ?? null,
+  })
+  return previous?.fingerprint === fingerprint ? previous : { fingerprint, messageId: generateUuidV7() }
 }
 
 export function generateUuidV7(now = Date.now()): string {
@@ -129,6 +158,7 @@ export const api = {
     attachments: AgentCreateChatAttachment[],
     model: string | null,
     enabledConnectorSlugs: string[],
+    messageId = generateUuidV7(),
   ): Promise<string> {
     const text = content.trim()
     const uploads = attachments.map((attachment) => ({
@@ -159,7 +189,7 @@ export const api = {
         : undefined,
       body: JSON.stringify({
         message: {
-          id: generateUuidV7(),
+          id: messageId,
           role: 'user',
           parts,
           ...(uploads.length > 0 ? { metadata: { manifestNodeId: null, uploads } } : {}),
@@ -169,6 +199,7 @@ export const api = {
         ...(model ? { modelId: model } : {}),
       }),
     })
+    if (typeof result.id !== 'string' || !result.id) throw new Error('Create-chat response did not contain a session id; retry the same message.')
     return result.id
   },
   async listAgentModels(): Promise<AgentModelOption[]> {
@@ -209,7 +240,7 @@ export const api = {
   async officeArtifactPreview(id: string, path: string): Promise<OfficeArtifactPreview> {
     return await request(`/api/sessions/${id}/artifact-preview?path=${encodeURIComponent(path)}`)
   },
-  async send(id: string, content: string, attachments: AgentMessageAttachment[], model: string | null, enabledConnectorSlugs: string[], reviewedNodeId?: string): Promise<void> {
+  async send(id: string, content: string, attachments: AgentMessageAttachment[], model: string | null, enabledConnectorSlugs: string[], reviewedNodeId?: string, clientMessageId?: string): Promise<void> {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
     await request(`/api/sessions/${id}/messages`, {
       method: 'POST',
@@ -217,11 +248,12 @@ export const api = {
         ...arenaAgentMessageTransport(id, content, attachments, reviewedNodeId, timezone),
         model,
         enabledConnectorSlugs,
+        ...(clientMessageId ? { clientMessageId } : {}),
       }),
     })
   },
-  async stop(id: string): Promise<void> {
-    await request(`/api/sessions/${id}/stop`, { method: 'POST', body: '{}' })
+  async stop(id: string, target?: CancelRunTarget): Promise<void> {
+    await request(`/api/sessions/${id}/stop`, { method: 'POST', body: JSON.stringify(target ?? {}) })
   },
   async resume(id: string, model?: string): Promise<void> {
     await request(`/api/sessions/${id}/resume`, { method: 'POST', body: JSON.stringify({ model }) })

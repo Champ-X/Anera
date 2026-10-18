@@ -38,6 +38,7 @@ import {
   projectTimeline,
   reconcileSnapshot,
   resolveCreditGaugeState,
+  resolveCancelRunTarget,
   resolveCustomFeedbackOffer,
   resolveUndoTurnCandidate,
   resolveTaskCompletion,
@@ -65,6 +66,29 @@ import {
   WorkspacePanel,
   workspaceWriteDraftsFromTimeline,
 } from './App.js'
+
+describe('run-scoped cancellation', () => {
+  it('targets the newest observed turn and does not reuse a prior input identity for resume', () => {
+    const snapshot = fixture([
+      { ...event(1, 'turn.started', { clientMessageId: 'input_first', content: 'First' }, 'step_first'), turnId: 'turn_first' },
+      { ...event(3, 'run.resumed', {}, 'step_resume'), turnId: 'turn_resume' },
+      { ...event(2, 'assistant.final', { content: 'Partial' }, 'step_first'), turnId: 'turn_first' },
+    ])
+    snapshot.session.status = 'running'
+    expect(resolveCancelRunTarget(snapshot)).toEqual({ targetTurnId: 'turn_resume' })
+    snapshot.events.push({ ...event(4, 'turn.started', { clientMessageId: 'input_next', content: 'Next' }, 'step_next'), turnId: 'turn_next' })
+    expect(resolveCancelRunTarget(snapshot)).toEqual({ targetTurnId: 'turn_next', targetInputId: 'input_next' })
+    snapshot.session.status = 'completed'
+    expect(resolveCancelRunTarget(snapshot)).toBeUndefined()
+  })
+
+  it('does not send an untargeted stop when initial hydration has not supplied a run identity', () => {
+    const snapshot = fixture([])
+    snapshot.session.status = 'queued'
+    expect(resolveCancelRunTarget(snapshot)).toBeUndefined()
+    expect(resolveCancelRunTarget(undefined)).toBeUndefined()
+  })
+})
 
 describe('streamed file-write projection', () => {
   it('offers a keyboard-accessible HTML viewer while keeping the thumbnail out of the tab order', () => {

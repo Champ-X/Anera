@@ -48,6 +48,7 @@ export interface VisualWorkspacePersistenceFixture {
 }
 
 const MODEL = 'arena-agent-fixture'
+export { MODEL as VISUAL_FIXTURE_MODEL }
 
 const LONG_THOUGHT_TITLE = 'Synthetic Long Thought · zero provider calls'
 const LONG_THOUGHT_MODEL = 'synthetic-ui-zero-provider'

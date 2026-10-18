@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import { ANERA_DEV_PROXY, ANERA_DEV_PROXY_TARGET } from '../shared/dev-proxy'
-import { api, generateUuidV7, type AgentMessageAttachment } from './api'
+import { api, generateUuidV7, resolveAgentSubmissionAttempt, type AgentMessageAttachment } from './api'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -16,7 +16,7 @@ function captureRequests() {
       init,
       body: JSON.parse(String(init?.body || '{}')) as Record<string, unknown>,
     })
-    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    return new Response(String(url).endsWith('/create-chat') ? '{"id":"ses_created"}' : '{}', { status: 200, headers: { 'content-type': 'application/json' } })
   })
   vi.stubGlobal('fetch', fetchMock)
   return requests
@@ -33,6 +33,39 @@ describe('Vite development proxy', () => {
 })
 
 describe('Arena-shaped desktop message transport', () => {
+  it('preserves explicit input identities and scopes stop requests to the observed run', async () => {
+    const requests = captureRequests()
+    const messageId = generateUuidV7()
+    await api.createAgentChat('First', [], 'deepseek-flash', [], messageId)
+    await api.send('ses_retry', 'Follow-up', [], 'deepseek-flash', [], undefined, messageId)
+    await api.stop('ses_retry', { targetTurnId: 'turn_observed', targetInputId: messageId })
+    await api.stop('ses_legacy')
+
+    expect((requests[0]?.body.message as { id: string }).id).toBe(messageId)
+    expect(requests[1]?.body.clientMessageId).toBe(messageId)
+    expect(requests[2]?.body).toEqual({ targetTurnId: 'turn_observed', targetInputId: messageId })
+    expect(requests[3]?.body).toEqual({})
+  })
+
+  it('reuses an uncertain receipt only for equivalent requests and rotates it for meaningful changes', () => {
+    const input = {
+      sessionId: 'ses_retry', content: 'Inspect this file.',
+      attachments: [{ path: 'uploads/brief.txt', name: 'brief.txt', mime: 'text/plain' }],
+      model: 'deepseek-flash', enabledConnectorSlugs: ['github', 'linear'], reviewedNodeId: 'evt_review',
+    }
+    const first = resolveAgentSubmissionAttempt(undefined, input)
+    expect(resolveAgentSubmissionAttempt(first, { ...input, content: ' Inspect this file. ', enabledConnectorSlugs: ['linear', 'github', 'github'] })).toBe(first)
+    for (const changed of [
+      { ...input, sessionId: 'ses_other' },
+      { ...input, content: 'Inspect another file.' },
+      { ...input, attachments: [{ ...input.attachments[0]!, path: 'uploads/another.txt' }] },
+      { ...input, model: 'deepseek-v4-pro' },
+      { ...input, enabledConnectorSlugs: [] },
+      { ...input, reviewedNodeId: 'evt_another_review' },
+    ]) expect(resolveAgentSubmissionAttempt(first, changed).messageId).not.toBe(first.messageId)
+    expect(resolveAgentSubmissionAttempt(undefined, input).messageId).not.toBe(first.messageId)
+  })
+
   it('carries explicit models on follow-up and resume, preserving model-less resume compatibility', async () => {
     const requests = captureRequests()
     await api.send('ses_model', 'Follow up', [], 'deepseek-v4-pro', [])
@@ -47,6 +80,12 @@ describe('Arena-shaped desktop message transport', () => {
 
     await expect(api.createAgentChat('Diagnose routing.', [], 'deepseek-chat', []))
       .rejects.toThrow('POST /nextjs-api/stream/create-chat failed (404)')
+  })
+
+  it('keeps a missing creation receipt uncertain instead of claiming success without a session id', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"id":', { headers: { 'content-type': 'application/json' } })))
+    await expect(api.createAgentChat('Retry this task.', [], 'deepseek-flash', [], generateUuidV7()))
+      .rejects.toThrow('Create-chat response did not contain a session id')
   })
 
   it('uses Arena current create-chat envelope for an atomic first submission', async () => {

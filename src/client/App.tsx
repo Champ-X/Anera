@@ -3,6 +3,7 @@ import { ModelSelector } from './ModelSelector'
 import {
   Archive,
   ArrowDown,
+  ArrowRight,
   ArrowUp,
   BrainCircuit,
   Check,
@@ -35,9 +36,10 @@ import {
   Menu,
   MousePointer2,
   Paperclip,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
   Plus,
-  Plug,
   RefreshCw,
   RotateCcw,
   Search,
@@ -51,7 +53,7 @@ import {
   Volume2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import aneraLogoUrl from '../../logo.png'
@@ -60,6 +62,7 @@ import { AGENT_UPLOAD_ACCEPT_ATTR, selectAgentUploads } from '../shared/agent-up
 import type {
   AgentModelOption,
   ArtifactRecord,
+  CancelRunTarget,
   CodingRepositoryState,
   CreditBalance,
   GitHubBranch,
@@ -82,7 +85,7 @@ import type {
   WorkspaceInventoryMetadata,
 } from '../shared/types'
 import { AGENT_LEADERBOARD_PATH, AgentLeaderboard, isAgentLeaderboardPath } from './AgentLeaderboard'
-import { api, ApiRequestError } from './api'
+import { api, ApiRequestError, resolveAgentSubmissionAttempt, type AgentSubmissionAttempt } from './api'
 import { mergeSteeringMessages, SteeringUpdates, visibleSteeringMessages } from './SteeringUpdates'
 import { WorkspaceVersionsDialog } from './WorkspaceVersionsDialog'
 import { MAX_STEERING_CONTENT_LENGTH, type SteeringMessage } from '../shared/steering'
@@ -100,6 +103,7 @@ import {
 
 export const HISTORY_SEARCH_PATH = '/history/search'
 export const AGENT_DRAFT_PATH = '/agent'
+export const SIDEBAR_COLLAPSED_STORAGE_KEY = 'anera-sidebar-collapsed'
 const DRAFT_COMPOSER_SESSION_ID = 'draft'
 export const CONVERSATION_NEAR_BOTTOM_PX = 32
 
@@ -589,6 +593,20 @@ export async function materializeComposerAttachments(
   return resolved
 }
 
+export function resolveCancelRunTarget(snapshot?: SessionSnapshot): CancelRunTarget | undefined {
+  if (!snapshot || !['queued', 'running', 'cancelling', 'awaiting_approval'].includes(snapshot.session.status)) return undefined
+  const start = snapshot.events.reduce<SessionEvent | undefined>((latest, event) => (
+    (event.type === 'turn.started' || event.type === 'run.resumed') && event.turnId
+      && (!latest || event.seq > latest.seq) ? event : latest
+  ), undefined)
+  if (!start?.turnId) return undefined
+  const clientMessageId = start.type === 'turn.started' ? start.data.clientMessageId : undefined
+  return {
+    targetTurnId: start.turnId,
+    ...(typeof clientMessageId === 'string' && clientMessageId ? { targetInputId: clientMessageId } : {}),
+  }
+}
+
 export interface UndoTurnCandidate {
   sessionNodeId: string
   promptText: string
@@ -675,6 +693,36 @@ export function App() {
   const [modelListUnavailable, setModelListUnavailable] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [leftOpen, setLeftOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true' }
+    catch { return false }
+  })
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null)
+  const sidebarHistoryRef = useRef<HTMLDivElement>(null)
+  const toggleSidebar = useCallback(() => {
+    if (!sidebarCollapsed && window.matchMedia('(min-width: 721px)').matches
+      && sidebarHistoryRef.current?.contains(document.activeElement)) {
+      sidebarToggleRef.current?.focus()
+    }
+    setSidebarCollapsed((collapsed) => !collapsed)
+  }, [sidebarCollapsed])
+  useEffect(() => {
+    try { window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed)) }
+    catch { /* The sidebar remains usable when browser storage is unavailable. */ }
+  }, [sidebarCollapsed])
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.altKey || event.shiftKey
+        || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'b'
+        || !window.matchMedia('(min-width: 721px)').matches) return
+      const target = event.target instanceof Element ? event.target : null
+      if (target?.closest('input, textarea, select, [contenteditable]')) return
+      event.preventDefault()
+      toggleSidebar()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [toggleSidebar])
   const [searchOpen, setSearchOpen] = useState(false)
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget>()
   const [previewMode, setPreviewMode] = useState<'rendered' | 'source'>('rendered')
@@ -718,6 +766,7 @@ export function App() {
   const [workspaceInventory, setWorkspaceInventory] = useState<WorkspaceInventoryView>()
   const [thankYouPhase, setThankYouPhase] = useState<'in' | 'out' | null>(null)
   const [composerDraftCommand, setComposerDraftCommand] = useState<ComposerDraftCommand>()
+  const [draftHasText, setDraftHasText] = useState(false)
   const [activeCustomFeedback, setActiveCustomFeedback] = useState<{ sessionId: string; messageEventId: string }>()
   const [dismissedCustomFeedback, setDismissedCustomFeedback] = useState<{ sessionId: string; messageEventId: string }>()
   const [conversationAwayFromBottom, setConversationAwayFromBottom] = useState(false)
@@ -730,6 +779,7 @@ export function App() {
   const composerDraftRef = useRef<ComposerDraftSnapshot | undefined>(undefined)
   const newChatDraftRef = useRef<ComposerDraftSnapshot>({ sessionId: DRAFT_COMPOSER_SESSION_ID, value: '', attachments: [] })
   const pendingComposerDraftRef = useRef<ComposerDraftSnapshot | undefined>(undefined)
+  const submissionAttemptsRef = useRef(new Map<string, AgentSubmissionAttempt>())
   const composerDraftCommandId = useRef(0)
   const previewIframeRef = useRef<HTMLIFrameElement>(null)
   const conversationScrollRef = useRef<HTMLDivElement>(null)
@@ -853,6 +903,7 @@ export function App() {
     composerDraftRef.current = { ...command, attachments: command.attachments.map((attachment) => ({ ...attachment })) }
     if (command.sessionId === DRAFT_COMPOSER_SESSION_ID) {
       newChatDraftRef.current = { ...command, attachments: command.attachments.map((attachment) => ({ ...attachment })) }
+      setDraftHasText(Boolean(command.value.trim()))
     }
     setComposerDraftCommand(command)
   }, [])
@@ -860,7 +911,10 @@ export function App() {
   const recordComposerDraft = useCallback((draft: ComposerDraftSnapshot) => {
     const copy = { ...draft, attachments: draft.attachments.map((attachment) => ({ ...attachment })) }
     composerDraftRef.current = copy
-    if (copy.sessionId === DRAFT_COMPOSER_SESSION_ID) newChatDraftRef.current = copy
+    if (copy.sessionId === DRAFT_COMPOSER_SESSION_ID) {
+      newChatDraftRef.current = copy
+      setDraftHasText(Boolean(copy.value.trim()))
+    }
   }, [])
 
   useEffect(() => {
@@ -1008,6 +1062,7 @@ export function App() {
     setError(undefined)
     if (resetDraft) {
       manuallyClosedWorkspaceRef.current.clear()
+      submissionAttemptsRef.current.delete(DRAFT_COMPOSER_SESSION_ID)
       newChatDraftRef.current = { sessionId: DRAFT_COMPOSER_SESSION_ID, value: '', attachments: [] }
     }
     applyComposerDraft(newChatDraftRef.current, focus)
@@ -1558,6 +1613,9 @@ export function App() {
       && dismissedCustomFeedback.messageEventId === customFeedbackOffer.messageEventId),
   )
   const emptySession = !loading && timeline.length === 0
+  const conversationTitle = activeId
+    ? (snapshot?.session.id === activeId ? snapshot.session.title : sessions.find((session) => session.id === activeId)?.title) || 'Conversation'
+    : 'New chat'
 
   useLayoutEffect(() => {
     clearConversationScrollSettleTimer()
@@ -1748,35 +1806,50 @@ export function App() {
   }, [taskCompletion?.messageEventId])
 
   return (
-    <div className={`app-shell ${appRoute === 'leaderboard' ? 'leaderboard-route' : ''} ${appRoute === 'agent' && workspaceVisible && activeId ? 'workspace-open' : ''} ${appRoute === 'agent' && previewTarget && activeId ? 'preview-open' : ''} ${appRoute === 'agent' && emptySession ? 'empty-session' : ''}`}>
-      <button className="mobile-rail-button" aria-label="Open conversations" onClick={() => setLeftOpen(true)}><Menu size={18} /></button>
-      <aside className={`left-rail ${leftOpen ? 'is-open' : ''}`}>
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${appRoute === 'leaderboard' ? 'leaderboard-route' : ''} ${appRoute === 'agent' && workspaceVisible && activeId ? 'workspace-open' : ''} ${appRoute === 'agent' && previewTarget && activeId ? 'preview-open' : ''} ${appRoute === 'agent' && emptySession ? 'empty-session' : ''}`}>
+      <button className="mobile-rail-button" aria-label="Open conversations" aria-expanded={leftOpen} aria-controls="conversation-sidebar" onClick={() => setLeftOpen(true)}><Menu size={18} aria-hidden="true" /></button>
+      <aside id="conversation-sidebar" className={`left-rail ${leftOpen ? 'is-open' : ''}`}>
         <div className="brand-row">
           <Brand />
-          <button className="mobile-close" aria-label="Close conversations" onClick={() => setLeftOpen(false)}><X size={17} /></button>
+          <button
+            ref={sidebarToggleRef}
+            className="sidebar-toggle"
+            type="button"
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!sidebarCollapsed}
+            aria-controls="conversation-sidebar"
+            aria-keyshortcuts="Control+B Meta+B"
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            onClick={toggleSidebar}
+          >{sidebarCollapsed ? <PanelLeftOpen size={18} aria-hidden="true" /> : <PanelLeftClose size={18} aria-hidden="true" />}</button>
+          <button className="mobile-close" aria-label="Close conversations" aria-expanded={leftOpen} aria-controls="conversation-sidebar" onClick={() => setLeftOpen(false)}><X size={17} aria-hidden="true" /></button>
         </div>
         <nav className="rail-links" aria-label="Primary">
           <button
             className="new-chat"
+            aria-label="New Chat"
             disabled={STATIC_SHOWCASE}
-            title={STATIC_SHOWCASE ? 'New tasks are disabled in this static replay' : undefined}
+            title={STATIC_SHOWCASE ? 'New tasks are disabled in this static replay' : 'New Chat'}
             onClick={() => navigateToDraft(false, true, true)}
-          ><Plus size={16} /> New Chat</button>
+          ><Plus size={16} aria-hidden="true" /><span>New Chat</span></button>
           <button
             className={appRoute === 'leaderboard' ? 'active' : ''}
+            aria-label="Leaderboard"
+            title="Leaderboard"
             aria-current={appRoute === 'leaderboard' ? 'page' : undefined}
             onClick={() => navigateToLeaderboard()}
-          ><Sparkles size={16} /> Leaderboard</button>
+          ><Sparkles size={16} aria-hidden="true" /><span>Leaderboard</span></button>
           <button
             className={searchOpen ? 'active' : ''}
+            aria-label="Search"
             aria-current={searchOpen ? 'page' : undefined}
             aria-haspopup="dialog"
             aria-expanded={searchOpen}
             title="Search conversations (⌘K)"
             onClick={() => navigateToSearch()}
-          ><Search size={16} /> Search</button>
+          ><Search size={16} aria-hidden="true" /><span>Search</span></button>
         </nav>
-        <div className="history-list">
+        <div ref={sidebarHistoryRef} className="history-list">
           {groupHistorySessions(sessions).map((group) => (
             <section className="history-group" key={group.label}>
               <div className="history-label">{group.label}</div>
@@ -1817,7 +1890,7 @@ export function App() {
           ? <AgentLeaderboard onTryAgent={() => navigateToDraft()} />
           : <>
         <header className="stage-header">
-          <button className="mode-picker"><Sparkles size={14} /> Agent Mode <ChevronDown size={14} /></button>
+          <span className="stage-title" title={conversationTitle}>{conversationTitle}</span>
           <div className="stage-actions">
             {snapshot?.session.archivedAt && <span className="archived-session-controls">
               <Archive size={13} />Archived
@@ -1825,7 +1898,7 @@ export function App() {
             </span>}
             {snapshot?.repository && <span className="header-repository"><Github size={12} />{snapshot.repository.fullName}<GitBranch size={11} />{snapshot.repository.baseBranch}</span>}
             <span className="model-label">{snapshot?.session.model || 'DeepSeek'}</span>
-            {!workspaceVisible && <button
+            {!workspaceVisible && activeId && <button
               className={`workspace-toggle ${workspaceVisible ? 'active' : ''}`}
               aria-label="Toggle workspace sidebar"
               aria-pressed={workspaceVisible}
@@ -2125,6 +2198,17 @@ export function App() {
               setActiveComposerOperation('submit')
               let targetSessionId = activeId
               let stagedAttachments = attachments.map((attachment) => ({ ...attachment }))
+              const submissionScope = activeId ?? DRAFT_COMPOSER_SESSION_ID
+              const enabledConnectorSlugs = githubConnection.status === 'connected' && repositoryPanelOpen ? ['github'] : []
+              let attemptedMessageId: string | undefined
+              const submissionAttempt = () => {
+                const attempt = resolveAgentSubmissionAttempt(submissionAttemptsRef.current.get(submissionScope), {
+                  sessionId: activeId, content, attachments: stagedAttachments, model, enabledConnectorSlugs, reviewedNodeId,
+                })
+                submissionAttemptsRef.current.set(submissionScope, attempt)
+                attemptedMessageId = attempt.messageId
+                return attempt
+              }
               const restoreTargetDraft = (focus = false) => {
                 if (!targetSessionId) return
                 const draft: ComposerDraftSnapshot = {
@@ -2136,6 +2220,17 @@ export function App() {
                   pendingComposerDraftRef.current = draft
                 }
                 if (activeIdRef.current === targetSessionId) applyComposerDraft(draft, focus)
+              }
+              const clearAcceptedDraft = () => {
+                if (!targetSessionId) return
+                submissionAttemptsRef.current.delete(submissionScope)
+                const clearedDraft: ComposerDraftSnapshot = { sessionId: targetSessionId, value: '', attachments: [] }
+                if (pendingComposerDraftRef.current?.sessionId === targetSessionId) pendingComposerDraftRef.current = clearedDraft
+                if (activeIdRef.current === targetSessionId) applyComposerDraft(clearedDraft)
+                if (reviewedNodeId && activeIdRef.current === targetSessionId) {
+                  setActiveCustomFeedback(undefined)
+                  setDismissedCustomFeedback({ sessionId: targetSessionId, messageEventId: reviewedNodeId })
+                }
               }
               try {
                 if (!snapshot?.repository && repositoryPanelOpen && githubConnection.status === 'connected') {
@@ -2164,8 +2259,10 @@ export function App() {
                       content,
                       stagedAttachments.map(({ path, name, mime, url }) => ({ path, name, mime, url })),
                       model,
-                      githubConnection.status === 'connected' && repositoryPanelOpen ? ['github'] : [],
+                      enabledConnectorSlugs,
+                      submissionAttempt().messageId,
                     )
+                    submissionAttemptsRef.current.delete(submissionScope)
                     const migratedDraft: ComposerDraftSnapshot = {
                       sessionId: targetSessionId,
                       value: content,
@@ -2173,8 +2270,11 @@ export function App() {
                     }
                     pendingComposerDraftRef.current = migratedDraft
                     newChatDraftRef.current = { sessionId: DRAFT_COMPOSER_SESSION_ID, value: '', attachments: [] }
-                    setSessions(await api.listSessions())
                     navigateToSession(targetSessionId)
+                    // The send is committed even if refreshing the history list fails.
+                    void refreshSessions().catch((reason) => {
+                      if (activeIdRef.current === targetSessionId) setError(messageOf(reason))
+                    })
                   } else {
                     stagedAttachments = await materializeComposerAttachments(
                       stagedAttachments,
@@ -2189,20 +2289,24 @@ export function App() {
                       content,
                       stagedAttachments.map(({ path, name, mime }) => ({ path, name, mime })),
                       model,
-                      githubConnection.status === 'connected' && repositoryPanelOpen ? ['github'] : [],
+                      enabledConnectorSlugs,
                       reviewedNodeId,
+                      submissionAttempt().messageId,
                     )
+                    submissionAttemptsRef.current.delete(submissionScope)
                   }
-                  const clearedDraft: ComposerDraftSnapshot = { sessionId: targetSessionId, value: '', attachments: [] }
-                  if (pendingComposerDraftRef.current?.sessionId === targetSessionId) pendingComposerDraftRef.current = clearedDraft
-                  if (activeIdRef.current === targetSessionId) applyComposerDraft(clearedDraft)
-                  if (reviewedNodeId && activeIdRef.current === targetSessionId) {
-                    setActiveCustomFeedback(undefined)
-                    setDismissedCustomFeedback({ sessionId: targetSessionId, messageEventId: reviewedNodeId })
-                  }
+                  clearAcceptedDraft()
                 }
               }
               catch (reason) {
+                if (targetSessionId && attemptedMessageId) {
+                  // A durable turn can acknowledge a request whose HTTP receipt was lost.
+                  const latest = await refreshSnapshot(targetSessionId).catch(() => undefined)
+                  if (latest?.events.some((event) => event.type === 'turn.started' && event.data.clientMessageId === attemptedMessageId)) {
+                    clearAcceptedDraft()
+                    return
+                  }
+                }
                 restoreTargetDraft(true)
                 void refreshCredits().catch(() => undefined)
                 setError(codingErrorMessage(reason))
@@ -2213,7 +2317,9 @@ export function App() {
             }}
             onStop={async () => {
               if (!activeId) return
-              try { await api.stop(activeId) }
+              const target = resolveCancelRunTarget(snapshot)
+              if (!target) return
+              try { await api.stop(activeId, target) }
               catch (reason) { void refreshCredits().catch(() => undefined); setError(messageOf(reason)) }
             }}
             onResume={async (model) => {
@@ -2229,6 +2335,15 @@ export function App() {
               navigateToDraft(false, true, true)
             }}
             />
+            {!activeId && !loading && !STATIC_SHOWCASE && !draftHasText && !activeComposerOperation && <div className="starter-prompts" role="group" aria-label="Suggested tasks">
+              {[
+                { label: 'Research a topic', icon: Search, prompt: '请帮我研究【主题】。优先查找可靠的一手资料，比较主要观点，列出结论、证据链接和仍需确认的问题。' },
+                { label: 'Build a web app', icon: Code2, prompt: '请帮我构建一个【用途】网页应用。目标用户是【用户】，核心功能包括【功能】。先明确必要信息，再实现并验证主要交互。' },
+                { label: 'Create a presentation', icon: FileText, prompt: '请帮我制作一份关于【主题】的演示文稿，面向【受众】，约【页数】页。先拟定叙事结构，再完成内容和视觉设计。' },
+              ].map(({ label, icon: Icon, prompt }) => <button type="button" key={label} onClick={() => {
+                applyComposerDraft({ ...newChatDraftRef.current, value: prompt }, true)
+              }}><Icon size={16} aria-hidden="true" /><span>{label}</span></button>)}
+            </div>}
           </div>
         )}
         </>}
@@ -2847,6 +2962,13 @@ export function Composer(props: {
   const [uploading, setUploading] = useState(false)
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [creditOpen, setCreditOpen] = useState(false)
+  const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const addControl = useRef<HTMLDivElement>(null)
+  const addTrigger = useRef<HTMLButtonElement>(null)
+  const addMenu = useRef<HTMLDivElement>(null)
+  const addMenuId = useId()
+  const addMenuInitialFocus = useRef<'first' | 'last'>('first')
+  const connectionMenuRequested = useRef(false)
   const [steeringPending, setSteeringPending] = useState(false)
   const steeringAttempt = useRef<{ content: string; clientMessageId: string } | undefined>(undefined)
   const steeringSubmitting = useRef(false)
@@ -2861,6 +2983,7 @@ export function Composer(props: {
   const applyingDraftCommand = useRef<number | undefined>(undefined)
   const blockedBySessionLimit = Boolean(props.tokenLimit?.reached)
   const canSteer = Boolean(props.steeringEnabled && props.onSteer)
+  const addActionsDisabled = Boolean(props.readOnly || props.running || canSteer || blockedBySessionLimit)
   const editorLocked = props.readOnly || (props.running && !canSteer) || blockedBySessionLimit || steeringPending
   const placeholder = props.readOnly
     ? 'Static replay — new tasks are disabled'
@@ -2873,6 +2996,37 @@ export function Composer(props: {
       : props.reviewedNodeId
         ? 'Give feedback on this task…'
         : 'Ask anything…'
+  useEffect(() => { setAddMenuOpen(false) }, [props.sessionId, addActionsDisabled])
+  useLayoutEffect(() => {
+    if (!addMenuOpen) return
+    const items = addMenu.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
+    const target = addMenuInitialFocus.current === 'last' ? items?.[items.length - 1] : items?.[0]
+    target?.focus({ preventScroll: true })
+  }, [addMenuOpen])
+  useEffect(() => {
+    if (!addMenuOpen) return
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !addControl.current?.contains(event.target)) setAddMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [addMenuOpen])
+  useEffect(() => {
+    if (!props.connectionsOpen || !connectionMenuRequested.current) return
+    connectionMenuRequested.current = false
+    const frame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>('.connections-panel button:not(:disabled), .connections-panel input:not(:disabled)')?.focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [props.connectionsOpen])
+  useEffect(() => {
+    if (!props.connectionsOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') window.requestAnimationFrame(() => addTrigger.current?.focus({ preventScroll: true }))
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [props.connectionsOpen])
   useEffect(() => {
     const attempt = steeringAttempt.current
     if (!attempt || steeringPending || !props.steeringMessages?.some((message) => message.clientMessageId === attempt.clientMessageId)) return
@@ -3033,7 +3187,7 @@ export function Composer(props: {
         {(props.reviewedNodeId || attachments.length > 0) && <div className="attachment-row">
           {props.reviewedNodeId && <div className="feedback-chip" data-reviewed-node-id={props.reviewedNodeId}><Heart size={13} /><span>Feedback</span><button type="button" aria-label="Remove Feedback" onClick={props.onRemoveCustomFeedback}><X size={12} /></button></div>}
           {attachments.map((attachment) => (
-            <div className="attachment-chip" key={attachment.path}><FileIcon size={13} /><span>{attachment.name}</span><button onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></div>
+            <div className="attachment-chip" key={attachment.path}><FileIcon size={13} /><span>{attachment.name}</span><button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></div>
           ))}
         </div>}
         <div
@@ -3094,7 +3248,7 @@ export function Composer(props: {
             if (event.key !== 'Enter') return
             if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
             event.preventDefault()
-            if (event.shiftKey) {
+            if (event.shiftKey || window.matchMedia('(max-width: 720px)').matches) {
               insertComposerText(event.currentTarget, '\n')
               setValue(composerText(event.currentTarget))
               return
@@ -3120,21 +3274,73 @@ export function Composer(props: {
               }
             }}
           />
-          <button className="attach-button" title={props.readOnly ? 'Uploads are disabled in the static replay' : 'Upload files'} disabled={props.readOnly || props.running || canSteer || blockedBySessionLimit || uploading} onClick={() => fileInput.current?.click()} aria-label={draggingFiles ? 'Drop files' : 'Add files'}>
-            {uploading ? <LoaderCircle className="spin" size={16} /> : draggingFiles ? <CloudUpload size={16} /> : <Paperclip size={16} />}
-            <span>{draggingFiles ? 'Drop files...' : 'Add files'}</span>
-          </button>
-          <button
-            className={`connections-button ${props.connectionsOpen ? 'active' : ''}`}
-            type="button"
-            aria-label={props.connectionsEnabled ? 'Connections enabled: GitHub' : 'Connections'}
-            aria-expanded={props.connectionsOpen}
-            disabled={props.readOnly || props.running || canSteer || blockedBySessionLimit}
-            onClick={(event) => {
-              const bounds = event.currentTarget.getBoundingClientRect()
-              props.onConnections({ left: bounds.left, top: bounds.top })
-            }}
-          >{props.connectionsEnabled ? <Github size={14} /> : <Plug size={14} />}<ChevronDown className={props.connectionsOpen ? 'open' : ''} size={11} /></button>
+          <div ref={addControl} className="composer-add-control">
+            <button
+              ref={addTrigger}
+              className={`composer-add-button connections-button ${addMenuOpen || props.connectionsOpen ? 'active' : ''}`}
+              type="button"
+              aria-label="Add files and connections"
+              aria-haspopup="menu"
+              aria-expanded={addMenuOpen}
+              aria-controls={addMenuId}
+              data-connections-enabled={props.connectionsEnabled}
+              title={props.readOnly ? 'Files and connections are disabled in the static replay' : props.connectionsEnabled ? 'Add files and connections · GitHub enabled' : 'Add files and connections'}
+              disabled={addActionsDisabled}
+              onClick={() => {
+                if (props.connectionsOpen && addTrigger.current) {
+                  const bounds = addTrigger.current.getBoundingClientRect()
+                  props.onConnections({ left: bounds.left, top: bounds.top })
+                }
+                addMenuInitialFocus.current = 'first'
+                setAddMenuOpen((open) => !open)
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+                event.preventDefault()
+                if (props.connectionsOpen && addTrigger.current) {
+                  const bounds = addTrigger.current.getBoundingClientRect()
+                  props.onConnections({ left: bounds.left, top: bounds.top })
+                }
+                addMenuInitialFocus.current = event.key === 'ArrowUp' ? 'last' : 'first'
+                setAddMenuOpen(true)
+              }}
+            >{uploading ? <LoaderCircle className="spin" size={16} /> : draggingFiles ? <CloudUpload size={16} /> : <Plus size={18} aria-hidden="true" />}</button>
+            {addMenuOpen && <div
+              ref={addMenu}
+              id={addMenuId}
+              className="composer-add-menu"
+              role="menu"
+              aria-label="Add files and connections"
+              onKeyDown={(event) => {
+                const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')]
+                const index = items.indexOf(document.activeElement as HTMLButtonElement)
+                if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+                  event.preventDefault()
+                  const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+                    : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+                  items[next]?.focus()
+                } else if (event.key === 'Escape' || event.key === 'Tab') {
+                  if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation() }
+                  setAddMenuOpen(false)
+                  addTrigger.current?.focus({ preventScroll: true })
+                }
+              }}
+            >
+              <button type="button" role="menuitem" disabled={addActionsDisabled || uploading} onClick={() => {
+                setAddMenuOpen(false)
+                addTrigger.current?.focus({ preventScroll: true })
+                fileInput.current?.click()
+              }}><Paperclip size={16} aria-hidden="true" /><span>Upload files</span></button>
+              <button type="button" role="menuitem" aria-label="GitHub connection" disabled={addActionsDisabled} onClick={() => {
+                const bounds = addTrigger.current?.getBoundingClientRect()
+                if (!bounds) return
+                setAddMenuOpen(false)
+                connectionMenuRequested.current = true
+                props.onConnections({ left: bounds.left, top: bounds.top })
+              }}><Github size={16} aria-hidden="true" /><span>GitHub connection</span>{props.connectionsEnabled && <Check size={14} aria-label="Enabled" />}</button>
+            </div>}
+          </div>
+          <span className="composer-agent-label"><Sparkles size={14} aria-hidden="true" /><span>Agent</span></span>
           <ModelSelector models={props.models} value={modelSelection} unavailable={props.modelListUnavailable}
             disabled={Boolean(editorLocked || canSteer || props.submitDisabled)} onChange={setModelSelection} />
           <span className="composer-spacer" />
@@ -3154,7 +3360,7 @@ export function Composer(props: {
                 disabled={Boolean(props.readOnly || props.submitDisabled || modelPending || blockedBySessionLimit || ((!value.trim() && (attachments.length === 0 || props.codingMode)) || uploading))}
                 onClick={() => void submit()}
                 aria-label="Send message"
-              ><ArrowUp size={17} /></button>}
+              ><ArrowRight size={16} /></button>}
         </div>
       </div>
       {canSteer && <p className="steering-hint" id={`steering-hint-${props.sessionId}`}>Instructions apply in order at the next safe step. The current operation will finish first.</p>}
