@@ -31,6 +31,7 @@ import {
   type StaticDeploymentSnapshot,
 } from './deployment.js'
 import { createId } from './ids.js'
+import { assertCreationInput, assertInputReceipt, assertInputReceipts, type InputReceipt } from './input-submission.js'
 import { validateAgentUploadBytes } from './agent-upload-validation.js'
 import { terminateRecoveredManagedProcess, type ManagedProcessRecoveryResult } from './process-manager.js'
 import type { DurableReferenceStyleContract } from './reference-style.js'
@@ -57,6 +58,10 @@ import {
 } from './reference-fonts.js'
 
 export interface StoredSession {
+  /** Private initial input identity, committed before any uploads or execution. */
+  creationInput?: { id: string; fingerprint: string }
+  /** Admission receipts survive Undo, workspace restore, and process restart. */
+  inputReceipts?: Record<string, InputReceipt>
   /** Durable receipt/apply journal; messages join model context only at a closed tool boundary. */
   steering?: DurableSteeringMessage[]
   /** Private, source-bound review feedback; survives context compaction/resume. */
@@ -715,6 +720,7 @@ export interface DurableUsageSettlement {
 }
 
 export interface CreateSessionOptions {
+  creationInput?: { id: string; fingerprint: string }
   repository?: CodingRepositoryState
   workspaceSource?: string
   workspaceBytes?: number
@@ -1071,6 +1077,7 @@ export class SessionStore {
     }
     const creationEventId = createId('evt')
     const state: StoredSession = {
+      ...(options.creationInput ? { creationInput: options.creationInput } : {}),
       summary: {
         id,
         title: 'New task',
@@ -1132,6 +1139,9 @@ export class SessionStore {
     const queued = this.writeQueues.get(id)
     if (queued) await queued.catch(() => undefined)
     const state = await this.get(id)
+    if (state.pendingStart || Object.keys(state.inputReceipts ?? {}).length > 0) {
+      throw new Error('Cannot discard a Session after an input was accepted')
+    }
     if (['queued', 'running', 'awaiting_approval', 'awaiting_user', 'cancelling', 'completed'].includes(state.summary.status)) {
       throw new Error('Cannot discard a published or active Session')
     }
@@ -1818,6 +1828,27 @@ export class SessionStore {
     })
   }
 
+  /** Resolve initial input ownership from the same atomic state as creation.
+   * Missing state is an unfinished mkdir, before any run could be admitted.
+   * Other read errors fail closed: do not silently duplicate a damaged owner.
+   */
+  async findCreationInput(inputId: string): Promise<StoredSession | undefined> {
+    await this.initialize()
+    const names = await readdir(resolve(this.root, 'sessions'))
+    let found: StoredSession | undefined
+    for (const id of names.filter((name) => /^ses_[a-z0-9]{20}$/.test(name))) {
+      let state: StoredSession
+      try { state = await this.get(id) } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw error
+      }
+      if (state.creationInput?.id !== inputId) continue
+      if (found) throw new Error('Multiple sessions own the same initial input')
+      found = state
+    }
+    return found
+  }
+
   async list(): Promise<SessionSummary[]> {
     await this.initialize()
     const names = await readdir(resolve(this.root, 'sessions'))
@@ -1858,6 +1889,8 @@ export class SessionStore {
   async get(id: string): Promise<StoredSession> {
     assertSessionId(id)
     const state = JSON.parse(await readFile(this.statePath(id), 'utf8')) as StoredSession
+    if (state.creationInput !== undefined) assertCreationInput(state.creationInput)
+    if (state.inputReceipts !== undefined) assertInputReceipts(state.inputReceipts)
     state.processes ??= []
     state.artifacts ??= []
     state.messages ??= []
@@ -1907,6 +1940,24 @@ export class SessionStore {
   async setStatus(id: string, status: RunStatus): Promise<void> {
     await this.update(id, (state) => {
       transitionRunStatus(state, status)
+    })
+  }
+
+  /** Linearize cancellation against terminal staging; a finished turn stays finished. */
+  async tryMarkCancelling(id: string, turnId: string): Promise<boolean> {
+    return await this.enqueue(id, async () => {
+      const state = await this.get(id)
+      if (state.pendingTerminal || !['queued', 'running', 'awaiting_approval', 'awaiting_user', 'cancelling'].includes(state.summary.status)) return false
+      const events = await this.readStoredEvents(id)
+      const currentStart = [...events].reverse().find((event) => event.type === 'turn.started' || event.type === 'run.resumed')
+      if (currentStart?.turnId !== turnId) return false
+      transitionRunStatus(state, 'cancelling')
+      state.summary.updatedAt = new Date().toISOString()
+      await this.writeState(id, state)
+      if (!events.some((event) => event.type === 'run.status' && event.turnId === turnId && event.data.status === 'cancelling')) {
+        await this.appendUnqueued(id, 'run.status', { status: 'cancelling' }, { turnId })
+      }
+      return true
     })
   }
 
@@ -2526,6 +2577,35 @@ export class SessionStore {
     })
   }
 
+  /** Repair a failed admission publication without dispatching the input again.
+   * The receipt remains authoritative. If storage is still unavailable the
+   * pending-start journal is retained for normal process-restart recovery.
+   */
+  async interruptUnlaunchedInput(id: string, clientMessageId: string): Promise<void> {
+    const state = await this.get(id)
+    const receipt = state.inputReceipts?.[clientMessageId]
+    if (!receipt) return
+    assertInputReceipt(receipt)
+    if (state.pendingTerminal) return
+    if (!['queued', 'running', 'cancelling'].includes(state.summary.status)) return
+    const pending = state.pendingStart
+    const events = await this.events(id)
+    const currentTurnId = pending?.turnId ?? [...events].reverse()
+      .find((event) => event.type === 'turn.started' || event.type === 'run.resumed')?.turnId
+    if (currentTurnId !== receipt.turnId) return
+    if (pending) {
+      await this.append(id, 'turn.started', pending.eventData, { turnId: pending.turnId, eventId: pending.eventId })
+    }
+    await this.append(id, 'run.status', {
+      status: 'interrupted',
+      reason: 'Input accepted but execution could not start; use Continue to recover.',
+    }, { turnId: receipt.turnId })
+    await this.update(id, (next) => {
+      if (next.pendingStart?.turnId === receipt.turnId) delete next.pendingStart
+      transitionRunStatus(next, 'interrupted')
+    })
+  }
+
   async stageRunTerminal(
     id: string,
     pending: DurablePendingTerminal,
@@ -2534,6 +2614,9 @@ export class SessionStore {
     return await this.update(id, (state) => {
       if (state.pendingStart) throw new Error(`Turn ${state.pendingStart.turnId} has not finished dispatching`)
       if (state.pendingTerminal) throw new Error(`Turn ${state.pendingTerminal.turnId} already has a pending terminal outcome`)
+      if (pending.status === 'completed' && state.summary.status === 'cancelling') {
+        throw new DOMException('Run cancelled before completion was committed', 'AbortError')
+      }
       if (pending.status === 'completed' && state.steering?.some((item) => item.status === 'received')) throw new SteeringPendingError()
       mutate(state)
       state.pendingTerminal = pending

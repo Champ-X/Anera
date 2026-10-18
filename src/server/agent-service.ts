@@ -1,8 +1,10 @@
 import { createHash, randomInt } from 'node:crypto'
-import { resolve } from 'node:path'
+import { InputAdmissions, assertInputFingerprint, assertInputReceipt, inputId, submissionFingerprint } from './input-submission.js'
+import { posix, resolve } from 'node:path'
 import { open, readFile, rm } from 'node:fs/promises'
 import {
   type AgentModelOption,
+  type CancelRunTarget,
   type CodingSessionStatus,
   type EstimatedCostStatus,
   type ModelMessage,
@@ -142,6 +144,7 @@ import {
   type ExtensionToolName,
   arenaActiveToolContentParts,
   arenaActiveToolModelOutput,
+  arenaWorkspacePath,
   normalizeAneraRuntimeToolCall,
   validateToolCallArguments,
   ToolExecutor,
@@ -1084,7 +1087,7 @@ interface SubmitOptions {
   model?: string | null
   timezone?: string | null
   enabledConnectorSlugs?: string[]
-  /** Arena client-authored UUIDv7 for the initial user message. */
+  /** Stable client identity across retries of one ordinary user input. */
   clientMessageId?: string
   /** Arena data-custom-feedback correlation. Never trusted without server validation. */
   reviewedNodeId?: string
@@ -1123,9 +1126,10 @@ type DurableHumanInteraction =
 interface ActiveRun {
   controller: AbortController
   turnId: string
+  clientMessageId?: string
   settled: Promise<void>
   settle: () => void
-  cancellationTransition?: Promise<void>
+  cancellationTransition?: Promise<boolean>
   timer?: NodeJS.Timeout
   remainingMs: number
   activeStartedAt?: number
@@ -1134,6 +1138,8 @@ interface ActiveRun {
 
 interface StartReservation {
   controller: AbortController
+  turnId?: string
+  clientMessageId?: string
   settled: Promise<void>
   settle: () => void
 }
@@ -1341,6 +1347,7 @@ export class AgentService {
   private readonly now: () => Date
   private readonly modelTransportObserver?: AgentServiceOptions['modelTransportObserver']
   private readonly active = new Map<string, ActiveRun>()
+  private readonly inputAdmissions = new InputAdmissions<{ turnId: string }>()
   private readonly starting = new Set<string>()
   private readonly startReservations = new Map<string, StartReservation>()
   private readonly pendingApprovals = new Map<string, PendingApproval>()
@@ -1529,7 +1536,51 @@ export class AgentService {
   async submit(sessionId: string, options: SubmitOptions): Promise<{ turnId: string }> {
     this.assertAcceptingWork()
     await this.initialize()
-    await this.reserveStart(sessionId)
+    const id = inputId(options.clientMessageId)
+    if (!id) return await this.submitOnce(sessionId, options)
+    const fingerprint = submissionFingerprint(options)
+    return await this.inputAdmissions.run(`${sessionId}/${id}`, fingerprint, async () => {
+      const receipt = await this.submissionReceipt(sessionId, options)
+      if (receipt) return receipt
+      return await this.submitOnce(sessionId, options, fingerprint)
+    })
+  }
+
+  async submissionReceipt(sessionId: string, options: SubmitOptions): Promise<{ turnId: string } | undefined> {
+    const id = inputId(options.clientMessageId)
+    if (!id) return undefined
+    const state = await this.store.get(sessionId)
+    if (!Object.hasOwn(state.inputReceipts ?? {}, id)) return undefined
+    const receipt = state.inputReceipts![id]
+    assertInputReceipt(receipt)
+    assertInputFingerprint(receipt.fingerprint, submissionFingerprint(options))
+    await this.reconcileInputAdmission(sessionId, id)
+    return { turnId: receipt.turnId }
+  }
+
+  async reconcileInputAdmission(sessionId: string, id: string): Promise<void> {
+    const state = await this.store.get(sessionId)
+    if (!Object.hasOwn(state.inputReceipts ?? {}, id)) return
+    if (!this.isRunning(sessionId) && ['queued', 'running', 'cancelling'].includes(state.summary.status)) {
+      // A publication failure may outlive the original request while this
+      // process stays up. Reconcile under the ordinary start reservation so
+      // a receipt replay cannot interrupt a concurrently admitted new turn.
+      let reserved = false
+      try {
+        await this.reserveStart(sessionId)
+        reserved = true
+        await this.store.interruptUnlaunchedInput(sessionId, id)
+      } catch (error) {
+        if (reserved || !this.isRunning(sessionId)) throw error
+      } finally {
+        if (reserved) this.releaseStart(sessionId)
+      }
+    }
+  }
+
+  private async submitOnce(sessionId: string, options: SubmitOptions, fingerprint?: string): Promise<{ turnId: string }> {
+    this.assertAcceptingWork()
+    await this.reserveStart(sessionId, false, options.clientMessageId)
     let active: ActiveRun | undefined
     let launched = false
     try {
@@ -1557,6 +1608,7 @@ export class AgentService {
         : this.knownConnectorSlugs(options.enabledConnectorSlugs)
       this.store.registerSensitiveValues(sessionId, findSensitiveValues(content))
       const turnId = createId('turn')
+      this.bindStartTurn(sessionId, turnId)
       const modelContent = reviewedNodeId
         ? projectArenaCustomFeedbackMessageForModel(content, attachments)
         : projectArenaUserMessageForModel(content, attachments)
@@ -1581,6 +1633,10 @@ export class AgentService {
         eventData: startEventData,
         createdAt: new Date().toISOString(),
       }, (next) => {
+        if (options.clientMessageId && fingerprint) {
+          next.inputReceipts ??= {}
+          next.inputReceipts[options.clientMessageId] = { fingerprint, turnId }
+        }
         const displaySummary = content || `Uploaded ${attachments.map((path) => path.split('/').at(-1) || path).join(', ')}`
         if (next.messages.length === 0 && !next.titleCustomized) next.summary.title = titleFromPrompt(this.store.redactTextForDisplay(sessionId, displaySummary))
         next.summary.lastMessage = this.store.redactTextForDisplay(sessionId, displaySummary)
@@ -1624,24 +1680,58 @@ export class AgentService {
       launched = true
       void this.run(sessionId, turnId, active.controller, state.messages.length === 0, selectedModel.model).finally(() => this.deactivate(sessionId, active as ActiveRun))
       return { turnId }
+    } catch (error) {
+      if (!launched && options.clientMessageId && fingerprint) {
+        await this.store.interruptUnlaunchedInput(sessionId, options.clientMessageId).catch(() => undefined)
+      }
+      throw error
     } finally {
       this.releaseStart(sessionId)
       if (active && !launched) await this.deactivate(sessionId, active)
     }
   }
 
-  async cancel(sessionId: string): Promise<void> {
-    const active = this.active.get(sessionId)
+  async cancel(sessionId: string, target: CancelRunTarget = {}): Promise<{ cancelled: boolean }> {
+    let active = this.active.get(sessionId)
     if (!active) {
       const reservation = this.startReservations.get(sessionId)
-      if (!reservation) return
-      reservation.controller.abort(new DOMException('Cancelled by user', 'AbortError'))
-      return
+      if (!reservation) return { cancelled: false }
+      const match = this.matchesCancellationTarget(sessionId, reservation, target)
+      if (!(typeof match === 'boolean' ? match : await match)) return { cancelled: false }
+      // Matching a recovered identity may read the journal. Never carry a
+      // decision across replacement of this exact startup reservation. Its
+      // activation reuses the controller, so that transition keeps ownership.
+      active = this.active.get(sessionId)
+      if (active?.controller !== reservation.controller) {
+        if (active || this.startReservations.get(sessionId) !== reservation) return { cancelled: false }
+        reservation.controller.abort(new DOMException('Cancelled by user', 'AbortError'))
+        return { cancelled: true }
+      }
     }
+    const match = this.matchesCancellationTarget(sessionId, active, target)
+    if (!(typeof match === 'boolean' ? match : await match)
+      || this.active.get(sessionId) !== active) return { cancelled: false }
     active.termination ??= 'cancelled'
-    await this.publishCancellationTransition(sessionId, active)
+    if (!await this.publishCancellationTransition(sessionId, active)) return { cancelled: false }
     active.controller.abort(new DOMException('Cancelled by user', 'AbortError'))
-    await this.processes.stopAll(sessionId, { turnId: active.turnId })
+    if (this.active.get(sessionId) === active) await this.processes.stopAll(sessionId, { turnId: active.turnId })
+    return { cancelled: true }
+  }
+
+  private matchesCancellationTarget(
+    sessionId: string,
+    owner: { turnId?: string; clientMessageId?: string },
+    target: CancelRunTarget,
+  ): boolean | Promise<boolean> {
+    // When both identities are supplied they must identify the same run.
+    if (target.targetTurnId !== undefined && owner.turnId !== target.targetTurnId) return false
+    if (target.targetInputId === undefined) return true
+    if (owner.clientMessageId !== undefined) return owner.clientMessageId === target.targetInputId
+    if (!owner.turnId) return false
+    // Restarted approval/HITL runs retain their original turn, but may not have
+    // an in-memory input identity. Only that turn's durable start can prove it.
+    return this.store.events(sessionId).then((events) => events.some((event) => event.type === 'turn.started' && event.turnId === owner.turnId
+      && event.data.clientMessageId === target.targetInputId))
   }
 
   async resume(sessionId: string, model?: string): Promise<{ turnId: string }> {
@@ -1677,6 +1767,7 @@ export class AgentService {
         : 0
       const activeTaskConnectorSlugs = state.activeTaskConnectorSlugs ?? await this.connectedConnectorSlugs()
       const turnId = createId('turn')
+      this.bindStartTurn(sessionId, turnId)
       const startEventId = createId('evt')
       const startEventData = {
         previousStatus: state.summary.status,
@@ -1917,6 +2008,7 @@ export class AgentService {
     if (this.shuttingDown || this.isRunning(sessionId)) return
     try {
       await this.reserveStart(sessionId)
+      this.bindStartTurn(sessionId, interaction.pending.turnId)
     } catch (error) {
       if (this.isRunning(sessionId)) return
       throw error
@@ -4994,12 +5086,14 @@ export class AgentService {
   }
 
   private activate(sessionId: string, turnId: string): ActiveRun {
-    const controller = this.startReservations.get(sessionId)?.controller ?? new AbortController()
+    const reservation = this.startReservations.get(sessionId)
+    const controller = reservation?.controller ?? new AbortController()
     let settle = () => {}
     const settled = new Promise<void>((resolve) => { settle = resolve })
     const active: ActiveRun = {
       controller,
       turnId,
+      ...(reservation?.clientMessageId ? { clientMessageId: reservation.clientMessageId } : {}),
       settled,
       settle,
       remainingMs: this.runTimeoutMs,
@@ -5010,13 +5104,10 @@ export class AgentService {
     return active
   }
 
-  private async publishCancellationTransition(sessionId: string, active: ActiveRun): Promise<void> {
-    if (active.termination !== 'cancelled') return
-    active.cancellationTransition ??= (async () => {
-      await this.store.setStatus(sessionId, 'cancelling')
-      await this.store.append(sessionId, 'run.status', { status: 'cancelling' }, { turnId: active.turnId })
-    })()
-    await active.cancellationTransition
+  private async publishCancellationTransition(sessionId: string, active: ActiveRun): Promise<boolean> {
+    if (active.termination !== 'cancelled') return false
+    active.cancellationTransition ??= this.store.tryMarkCancelling(sessionId, active.turnId)
+    return await active.cancellationTransition
   }
 
   async stopWorkspaceResources(sessionId: string): Promise<void> {
@@ -5078,7 +5169,7 @@ export class AgentService {
     }, (event) => event.type === 'workspace.version.restored' && event.data.restoreId === restoreId)
   }
 
-  private async reserveStart(sessionId: string, allowPendingRestore = false): Promise<void> {
+  private async reserveStart(sessionId: string, allowPendingRestore = false, clientMessageId?: string): Promise<void> {
     this.assertAcceptingWork()
     if (this.starting.has(sessionId)) throw new Error('This session is already running')
     const active = this.active.get(sessionId)
@@ -5102,7 +5193,7 @@ export class AgentService {
     let settle = () => {}
     const settled = new Promise<void>((resolve) => { settle = resolve })
     const controller = new AbortController()
-    const reservation = { controller, settled, settle }
+    const reservation: StartReservation = { controller, settled, settle, ...(clientMessageId ? { clientMessageId } : {}) }
     this.starting.add(sessionId)
     this.startReservations.set(sessionId, reservation)
     try {
@@ -5125,6 +5216,12 @@ export class AgentService {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
+  }
+
+  private bindStartTurn(sessionId: string, turnId: string): void {
+    const reservation = this.startReservations.get(sessionId)
+    if (!reservation) throw new Error('Cannot bind a turn without its startup reservation')
+    reservation.turnId = turnId
   }
 
   private releaseStart(sessionId: string): void {
@@ -6586,7 +6683,11 @@ export async function executeToolBatch<T>(
       continue
     }
     let end = index + 1
-    while (end < calls.length && isParallelSafeToolCall(calls[end])) end += 1
+    // Speech writes files. Parallelize independent clips with one another,
+    // while preserving the existing order against reads and other tools.
+    const speechBatch = calls[index].name === 'generate_speech'
+    while (end < calls.length && isParallelSafeToolCall(calls[end])
+      && (calls[end].name === 'generate_speech') === speechBatch) end += 1
     const resourceTails = new Map<string, Promise<void>>()
     const limit = createConcurrencyLimiter(maxConcurrency)
     const scheduled = calls.slice(index, end).map((call) => {
@@ -6633,6 +6734,18 @@ function createConcurrencyLimiter(maxConcurrency: number): <T>(work: () => Promi
 }
 
 function parallelToolSerializationKey(call: ToolCallRecord): string | undefined {
+  if (call.name === 'generate_speech') {
+    try {
+      if (typeof call.arguments.file_path !== 'string') return 'generate_speech:invalid-path'
+      // Resolve public-root aliases and lexical dot segments. Case/Unicode
+      // folding is conservative on case-sensitive hosts and prevents racing
+      // equivalent destinations on the supported macOS filesystem.
+      const path = posix.normalize(arenaWorkspacePath(call.arguments.file_path)).normalize('NFC').toLowerCase()
+      return `generate_speech:${path}`
+    } catch {
+      return 'generate_speech:invalid-path'
+    }
+  }
   if (call.name !== 'fetch_page' || typeof call.arguments.url !== 'string') return undefined
   const rawUrl = call.arguments.url.trim()
   try {
@@ -6647,7 +6760,7 @@ function parallelToolSerializationKey(call: ToolCallRecord): string | undefined 
 }
 
 export function isParallelSafeToolCall(call: ToolCallRecord): boolean {
-  if (['list_files', 'read_file', 'read_reference_resource', 'grep_files', 'glob_files', 'extract_attachment', 'inspect_image', 'web_fetch', 'fetch_page', 'web_search', 'fetch_media', 'list_processes', 'get_process_output', 'list_connector_tools', 'add_voice'].includes(call.name)) return true
+  if (['list_files', 'read_file', 'read_reference_resource', 'grep_files', 'glob_files', 'extract_attachment', 'inspect_image', 'web_fetch', 'fetch_page', 'web_search', 'fetch_media', 'list_processes', 'get_process_output', 'list_connector_tools', 'add_voice', 'generate_speech'].includes(call.name)) return true
   return call.name === 'browser' && ['snapshot', 'console'].includes(String(call.arguments.action || ''))
 }
 

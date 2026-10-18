@@ -13,6 +13,7 @@ import {
 import type {
   AgentCustomFeedbackArm,
   AgentFeedbackType,
+  CancelRunTarget,
   PointwiseFeedbackValue,
   SessionEvent,
   TaskCompletionFeedbackValue,
@@ -41,6 +42,7 @@ import {
   type CodingSessionInput,
 } from './github-connector.js'
 import { SessionStore, type StoredSession } from './session-store.js'
+import { InputAdmissions, assertInputFingerprint, inputFingerprint, inputId } from './input-submission.js'
 import { WorkspaceVersionService, mountWorkspaceVersionRoutes } from './workspace-versions.js'
 import { withWorkspaceMaintenance } from './workspace-maintenance.js'
 import { publicSteeringMessage } from './steering.js'
@@ -97,6 +99,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   await mkdir(agentCasRoot, { recursive: true })
   const signedAgentUploads = new Map<string, SignedAgentUpload>()
   const websiteRestartRequests = new Map<string, Promise<StoredSession['website']>>()
+  const chatAdmissions = new InputAdmissions<{ id: string }>()
   const credits = new DailyCreditStore(dataRoot, {
     dailyFreeCredits: options.dailyFreeCredits ?? config.dailyFreeCredits,
     creditsPerUsd: options.creditsPerUsd ?? config.creditsPerUsd,
@@ -420,34 +423,59 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   app.post('/nextjs-api/stream/create-chat', async (request, response) => {
     const input = await parseArenaCreateChatTransport(request.body, { agentCasRoot, localUserId })
     const enabledConnectorSlugs = parseLocalConnectorHeader(request.get('x-anera-enabled-connectors'))
-    const session = await store.create({ customFeedbackArm })
-    try {
-      const attachments: string[] = []
-      await withWorkspaceMaintenance(store, session.summary.id, async () => {
-        for (const upload of input.uploads) {
-          const safeName = safeAgentUploadName(upload.filename)
-          const uploaded = await store.createUpload(
-            session.summary.id,
-            `uploads/${safeName}`,
-            upload.content,
-            upload.mediaType,
-          )
-          attachments.push(uploaded.path)
+    const fingerprint = inputFingerprint({
+      content: input.content,
+      uploads: input.uploads.map((upload) => ({
+        filename: upload.filename,
+        mediaType: upload.mediaType,
+        sha256: createHash('sha256').update(upload.content).digest('hex'),
+      })),
+      model: input.modelId ?? null,
+      timezone: input.timezone,
+      enabledConnectorSlugs: enabledConnectorSlugs === undefined ? null : [...new Set(enabledConnectorSlugs)].sort(),
+    })
+    const result = await chatAdmissions.run(input.messageId, fingerprint, async () => {
+      const prior = await store.findCreationInput(input.messageId)
+      if (prior) {
+        assertInputFingerprint(prior.creationInput!.fingerprint, fingerprint)
+        if (Object.hasOwn(prior.inputReceipts ?? {}, input.messageId)) {
+          await agent.reconcileInputAdmission(prior.summary.id, input.messageId)
+          return { id: prior.summary.id }
         }
-      })
-      await agent.submit(session.summary.id, {
-        content: input.content,
-        attachments,
-        model: input.modelId,
-        timezone: input.timezone,
-        enabledConnectorSlugs,
-        clientMessageId: input.messageId,
-      })
-      response.status(200).json({ id: session.summary.id })
-    } catch (error) {
-      await store.discardUnpublishedSession(session.summary.id).catch(() => undefined)
-      throw error
-    }
+        // No acceptance checkpoint exists: rebuild the unpublished preparation
+        // instead of appending the same uploads a second time after a crash.
+        await store.discardUnpublishedSession(prior.summary.id)
+      }
+      const session = await store.create({ customFeedbackArm, creationInput: { id: input.messageId, fingerprint } })
+      try {
+        const attachments: string[] = []
+        await withWorkspaceMaintenance(store, session.summary.id, async () => {
+          for (const upload of input.uploads) {
+            const safeName = safeAgentUploadName(upload.filename)
+            const uploaded = await store.createUpload(
+              session.summary.id,
+              `uploads/${safeName}`,
+              upload.content,
+              upload.mediaType,
+            )
+            attachments.push(uploaded.path)
+          }
+        })
+        await agent.submit(session.summary.id, {
+          content: input.content,
+          attachments,
+          model: input.modelId,
+          timezone: input.timezone,
+          enabledConnectorSlugs,
+          clientMessageId: input.messageId,
+        })
+        return { id: session.summary.id }
+      } catch (error) {
+        await store.discardUnpublishedSession(session.summary.id).catch(() => undefined)
+        throw error
+      }
+    })
+    response.status(200).json(result)
   })
 
   app.get('/api/sessions/:id', async (request, response) => {
@@ -523,15 +551,21 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
       || rawEnabledConnectorSlugs.some((value: unknown) => typeof value !== 'string')
     )) throw new Error('enabledConnectorSlugs must be an array of strings')
     const message = parseAgentMessageTransport(body, request.params.id)
-    await assertAgentTurnAttachments(store, request.params.id, message.attachments)
-    const result = await agent.submit(request.params.id, {
+    const options = {
       content: message.content,
       attachments: message.attachments,
       model: rawModel,
       timezone: message.timezone,
       enabledConnectorSlugs: rawEnabledConnectorSlugs,
       reviewedNodeId: message.reviewedNodeId,
-    })
+      clientMessageId: inputId(body.clientMessageId),
+    }
+    // Accepted retries remain acknowledgements even after files were changed
+    // or removed by the task. Only a new admission needs present-day files.
+    const prior = await agent.submissionReceipt(request.params.id, options)
+    if (prior) { response.status(202).json(prior); return }
+    await assertAgentTurnAttachments(store, request.params.id, message.attachments)
+    const result = await agent.submit(request.params.id, options)
     response.status(202).json(result)
   })
 
@@ -541,8 +575,19 @@ export async function createApp(options: CreateAppOptions = {}): Promise<{
   })
 
   app.post('/api/sessions/:id/stop', async (request, response) => {
-    await agent.cancel(request.params.id)
-    response.status(202).json({ ok: true })
+    const body = request.body === undefined ? {} : request.body
+    if (!isRecord(body)) throw statusError('stop body must be an object', 400)
+    const target: CancelRunTarget = {}
+    for (const key of ['targetInputId', 'targetTurnId'] as const) {
+      const value = body[key]
+      if (value === undefined) continue
+      if (typeof value !== 'string' || !value || value !== value.trim() || value.length > 128) {
+        throw statusError(`${key} must be a non-empty identity of at most 128 characters`, 400)
+      }
+      target[key] = value
+    }
+    const result = await agent.cancel(request.params.id, target)
+    response.status(202).json({ ok: true, ...result })
   })
 
   app.post('/api/sessions/:id/resume', async (request, response) => {

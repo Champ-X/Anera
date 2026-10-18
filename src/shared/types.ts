@@ -11,6 +11,12 @@ export type RunStatus =
   | 'timed_out'
   | 'interrupted'
 
+/** A delayed stop may only affect the input/turn observed by its caller. */
+export interface CancelRunTarget {
+  targetInputId?: string
+  targetTurnId?: string
+}
+
 export type EventType =
   | 'session.created'
   | 'session.limit.reached'

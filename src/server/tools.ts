@@ -229,6 +229,8 @@ export interface ToolContext {
   turnId: string
   stepId: string
   callId?: string
+  /** Stable occurrence within a provider batch, including repeated call ids. */
+  callIndex?: number
   signal: AbortSignal
   /** Undefined preserves compatibility for direct executor callers; Agent runs always pass an explicit task snapshot. */
   enabledConnectorSlugs?: readonly string[]
@@ -2265,6 +2267,7 @@ export class ToolExecutor {
     const args = call.arguments
     try {
       validateToolCallArguments(call, this.connectorToolDefinitions)
+      if (call.name === 'generate_speech') context.signal.throwIfAborted()
       await this.enforceTurnScopedMediaLimit(call, context)
       switch (call.name) {
         case 'ask_user': {
@@ -3410,7 +3413,7 @@ export class ToolExecutor {
               && typeof error === 'object'
               && (error as { preserveHitlFiles?: unknown }).preserveHitlFiles === true,
             )
-            throw withToolSpeechUsage(error, combineSpeechProviderMetering(speechUsages))
+            throw withToolSpeechUsage(error, combineSpeechProviderMetering(speechUsages), context.signal)
           } finally {
             if (!preserveAuditions) {
               await Promise.all(auditionPaths.map(async (path) => {
@@ -5303,6 +5306,9 @@ export class ToolExecutor {
         ? ARENA_ACTIVE_TOOL_LIMITS.maxImageBattlesPerTurn
         : undefined
     if (limit === undefined) return
+    if (context.callIndex !== undefined && (!Number.isInteger(context.callIndex) || context.callIndex < 0)) {
+      throw new Error('Media tool callIndex must be a non-negative integer')
+    }
     const matchesLimitedCall = (candidate: ToolCallRecord): boolean => (
       call.name === 'generate_speech'
         ? candidate.name === 'generate_speech'
@@ -5313,7 +5319,15 @@ export class ToolExecutor {
       event.type === 'tool.started'
       && event.turnId === context.turnId
     ))
-    const currentStarts = sameTurnStarts().filter((event) => event.callId === call.id)
+    const reservationKey = (callId: string, stepId?: string, callIndex?: unknown): string => (
+      call.name === 'generate_speech'
+        ? JSON.stringify([stepId ?? '', Number.isInteger(callIndex) ? callIndex : callId])
+        : callId
+    )
+    const currentKey = reservationKey(call.id, context.stepId, context.callIndex)
+    const currentStarts = sameTurnStarts().filter((event) => (
+      reservationKey(event.callId || '', event.stepId, event.data.callIndex) === currentKey
+    ))
     if (currentStarts.length > 0) {
       const persisted = currentStarts[0].data.call
       if (
@@ -5321,6 +5335,7 @@ export class ToolExecutor {
         || typeof persisted !== 'object'
         || Array.isArray(persisted)
         || (persisted as ToolCallRecord).name !== call.name
+        || (call.name === 'generate_speech' && (persisted as ToolCallRecord).id !== call.id)
       ) {
         throw new Error(`Tool call id ${call.id} is already bound to a different durable call in this turn`)
       }
@@ -5328,7 +5343,9 @@ export class ToolExecutor {
       // AgentService normally publishes tool.started before entering the
       // executor. Direct/recovered executor callers receive the same durable
       // reservation here so limits survive executor and process recreation.
-      await this.store.append(context.sessionId, 'tool.started', { call }, {
+      await this.store.append(context.sessionId, 'tool.started', {
+        call, ...(context.callIndex === undefined ? {} : { callIndex: context.callIndex }),
+      }, {
         turnId: context.turnId,
         stepId: context.stepId,
         callId: call.id,
@@ -5336,7 +5353,7 @@ export class ToolExecutor {
       events = await this.store.events(context.sessionId)
     }
 
-    const admittedCallIds: string[] = []
+    const admittedReservations: string[] = []
     const seen = new Set<string>()
     for (const event of sameTurnStarts().sort((left, right) => left.seq - right.seq)) {
       const persisted = event.data.call
@@ -5344,11 +5361,12 @@ export class ToolExecutor {
       const candidate = persisted as ToolCallRecord
       if (!matchesLimitedCall(candidate)) continue
       const callId = event.callId || candidate.id
-      if (!callId || seen.has(callId)) continue
-      seen.add(callId)
-      admittedCallIds.push(callId)
+      const key = reservationKey(callId, event.stepId, event.data.callIndex)
+      if (!callId || seen.has(key)) continue
+      seen.add(key)
+      admittedReservations.push(key)
     }
-    const ordinal = admittedCallIds.indexOf(call.id) + 1
+    const ordinal = admittedReservations.indexOf(currentKey) + 1
     if (ordinal < 1) throw new Error(`Tool call ${call.id} has no durable per-turn media reservation`)
     if (ordinal > limit) {
       const label = call.name === 'generate_speech' ? 'speech generations' : 'offer_options image battles'
@@ -5632,28 +5650,36 @@ export class ToolExecutor {
         + `register a voice auditioned for ${requestedLanguage}`,
       )
     }
+    context.signal.throwIfAborted()
     const generated = await this.synthesizeNormalizedSpeech(text, selectedVoice.providerVoice, plan, context.signal)
     const audio = generated.audio
-    if (context.signal.aborted) throw context.signal.reason
-    await this.store.commitWorkspaceWrite(context.sessionId, {
-      path: filePath,
-      content: audio,
-      mode: 'upsert',
-      operation: 'generated-speech',
-      artifact: this.artifactForPath(context, filePath),
-      context: { turnId: context.turnId, stepId: context.stepId, callId: context.callId },
-    })
-    await this.store.append(context.sessionId, 'audio.generated', {
-      path: filePath,
-      bytes: audio.byteLength,
-      voiceId,
-      language: requestedLanguage,
-      auditionLanguage,
-    }, {
-      turnId: context.turnId,
-      stepId: context.stepId,
-      callId: context.callId,
-    })
+    try {
+      context.signal.throwIfAborted()
+      await this.store.commitWorkspaceWrite(context.sessionId, {
+        path: filePath,
+        content: audio,
+        mode: 'upsert',
+        operation: 'generated-speech',
+        artifact: this.artifactForPath(context, filePath),
+        context: { turnId: context.turnId, stepId: context.stepId, callId: context.callId },
+      })
+      await this.store.append(context.sessionId, 'audio.generated', {
+        path: filePath,
+        bytes: audio.byteLength,
+        voiceId,
+        language: requestedLanguage,
+        auditionLanguage,
+      }, {
+        turnId: context.turnId,
+        stepId: context.stepId,
+        callId: context.callId,
+      })
+    } catch (error) {
+      // Provider work has already happened even when cancellation or the
+      // durable workspace commit prevents delivery. Settle it exactly once
+      // through AgentService's existing occurrence-keyed usage journal.
+      throw withToolSpeechUsage(error, generated.speechUsage, context.signal)
+    }
     return {
       content: JSON.stringify({ status: 'success', hash: arenaContentHash(audio), file_path: filePath }),
       isError: false,
@@ -5674,7 +5700,7 @@ export class ToolExecutor {
     try {
       providerAudio = await this.synthesizeSpeech(text, providerVoice, plan.providerFormat, signal)
     } catch (error) {
-      throw withToolSpeechUsage(error, speechProviderMetering(text, 0, 0, 0))
+      throw withToolSpeechUsage(error, speechProviderMetering(text, 0, 0, 0), signal)
     }
     const baseUsage = speechProviderMetering(text, providerAudio.byteLength, 0, 0)
     try {
@@ -5689,7 +5715,7 @@ export class ToolExecutor {
         ),
       }
     } catch (error) {
-      throw withToolSpeechUsage(error, baseUsage)
+      throw withToolSpeechUsage(error, baseUsage, signal)
     }
   }
 
@@ -6046,9 +6072,16 @@ function toolSpeechUsageFromError(error: unknown): SpeechProviderMetering | unde
   return usage as SpeechProviderMetering
 }
 
-function withToolSpeechUsage(error: unknown, usage: SpeechProviderMetering | undefined): unknown {
+function withToolSpeechUsage(error: unknown, usage: SpeechProviderMetering | undefined, signal?: AbortSignal): unknown {
   if (!usage) return error
-  const target = error instanceof Error ? error : new Error(String(error))
+  // AbortSignal.reason is shared by sibling and queued tools. Attaching one
+  // clip's metering to it would charge that clip again when another tool
+  // throws the same reason without ever reaching a provider.
+  const target = error instanceof Error && error !== signal?.reason
+    ? error
+    : Object.assign(new Error(error instanceof Error ? error.message : String(error), { cause: error }), {
+        name: error instanceof Error ? error.name : 'Error',
+      })
   try {
     return Object.assign(target, {
       speechUsage: usage,
